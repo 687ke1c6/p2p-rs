@@ -1,0 +1,10 @@
+[package]
+name = "protocol"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+postcard.workspace = true
+rust-p2p-core.workspace = true
+serde.workspace = true
+tokio.workspace = true

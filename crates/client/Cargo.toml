@@ -1,0 +1,6 @@
+[package]
+name = "p2p-client"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]

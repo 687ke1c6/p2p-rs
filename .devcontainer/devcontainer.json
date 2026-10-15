@@ -1,0 +1,21 @@
+{
+  "name": "rustp2p",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "runArgs": ["--network=host"],
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {},
+    "ghcr.io/guiyomh/features/just:0": {}
+  },
+  "postCreateCommand": "rustup component add rustfmt clippy rust-analyzer",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "docker.docker",
+        "Anthropic.claude-code"
+      ],
+      "settings": { "rust-analyzer.check.command": "clippy" }
+    }
+  }
+}
