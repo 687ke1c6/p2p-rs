@@ -36,3 +36,11 @@ docker-stop:
 # Run the rendezvous integration tests against a deployed server, e.g. a Railway TCP proxy host:port
 test-remote addr:
     RENDEZVOUS_TEST_ADDR={{addr}} cargo test -p rendezvous-server --test rendezvous
+
+# Query each STUN server (defaults, or --stun a,b) and report mapped addresses and NAT type
+stun-check *args:
+    cargo run -q -p p2p-client -- stun-check {{args}}
+
+# Run the tests that need the internet (public STUN servers)
+test-network:
+    cargo test -p p2p-client --test stun_live -- --ignored --nocapture

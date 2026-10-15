@@ -4,3 +4,9 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+clap.workspace = true
+env_logger.workspace = true
+log.workspace = true
+protocol = { path = "../protocol" }
+rand.workspace = true
+tokio.workspace = true

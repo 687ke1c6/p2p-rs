@@ -21,13 +21,13 @@ The `rustp2p` project publishes two crates. We use the lower-level one.
 * [ ] **Lightweight Signaling Server:** Implement or deploy a minimal rendezvous server responsible *only* for metadata exchange (trading IP addresses and ports), handling zero file data.
 * [ ] **Peer Handshake:** Allow two client instances to register with the signaling server, discover each other via unique share/device tokens, and trade connection candidates.
 * [ ] **Rendezvous and STUN Are Separate Services:** Even if one process provides both, the client treats rendezvous and STUN as two independent services, each with its own `host:port`. Hosting providers like Railway give every exposed port its own hostname (e.g. `shuttle.proxy.rlwy.net:15140`), so the client must never assume both services share a host or derive one address from the other.
-* [ ] **STUN Service (Address Reflection):** STUN tells each client its public address: the source IP and port of the client's UDP packet as seen from the internet. The client speaks standard RFC 5389 STUN Binding requests (`rust-p2p-core::stun` already implements them), not a custom message. We use existing public STUN servers instead of hosting our own (see the decision below).
+* [ ] **STUN Service (Address Reflection):** STUN tells each client its public address: the source IP and port of the client's UDP packet as seen from the internet. The client speaks standard RFC 5389 STUN Binding requests, not a custom message. It uses its own small Binding client (`crates/client/src/stun.rs`) rather than `rust-p2p-core::stun`, which probes from throwaway sockets of its own (so its mappings don't apply to the punching socket), doesn't check transaction ids, and sends the RFC 3489 `CHANGE-REQUEST` attribute. We use existing public STUN servers instead of hosting our own (see the decision below).
 * [ ] **NAT Type Detection:** The client sends Binding requests to at least two STUN endpoints from the same UDP socket and compares the mapped ports. Using servers at different IPs also catches NATs that change the mapping only when the destination IP changes. The same mapping means a cone NAT, different mappings mean a symmetric NAT. The result fills `NatInfo.nat_type`, which the `Puncher` uses to choose its strategy. With only one STUN endpoint configured, the client logs a warning and assumes cone NAT.
 * [ ] **Client Endpoint Configuration:** Each service address is set by CLI flag or environment variable. Rendezvous is required. STUN has public defaults.
   * `--rendezvous <host:port>` / `RENDEZVOUS_ADDR`: one TCP endpoint.
-  * `--stun <host:port>` / `STUN_ADDRS` (comma-separated): one or more UDP endpoints. Defaults to a small list of public servers from different providers, e.g. `stun.l.google.com:19302`, `stun1.l.google.com:19302` and `stun.cloudflare.com:3478`. Setting the option replaces the defaults instead of adding to them.
+  * `--stun <host:port>` / `STUN_ADDRS` (comma-separated): one or more UDP endpoints. Defaults to a small list of public servers from different providers, `stun.l.google.com:19302`, `stun.cloudflare.com:3478` and `global.stun.twilio.com:3478`. (`stun1.l.google.com` was dropped: it resolves to the same IP as `stun.l.google.com`, so it can't reveal per-destination remapping.) Setting the option replaces the defaults instead of adding to them.
   * Each hostname is resolved independently at startup, and every resolved address is logged. A failure to resolve or reach one service is reported with that service's name.
-* [ ] **Explicit STUN List:** The client contacts only its own STUN list, either the defaults above or the user's override. It does not use `rust-p2p-core`'s built-in default list, which includes servers we haven't chosen.
+* [x] **Explicit STUN List:** The client contacts only its own STUN list, either the defaults above or the user's override. It does not use `rust-p2p-core`'s built-in default list, which includes servers we haven't chosen.
 
 > **Hosting constraint (Railway):** Railway does not accept inbound UDP, and its TCP proxy hides the client's source IP. The rendezvous server can run on Railway over TCP, because signaling only needs to pass messages. **STUN cannot run on Railway**, because it must receive UDP and see the client's real source address. **Decision: use public STUN servers** for the prototype and probably beyond, rather than host infrastructure that already exists. Trade-off accepted: the STUN providers see each client's public IP and port when it starts up. They never see the peer, the token or any file data, so the "data never routes through third-party infrastructure" constraint still holds. Because the client keeps STUN separate, self-hosting later would only be a configuration change.
 
@@ -52,13 +52,13 @@ The `rustp2p` project publishes two crates. We use the lower-level one.
 
 The rendezvous server is deployed with Docker. It handles metadata only (addresses and ports) and never touches file data. It is TCP-only, so it can run behind Railway's TCP proxy. STUN uses public servers, so there is nothing to deploy for it.
 
-* [ ] **Dockerfile:** Create a `Dockerfile` for the rendezvous server in the repository. Use a multi-stage build: a Rust builder stage that compiles the server binary in release mode, and a minimal runtime stage based on `alpine` that copies in only the binary. Alpine uses musl libc, so build in a `rust:alpine` builder stage (or target `x86_64-unknown-linux-musl`) so the binary links against musl and runs in the runtime image. Fall back to `debian:bookworm-slim` only if a dependency doesn't build against musl. Run as a non-root user and expose the signaling port.
-* [ ] **`.dockerignore`:** Exclude `target/`, `.git/` and `.devcontainer/` to keep the build context small.
-* [ ] **Build the Image:** `docker build -t rendezvous-server .`
-* [ ] **Run the Container:** `docker run -d --name rendezvous --restart unless-stopped -p <PORT>:<PORT> rendezvous-server`. Configure the listen address and port through environment variables or CLI flags.
-* [ ] **Ports:** The server listens on one TCP port, read from `PORT` (which Railway sets) or a `--listen` flag.
-* [ ] **Railway Deployment:** Deploy from the Dockerfile and enable a TCP proxy on the listen port. Railway assigns a hostname and port such as `shuttle.proxy.rlwy.net:15140`, which becomes the client's `--rendezvous` value. Because the proxy hides client source IPs, the server must never use the connection's remote address as a candidate. Clients report their own candidates from STUN.
-* [ ] **Verify:** Check the container logs, then confirm that two clients can register and exchange candidates through the server.
+* [x] **Dockerfile:** Create a `Dockerfile` for the rendezvous server in the repository. Use a multi-stage build: a Rust builder stage that compiles the server binary in release mode, and a minimal runtime stage based on `alpine` that copies in only the binary. Alpine uses musl libc, so build in a `rust:alpine` builder stage (or target `x86_64-unknown-linux-musl`) so the binary links against musl and runs in the runtime image. Fall back to `debian:bookworm-slim` only if a dependency doesn't build against musl. Run as a non-root user and expose the signaling port.
+* [x] **`.dockerignore`:** Exclude `target/`, `.git/` and `.devcontainer/` to keep the build context small.
+* [x] **Build the Image:** `docker build -t rendezvous-server .`
+* [x] **Run the Container:** `docker run -d --name rendezvous --restart unless-stopped -p <PORT>:<PORT> rendezvous-server`. Configure the listen address and port through environment variables or CLI flags.
+* [x] **Ports:** The server listens on one TCP port, read from `PORT` (which Railway sets) or a `--listen` flag.
+* [x] **Railway Deployment:** Deploy from the Dockerfile and enable a TCP proxy on the listen port. Railway assigns a hostname and port such as `shuttle.proxy.rlwy.net:15140`, which becomes the client's `--rendezvous` value. Because the proxy hides client source IPs, the server must never use the connection's remote address as a candidate. Clients report their own candidates from STUN.
+* [x] **Verify:** Check the container logs, then confirm that two clients can register and exchange candidates through the server.
 
 ---
 
@@ -102,14 +102,15 @@ Start from `rust-p2p-core`'s `examples/server.rs`. Keep its peer registration an
 * [x] Write the Alpine-based multi-stage `Dockerfile` and `.dockerignore`, then build and run the image locally.
 * [x] Add `just` recipes for building and running the image.
 * [x] Let the step 3 integration test target a running server via `RENDEZVOUS_TEST_ADDR` (`just test-remote <host:port>`).
-* [ ] Deploy to Railway with a TCP proxy and note the assigned `host:port`.
+* [x] Deploy to Railway with a TCP proxy and note the assigned `host:port`.
 * **Done when:** the container runs locally and on Railway, logs show it listening, and the step 3 integration test passes against both.
 
 #### Step 5: Public STUN Selection (Section 1)
 
-* [ ] Choose the default STUN list: at least two providers and servers at different IPs.
-* [ ] Add a `just stun-check` recipe (or a client subcommand) that sends a Binding request to each configured server and prints the mapped address.
-* **Done when:** every default server returns the machine's real public `IP:port`, checked against a known external IP, and an unreachable server is reported by name without stopping the others.
+* [x] Choose the default STUN list: at least two providers and servers at different IPs.
+* [x] Add a `just stun-check` recipe (or a client subcommand) that sends a Binding request to each configured server and prints the mapped address.
+* [x] STUN tests: fake-server tests on loopback in `just check` (mapping, retransmit, timeout, noise rejection, per-server failures, cone/symmetric), and live tests against the defaults in `just test-network`.
+* **Done when:** every default server returns the machine's real public `IP:port`, checked against a known external IP, and an unreachable server is reported by name without stopping the others. *(Verified 2026-10-15: all three defaults returned the same public IP that ipinfo.io reports.)*
 
 #### Step 6: Client Handshake & NAT Detection (Section 1)
 
