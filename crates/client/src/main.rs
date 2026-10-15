@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use p2p_client::endpoint::{describe, Endpoint};
 use p2p_client::exchange::exchange;
+use p2p_client::punch::{punch, PunchConfig};
 use p2p_client::rendezvous::Rendezvous;
 use p2p_client::{resolve_v4, stun};
 use tokio::net::UdpSocket;
@@ -27,8 +28,8 @@ enum Command {
     /// Query each STUN server from one UDP socket and report the mapped
     /// addresses and the NAT type they imply.
     StunCheck,
-    /// Detect our NAT, register with the rendezvous server and trade
-    /// candidates with the first peer under the same token.
+    /// Detect our NAT, trade candidates with the first peer under the same
+    /// token, then punch a direct UDP path to it. Never relays.
     Connect {
         /// Rendezvous server (host:port), e.g. a Railway TCP proxy address.
         #[arg(long, env = "RENDEZVOUS_ADDR")]
@@ -133,6 +134,23 @@ async fn connect(rendezvous: &str, token: &str, stun_servers: &[String]) -> Resu
     println!("candidate exchange with peer {} complete", done.peer_id);
     println!("  sent:     {}", describe(&done.my_nat));
     println!("  received: {}", describe(&done.peer_nat));
+
+    let connected = punch(
+        &mut endpoint,
+        my_id,
+        done.peer_id,
+        &done.my_nat,
+        &done.peer_nat,
+        PunchConfig::DEFAULT,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    println!(
+        "direct connection to peer {} at {} established in {} ms",
+        done.peer_id,
+        connected.peer_addr,
+        connected.elapsed.as_millis()
+    );
     Ok(())
 }
 

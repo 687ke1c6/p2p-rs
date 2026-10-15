@@ -1,0 +1,41 @@
+# P2P client cross-compiled for 32-bit ARM (armv7, hard float), linked
+# against Debian bookworm's glibc, so it runs on bookworm armhf systems.
+#
+#   just client-armv7     # writes target/release/armv7/p2p-client
+#
+# The final stage is `scratch` holding only the binary: it exists to be
+# exported with `docker build --output`, not run.
+
+# Cross-compile on the build machine's native platform; no ARM emulation.
+FROM --platform=$BUILDPLATFORM rust:1.99-bookworm AS builder
+ARG TARGET=armv7-unknown-linux-gnueabihf
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add $TARGET
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+WORKDIR /build
+
+# Build dependencies against stub sources first, so editing our own code
+# doesn't rebuild every dependency. Every workspace member's manifest must be
+# present for cargo to load the workspace.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/client/Cargo.toml crates/client/
+COPY crates/protocol/Cargo.toml crates/protocol/
+COPY crates/server/Cargo.toml crates/server/
+RUN mkdir -p crates/client/src crates/protocol/src crates/server/src \
+    && echo 'fn main() {}' > crates/client/src/main.rs \
+    && echo 'fn main() {}' > crates/server/src/main.rs \
+    && touch crates/client/src/lib.rs crates/protocol/src/lib.rs crates/server/src/lib.rs \
+    && cargo build --release --locked -p p2p-client --target $TARGET \
+    && rm -r crates/*/src
+
+COPY crates crates
+# COPY keeps the files' original mtimes, which can be older than the stub
+# build, and cargo would then reuse the stub binary. Touch to force a rebuild.
+RUN find crates -name '*.rs' -exec touch {} + \
+    && cargo build --release --locked -p p2p-client --target $TARGET \
+    && cp target/$TARGET/release/p2p-client /p2p-client
+
+FROM scratch
+COPY --from=builder /p2p-client /p2p-client

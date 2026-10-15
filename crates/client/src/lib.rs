@@ -2,6 +2,7 @@
 
 pub mod endpoint;
 pub mod exchange;
+pub mod punch;
 pub mod rendezvous;
 pub mod stun;
 

@@ -44,3 +44,7 @@ stun-check *args:
 # Run the tests that need the internet (public STUN servers)
 test-network:
     cargo test -p p2p-client --test stun_live -- --ignored --nocapture
+
+# Cross-compile the client for armv7 (Debian bookworm armhf) into target/release/armv7
+client-armv7:
+    docker build -f Dockerfile.client-armv7 --output type=local,dest=target/release/armv7 .

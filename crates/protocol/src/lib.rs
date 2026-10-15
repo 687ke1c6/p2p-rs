@@ -8,7 +8,8 @@
 //!
 //! Rendezvous traffic is TCP, framed as a big-endian `u32` length followed by
 //! a `postcard`-encoded message. Peer-to-peer [`PeerMessage`]s travel as single
-//! UDP datagrams with no length prefix.
+//! UDP datagrams: [`PEER_MAGIC`] followed by the `postcard` encoding (see
+//! [`encode_peer`] / [`decode_peer`]).
 
 use std::io;
 
@@ -72,8 +73,32 @@ pub enum ServerMessage {
 /// sees these.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerMessage {
-    PunchRequest { from: PeerId },
-    PunchResponse { from: PeerId },
+    /// Sent while punching. `nonce` is random per punch attempt.
+    PunchRequest { from: PeerId, nonce: u64 },
+    /// Answers a `PunchRequest`, echoing its `nonce`, which proves the
+    /// round trip: off-path traffic can't guess it.
+    PunchResponse { from: PeerId, nonce: u64 },
+}
+
+/// Prefix on every peer datagram. The punching socket also receives STUN
+/// responses and whatever else reaches the port, and short binary junk can
+/// decode as a valid `postcard` message (a STUN success response starts
+/// `01 01`, which reads as `PunchResponse { from: 1, .. }`).
+pub const PEER_MAGIC: [u8; 4] = *b"rp2p";
+
+/// Encodes a peer datagram: [`PEER_MAGIC`] then the message.
+pub fn encode_peer(msg: &PeerMessage) -> Vec<u8> {
+    let datagram = PEER_MAGIC.to_vec();
+    postcard::to_extend(msg, datagram).expect("PeerMessage always encodes")
+}
+
+/// Decodes a peer datagram, or `None` for anything that isn't exactly one.
+pub fn decode_peer(datagram: &[u8]) -> Option<PeerMessage> {
+    let body = datagram.strip_prefix(&PEER_MAGIC)?;
+    match postcard::take_from_bytes(body) {
+        Ok((msg, [])) => Some(msg),
+        _ => None,
+    }
 }
 
 /// Encodes a message without framing, e.g. for a UDP datagram.
@@ -191,8 +216,33 @@ mod tests {
 
     #[test]
     fn peer_messages_round_trip() {
-        assert_round_trip(PeerMessage::PunchRequest { from: 1 });
-        assert_round_trip(PeerMessage::PunchResponse { from: 2 });
+        for msg in [
+            PeerMessage::PunchRequest { from: 1, nonce: 7 },
+            PeerMessage::PunchResponse {
+                from: 2,
+                nonce: u64::MAX,
+            },
+        ] {
+            let datagram = encode_peer(&msg);
+            assert!(datagram.starts_with(&PEER_MAGIC));
+            assert_eq!(decode_peer(&datagram), Some(msg));
+        }
+    }
+
+    #[test]
+    fn peer_decoding_rejects_strays() {
+        let valid = encode_peer(&PeerMessage::PunchResponse { from: 1, nonce: 9 });
+        // Without the magic, a STUN success response header decodes as a
+        // PunchResponse; with it, it doesn't.
+        let stun_header = [0x01, 0x01, 0x00, 0x0c, 0x21, 0x12, 0xa4, 0x42];
+        assert!(decode::<PeerMessage>(&stun_header).is_ok());
+        assert_eq!(decode_peer(&stun_header), None);
+        assert_eq!(decode_peer(&valid[..valid.len() - 1]), None);
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        assert_eq!(decode_peer(&trailing), None);
+        assert_eq!(decode_peer(b"rp2"), None);
+        assert_eq!(decode_peer(&[]), None);
     }
 
     #[test]

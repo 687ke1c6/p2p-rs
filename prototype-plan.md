@@ -118,7 +118,7 @@ Start from `rust-p2p-core`'s `examples/server.rs`. Keep its peer registration an
 * [x] Send STUN Binding requests from the socket that will be used for punching, build `NatInfo` (public address, local addresses, cone or symmetric) and log it. The mapping is only valid for that socket. STUN runs over `rust-p2p-core`'s main UDP tunnel (`Endpoint` in `crates/client/src/endpoint.rs`), so the `Puncher` sends from the socket the mapping describes. Detection reruns just before candidates are sent, so a long wait for the peer doesn't hand over a stale mapping.
 * [x] Client connects to the rendezvous endpoint over TCP, registers with a token and receives the peer's `NatInfo`. The newer peer (higher id) sends `PunchStart`, the older answers with `PunchReply`, so both never start at once. `Ping` every 20s keeps the connection inside the server's 60s idle timeout.
 * [x] Integration test (`crates/client/tests/exchange.rs`): two clients exchange candidates through an in-process server with fake STUN servers.
-* **Done when:** two client instances on one machine, pointed at the rendezvous server and the public STUN defaults, complete the candidate exchange. *(Verified 2026-10-15 against a local server with the public STUN defaults; Railway run pending.)*
+* **Done when:** two client instances on one machine, pointed at the rendezvous server and the public STUN defaults, complete the candidate exchange. *(Verified 2026-10-15: locally, and through the Railway rendezvous server with the public STUN defaults.)*
 
 > **Decision: UDP only.** The endpoint opens no TCP sockets and sends no TCP candidates. TCP hole punching is hard to get right and unreliable, and it would need the public TCP port, which STUN over UDP can't report. The intended transport over the punched UDP socket is QUIC, with KCP as the fallback if MTU limits become a problem. That is probably the only fallback needed.
 >
@@ -126,10 +126,12 @@ Start from `rust-p2p-core`'s `examples/server.rs`. Keep its peer registration an
 
 #### Step 7: Direct-Only Connection (Section 2)
 
-* [ ] Both peers call `Puncher::punch` with the other's `NatInfo` at roughly the same time, then confirm with a `PunchRequest`/`PunchResponse` round trip over the punched socket.
-* [ ] Abort immediately when both peers report symmetric NAT.
-* [ ] Add a timeout. On failure, abort with a clear error and no relay fallback.
-* **Done when:** a connection succeeds on a permissive network and aborts cleanly when traversal is blocked.
+* [x] Both peers call `Puncher::punch` with the other's `NatInfo` at roughly the same time, then confirm with a `PunchRequest`/`PunchResponse` round trip over the punched socket. (`crates/client/src/punch.rs`. The older peer starts punching as soon as it sends `PunchReply`, the newer one as soon as it receives it. A connection needs the round trip to work in *both* directions: the peer answered our request, and we answered one of theirs. Otherwise one side could stop while the other still waits.)
+* [x] Abort immediately when both peers report symmetric NAT.
+* [x] Add a timeout. On failure, abort with a clear error and no relay fallback. (15s by default.)
+* [x] Peer datagrams carry a magic prefix (`PEER_MAGIC`) and a per-attempt nonce that the response must echo. Without the prefix, a late STUN response on the punching socket decodes as `PunchResponse { from: 1 }`. The nonce means stray or spoofed packets can't fake a round trip.
+* [x] Tests (`crates/client/tests/punch.rs`): two clients connect end to end on loopback; both-symmetric aborts without sending anything; a silent peer times out, and the punches it receives come from the endpoint's socket; a response with the wrong nonce doesn't count.
+* **Done when:** a connection succeeds on a permissive network and aborts cleanly when traversal is blocked. *(2026-10-15: two clients on one machine connect in a few ms through the public STUN defaults. Because they share a host they connect over the LAN candidate, so this proves the handshake, not NAT traversal. The blocked case is covered by the tests. Real traversal and a real blocked network are step 9.)*
 
 #### Step 8: CLI Harness (Section 3)
 
@@ -138,7 +140,7 @@ Start from `rust-p2p-core`'s `examples/server.rs`. Keep its peer registration an
 
 #### Step 9: Cross-Network Verification (Section 2)
 
-* [ ] With rendezvous on Railway and public STUN, run the clients on two different networks and log the connection results.
+* [x] With rendezvous on Railway and public STUN, run the clients on two different networks and log the connection results. *(2026-10-15: the dev container (WSL2, behind its home NAT) and a Raspberry Pi running the armv7 build (`just client-armv7`), on a different network behind its own NAT, connected directly with the same token. `stun-check` reported cone NAT on both.)*
 * [ ] Check that the STUN-reported public addresses match each network's real public IP. If they don't, check whether the client sits behind extra NAT layers, such as a VPN or Docker without host networking.
 * [ ] Try at least one hostile case (e.g. symmetric NAT) to confirm the strict-failure behaviour.
 * **Done when:** a direct connection is logged across two networks and the failure case aborts without relaying.
