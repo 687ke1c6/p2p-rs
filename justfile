@@ -15,3 +15,24 @@ server *args:
 # Run the P2P client, passing any extra args through
 client *args:
     cargo run -p p2p-client -- {{args}}
+
+# Build the rendezvous server image
+docker-build:
+    docker build -t rendezvous-server .
+
+# Run the rendezvous server image in the background (replaces a running one)
+docker-run port="7000":
+    -docker rm -f rendezvous
+    docker run -d --name rendezvous --restart unless-stopped -e PORT={{port}} -p {{port}}:{{port}} rendezvous-server
+
+# Follow the running container's logs
+docker-logs:
+    docker logs -f rendezvous
+
+# Stop and remove the running container
+docker-stop:
+    docker rm -f rendezvous
+
+# Run the rendezvous integration tests against a deployed server, e.g. a Railway TCP proxy host:port
+test-remote addr:
+    RENDEZVOUS_TEST_ADDR={{addr}} cargo test -p rendezvous-server --test rendezvous

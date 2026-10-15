@@ -99,8 +99,9 @@ Start from `rust-p2p-core`'s `examples/server.rs`. Keep its peer registration an
 
 #### Step 4: Rendezvous Server Container & Railway Deployment (Section 5)
 
-* [ ] Write the Alpine-based multi-stage `Dockerfile` and `.dockerignore`, then build and run the image locally.
-* [ ] Add `just` recipes for building and running the image.
+* [x] Write the Alpine-based multi-stage `Dockerfile` and `.dockerignore`, then build and run the image locally.
+* [x] Add `just` recipes for building and running the image.
+* [x] Let the step 3 integration test target a running server via `RENDEZVOUS_TEST_ADDR` (`just test-remote <host:port>`).
 * [ ] Deploy to Railway with a TCP proxy and note the assigned `host:port`.
 * **Done when:** the container runs locally and on Railway, logs show it listening, and the step 3 integration test passes against both.
 

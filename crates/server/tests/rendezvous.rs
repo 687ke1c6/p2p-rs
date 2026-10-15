@@ -1,18 +1,54 @@
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{read_frame, write_frame, ClientMessage, NatInfo, NatType, PeerId, ServerMessage};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-const WAIT: Duration = Duration::from_secs(2);
+const WAIT: Duration = Duration::from_secs(5);
 
-async fn start_server() -> SocketAddr {
+/// Set to a `host:port` to run these tests against an already-running server
+/// (a local container, or the Railway TCP proxy) instead of an in-process one.
+const EXTERNAL_ADDR_VAR: &str = "RENDEZVOUS_TEST_ADDR";
+
+/// Starts (or locates) a server and returns its address with a token
+/// namespace unique to the calling test.
+async fn start_server() -> (SocketAddr, Tokens) {
+    let tokens = Tokens::new();
+    if let Ok(target) = std::env::var(EXTERNAL_ADDR_VAR) {
+        let addr = tokio::net::lookup_host(&target)
+            .await
+            .unwrap_or_else(|e| panic!("{EXTERNAL_ADDR_VAR}={target}: {e}"))
+            .next()
+            .unwrap_or_else(|| panic!("{EXTERNAL_ADDR_VAR}={target}: no addresses"));
+        return (addr, tokens);
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(rendezvous_server::serve(listener));
-    addr
+    (addr, tokens)
+}
+
+/// Token namespace for one test. Tests sharing an external server, within a
+/// run or across runs, never land in each other's groups.
+struct Tokens(String);
+
+impl Tokens {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let run_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Self(format!("{run_id}-{}", NEXT.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    fn get(&self, name: &str) -> String {
+        format!("{name}-{}", self.0)
+    }
 }
 
 struct Client {
@@ -105,12 +141,12 @@ fn nat_info(last_octet: u8) -> NatInfo {
 
 #[tokio::test]
 async fn two_peers_exchange_nat_info() {
-    let addr = start_server().await;
+    let (addr, tokens) = start_server().await;
 
-    let (mut a, a_id, a_peers) = Client::register(addr, "share-1").await;
+    let (mut a, a_id, a_peers) = Client::register(addr, &tokens.get("share-1")).await;
     assert!(a_peers.is_empty());
 
-    let (mut b, b_id, b_peers) = Client::register(addr, "share-1").await;
+    let (mut b, b_id, b_peers) = Client::register(addr, &tokens.get("share-1")).await;
     assert_eq!(b_peers, vec![a_id]);
     assert_eq!(a.recv_peer_list().await, vec![b_id]);
 
@@ -149,9 +185,9 @@ async fn two_peers_exchange_nat_info() {
 
 #[tokio::test]
 async fn tokens_are_isolated() {
-    let addr = start_server().await;
-    let (mut a, a_id, _) = Client::register(addr, "share-1").await;
-    let (mut c, _, c_peers) = Client::register(addr, "share-2").await;
+    let (addr, tokens) = start_server().await;
+    let (mut a, a_id, _) = Client::register(addr, &tokens.get("share-1")).await;
+    let (mut c, _, c_peers) = Client::register(addr, &tokens.get("share-2")).await;
 
     assert!(c_peers.is_empty(), "peer lists must not cross tokens");
     a.expect_silence().await;
@@ -167,9 +203,9 @@ async fn tokens_are_isolated() {
 
 #[tokio::test]
 async fn peer_list_updates_when_a_peer_leaves() {
-    let addr = start_server().await;
-    let (mut a, _, _) = Client::register(addr, "share-1").await;
-    let (b, b_id, _) = Client::register(addr, "share-1").await;
+    let (addr, tokens) = start_server().await;
+    let (mut a, _, _) = Client::register(addr, &tokens.get("share-1")).await;
+    let (b, b_id, _) = Client::register(addr, &tokens.get("share-1")).await;
     assert_eq!(a.recv_peer_list().await, vec![b_id]);
 
     drop(b);
@@ -178,15 +214,15 @@ async fn peer_list_updates_when_a_peer_leaves() {
 
 #[tokio::test]
 async fn ping_gets_pong() {
-    let addr = start_server().await;
-    let (mut a, _, _) = Client::register(addr, "share-1").await;
+    let (addr, tokens) = start_server().await;
+    let (mut a, _, _) = Client::register(addr, &tokens.get("share-1")).await;
     a.send(&ClientMessage::Ping).await;
     assert!(matches!(a.recv().await, ServerMessage::Pong));
 }
 
 #[tokio::test]
 async fn first_message_must_be_register() {
-    let addr = start_server().await;
+    let (addr, _) = start_server().await;
     let mut client = Client::connect(addr).await;
     client.send(&ClientMessage::Ping).await;
     assert!(matches!(client.recv().await, ServerMessage::Error { .. }));
@@ -195,7 +231,7 @@ async fn first_message_must_be_register() {
 
 #[tokio::test]
 async fn invalid_token_is_rejected() {
-    let addr = start_server().await;
+    let (addr, _) = start_server().await;
     let mut client = Client::connect(addr).await;
     client
         .send(&ClientMessage::Register {
@@ -208,8 +244,8 @@ async fn invalid_token_is_rejected() {
 
 #[tokio::test]
 async fn malformed_frame_closes_connection() {
-    let addr = start_server().await;
-    let (mut a, _, _) = Client::register(addr, "share-1").await;
+    let (addr, tokens) = start_server().await;
+    let (mut a, _, _) = Client::register(addr, &tokens.get("share-1")).await;
     // A well-formed frame whose body is not a valid ClientMessage.
     a.stream.write_u32(3).await.unwrap();
     a.stream.write_all(&[0xff, 0xff, 0xff]).await.unwrap();
@@ -218,10 +254,10 @@ async fn malformed_frame_closes_connection() {
 
 #[tokio::test]
 async fn duplicate_register_closes_connection() {
-    let addr = start_server().await;
-    let (mut a, _, _) = Client::register(addr, "share-1").await;
+    let (addr, tokens) = start_server().await;
+    let (mut a, _, _) = Client::register(addr, &tokens.get("share-1")).await;
     a.send(&ClientMessage::Register {
-        token: "share-1".into(),
+        token: tokens.get("share-1"),
     })
     .await;
     assert!(matches!(a.recv().await, ServerMessage::Error { .. }));
