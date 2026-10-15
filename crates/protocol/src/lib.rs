@@ -78,7 +78,36 @@ pub enum PeerMessage {
     /// Answers a `PunchRequest`, echoing its `nonce`, which proves the
     /// round trip: off-path traffic can't guess it.
     PunchResponse { from: PeerId, nonce: u64 },
+    /// A test payload, small enough for one datagram ([`MAX_PAYLOAD_LEN`]).
+    /// `name` is set for a file, unset for a text message. Retransmitted
+    /// with the same `seq` until acknowledged.
+    Payload {
+        from: PeerId,
+        seq: u64,
+        name: Option<String>,
+        data: Vec<u8>,
+        sha256: [u8; 32],
+    },
+    /// Acknowledges `Payload` `seq`. `intact` is whether `data` matched its
+    /// `sha256` on arrival.
+    PayloadAck {
+        from: PeerId,
+        seq: u64,
+        intact: bool,
+    },
+    /// Keeps NAT mappings open while a connection is idle.
+    Keepalive { from: PeerId },
+    /// The sender is done with this connection.
+    Bye { from: PeerId },
 }
+
+/// Largest test payload. With a name of up to [`MAX_NAME_LEN`] and the
+/// encoding overhead, a `Payload` datagram stays well under the 1280-byte
+/// minimum IPv6 MTU, so it is never fragmented.
+pub const MAX_PAYLOAD_LEN: usize = 1024;
+
+/// Longest file name a `Payload` may carry, in bytes.
+pub const MAX_NAME_LEN: usize = 100;
 
 /// Prefix on every peer datagram. The punching socket also receives STUN
 /// responses and whatever else reaches the port, and short binary junk can
@@ -222,11 +251,37 @@ mod tests {
                 from: 2,
                 nonce: u64::MAX,
             },
+            PeerMessage::Payload {
+                from: 3,
+                seq: 0,
+                name: Some("notes.txt".into()),
+                data: vec![0xab; 5],
+                sha256: [7; 32],
+            },
+            PeerMessage::PayloadAck {
+                from: 4,
+                seq: 9,
+                intact: true,
+            },
+            PeerMessage::Keepalive { from: 5 },
+            PeerMessage::Bye { from: 6 },
         ] {
             let datagram = encode_peer(&msg);
             assert!(datagram.starts_with(&PEER_MAGIC));
             assert_eq!(decode_peer(&datagram), Some(msg));
         }
+    }
+
+    #[test]
+    fn largest_payload_fits_one_unfragmented_datagram() {
+        let datagram = encode_peer(&PeerMessage::Payload {
+            from: u64::MAX,
+            seq: u64::MAX,
+            name: Some("n".repeat(MAX_NAME_LEN)),
+            data: vec![0xff; MAX_PAYLOAD_LEN],
+            sha256: [0xff; 32],
+        });
+        assert!(datagram.len() <= 1232, "{} bytes", datagram.len()); // 1280 - IPv6 - UDP headers
     }
 
     #[test]

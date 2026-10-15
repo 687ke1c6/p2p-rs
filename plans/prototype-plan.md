@@ -1,5 +1,7 @@
 ### Project Outline & Intention
 
+> **Status: complete (2026-10-15).** Two clients on different networks, each behind its own NAT, connected directly through the Railway rendezvous server and public STUN, and exchanged test payloads. Testing on a real hostile network (symmetric NAT) was left out of scope; the abort paths are covered by tests. The project then moved to iroh; see **Concluded** at the end, and [sync-plan.md](sync-plan.md) for the next phase.
+
 * **Project Name / Concept:** Direct P2P File & Folder Sync (Working Title)
 * **Core Intention:** Build a lightweight, sovereign, local-first file backup and synchronization tool in Rust. The primary constraint is **strict direct peer-to-peer connectivity**—no fallback data relays. If a direct NAT hole-punch cannot be established between peers, the connection fails entirely, ensuring data never routes through third-party infrastructure.
 * **Phase 1 Objective:** Create a minimal Rust prototype using `rust-p2p-core` to establish and verify direct TCP/UDP hole-punched sockets across known network environments.
@@ -18,12 +20,12 @@ The `rustp2p` project publishes two crates. We use the lower-level one.
 
 #### 1. Signaling & Discovery (Rendezvous)
 
-* [ ] **Lightweight Signaling Server:** Implement or deploy a minimal rendezvous server responsible *only* for metadata exchange (trading IP addresses and ports), handling zero file data.
-* [ ] **Peer Handshake:** Allow two client instances to register with the signaling server, discover each other via unique share/device tokens, and trade connection candidates.
-* [ ] **Rendezvous and STUN Are Separate Services:** Even if one process provides both, the client treats rendezvous and STUN as two independent services, each with its own `host:port`. Hosting providers like Railway give every exposed port its own hostname (e.g. `shuttle.proxy.rlwy.net:15140`), so the client must never assume both services share a host or derive one address from the other.
-* [ ] **STUN Service (Address Reflection):** STUN tells each client its public address: the source IP and port of the client's UDP packet as seen from the internet. The client speaks standard RFC 5389 STUN Binding requests, not a custom message. It uses its own small Binding client (`crates/client/src/stun.rs`) rather than `rust-p2p-core::stun`, which probes from throwaway sockets of its own (so its mappings don't apply to the punching socket), doesn't check transaction ids, and sends the RFC 3489 `CHANGE-REQUEST` attribute. We use existing public STUN servers instead of hosting our own (see the decision below).
-* [ ] **NAT Type Detection:** The client sends Binding requests to at least two STUN endpoints from the same UDP socket and compares the mapped ports. Using servers at different IPs also catches NATs that change the mapping only when the destination IP changes. The same mapping means a cone NAT, different mappings mean a symmetric NAT. The result fills `NatInfo.nat_type`, which the `Puncher` uses to choose its strategy. With only one STUN endpoint configured, the client logs a warning and assumes cone NAT.
-* [ ] **Client Endpoint Configuration:** Each service address is set by CLI flag or environment variable. Rendezvous is required. STUN has public defaults.
+* [x] **Lightweight Signaling Server:** Implement or deploy a minimal rendezvous server responsible *only* for metadata exchange (trading IP addresses and ports), handling zero file data.
+* [x] **Peer Handshake:** Allow two client instances to register with the signaling server, discover each other via unique share/device tokens, and trade connection candidates.
+* [x] **Rendezvous and STUN Are Separate Services:** Even if one process provides both, the client treats rendezvous and STUN as two independent services, each with its own `host:port`. Hosting providers like Railway give every exposed port its own hostname (e.g. `shuttle.proxy.rlwy.net:15140`), so the client must never assume both services share a host or derive one address from the other.
+* [x] **STUN Service (Address Reflection):** STUN tells each client its public address: the source IP and port of the client's UDP packet as seen from the internet. The client speaks standard RFC 5389 STUN Binding requests, not a custom message. It uses its own small Binding client (`crates/client/src/stun.rs`) rather than `rust-p2p-core::stun`, which probes from throwaway sockets of its own (so its mappings don't apply to the punching socket), doesn't check transaction ids, and sends the RFC 3489 `CHANGE-REQUEST` attribute. We use existing public STUN servers instead of hosting our own (see the decision below).
+* [x] **NAT Type Detection:** The client sends Binding requests to at least two STUN endpoints from the same UDP socket and compares the mapped ports. Using servers at different IPs also catches NATs that change the mapping only when the destination IP changes. The same mapping means a cone NAT, different mappings mean a symmetric NAT. The result fills `NatInfo.nat_type`, which the `Puncher` uses to choose its strategy. With only one STUN endpoint configured, the client logs a warning and assumes cone NAT.
+* [x] **Client Endpoint Configuration:** Each service address is set by CLI flag or environment variable. Rendezvous is required. STUN has public defaults.
   * `--rendezvous <host:port>` / `RENDEZVOUS_ADDR`: one TCP endpoint.
   * `--stun <host:port>` / `STUN_ADDRS` (comma-separated): one or more UDP endpoints. Defaults to a small list of public servers from different providers, `stun.l.google.com:19302`, `stun.cloudflare.com:3478` and `global.stun.twilio.com:3478`. (`stun1.l.google.com` was dropped: it resolves to the same IP as `stun.l.google.com`, so it can't reveal per-destination remapping.) Setting the option replaces the defaults instead of adding to them.
   * Each hostname is resolved independently at startup, and every resolved address is logged. A failure to resolve or reach one service is reported with that service's name.
@@ -33,20 +35,20 @@ The `rustp2p` project publishes two crates. We use the lower-level one.
 
 #### 2. Network Transport & Connection Constraint
 
-* [ ] **Direct-Only Enforcement:** Use the `rust-p2p-core` `Puncher` with the peer's exchanged `NatInfo` to attempt a direct peer-to-peer connection. A connection counts as established only after a punch request/response round trip over the punched socket succeeds. The server never forwards anything except signaling messages, so there is no path for data to be relayed.
-* [ ] **Early Abort:** If both peers report symmetric NAT, fail immediately with a clear "direct connection not possible" error instead of waiting for punch attempts to time out.
-* [ ] **Strict Failure Handling:** If the NAT traversal fails (e.g., hostile symmetric NATs), the app must gracefully abort the connection attempt rather than routing through a fallback relay.
-* [ ] **Connectivity Verification:** Log and verify successful raw socket connection establishment between machines across different local networks.
+* [x] **Direct-Only Enforcement:** Use the `rust-p2p-core` `Puncher` with the peer's exchanged `NatInfo` to attempt a direct peer-to-peer connection. A connection counts as established only after a punch request/response round trip over the punched socket succeeds. The server never forwards anything except signaling messages, so there is no path for data to be relayed.
+* [x] **Early Abort:** If both peers report symmetric NAT, fail immediately with a clear "direct connection not possible" error instead of waiting for punch attempts to time out.
+* [x] **Strict Failure Handling:** If the NAT traversal fails (e.g., hostile symmetric NATs), the app must gracefully abort the connection attempt rather than routing through a fallback relay.
+* [x] **Connectivity Verification:** Log and verify successful raw socket connection establishment between machines across different local networks.
 
 #### 3. Prototyping Scope & Next Steps
 
-* [ ] **CLI Harness:** Build a simple command-line interface for the prototype to trigger the connection handshake, accept incoming peer requests, and send a test payload (e.g., a simple text message or small file chunk) over the established P2P socket.
-* [ ] **Repository Setup:** Initialize a Git repository to house the prototype code, structuring it cleanly for future expansion into a local background daemon and file watcher.
+* [x] **CLI Harness:** Build a simple command-line interface for the prototype to trigger the connection handshake, accept incoming peer requests, and send a test payload (e.g., a simple text message or small file chunk) over the established P2P socket.
+* [x] **Repository Setup:** Initialize a Git repository to house the prototype code, structuring it cleanly for future expansion into a local background daemon and file watcher.
 
 #### 4. Development Environment
 
-* [ ] **Rust Dev Container:** All development happens inside a Rust dev container (`.devcontainer/devcontainer.json`, based on the official Rust dev container image or a Dockerfile pinning the Rust toolchain). It should include `rustfmt`, `clippy`, and `rust-analyzer`, so builds and tooling are reproducible across machines. Commit the dev container config to the repository.
-* [ ] **Host Networking:** The dev container runs in host network mode (`"runArgs": ["--network=host"]` in `devcontainer.json`), so it shares the host's network stack. This avoids an extra Docker NAT layer that would distort NAT traversal and hole-punching tests. Note that on Docker Desktop (including WSL2 setups using it) host mode behaves differently from native Linux, so verify the container sees the real host interfaces before trusting test results.
+* [x] **Rust Dev Container:** All development happens inside a Rust dev container (`.devcontainer/devcontainer.json`, based on the official Rust dev container image or a Dockerfile pinning the Rust toolchain). It should include `rustfmt`, `clippy`, and `rust-analyzer`, so builds and tooling are reproducible across machines. Commit the dev container config to the repository.
+* [x] **Host Networking:** The dev container runs in host network mode (`"runArgs": ["--network=host"]` in `devcontainer.json`), so it shares the host's network stack. This avoids an extra Docker NAT layer that would distort NAT traversal and hole-punching tests. Note that on Docker Desktop (including WSL2 setups using it) host mode behaves differently from native Linux, so verify the container sees the real host interfaces before trusting test results.
 
 #### 5. Running the Rendezvous Server
 
@@ -135,12 +137,46 @@ Start from `rust-p2p-core`'s `examples/server.rs`. Keep its peer registration an
 
 #### Step 8: CLI Harness (Section 3)
 
-* [ ] Add commands to initiate a connection, listen for and accept incoming peers, and send a test payload (text message or small file chunk).
-* **Done when:** the payload sent by one instance arrives intact at the other.
+* [x] Add commands to initiate a connection, listen for and accept incoming peers, and send a test payload (text message or small file chunk). `p2p-client listen [--save-dir DIR]` serves peers one at a time and prints messages or reports (and optionally saves) files. `p2p-client send --message TEXT | --file PATH` delivers one payload and exits. `p2p-client connect` only punches. Both sides run the same exchange and punch, so either can start first.
+* [x] Payloads (`crates/client/src/session.rs`) are a single datagram of up to 1024 bytes, carrying a SHA-256. The receiver checks the hash and acknowledges every copy, delivering each `seq` once. The sender retransmits until it gets an acknowledgement. Bigger transfers are for QUIC. While connected, a `Keepalive` goes out every 10s to keep NAT mappings open, and a peer silent for 45s counts as gone. The listener keeps pinging the rendezvous server so it stays registered for the next peer. Received file names must be plain names, and existing files are never overwritten.
+* [x] Tests (`crates/client/tests/session.rs`): a round trip between two sessions (a 1024-byte file and a message, then `Bye`); retransmission after a lost payload reuses its `seq`; no acknowledgement fails after every attempt; an acknowledgement reporting corruption is an error; oversized payloads are refused before sending; the receiver delivers duplicates once, acknowledges corrupted payloads as not intact, and ignores datagrams from the wrong address or peer id; a silent peer gets keepalives and then counts as gone.
+* **Done when:** the payload sent by one instance arrives intact at the other. *(Verified 2026-10-15 on one machine: a message and a 700-byte random file arrived intact (matching SHA-256, `cmp` identical), and the listener served both senders in turn.)*
 
 #### Step 9: Cross-Network Verification (Section 2)
 
 * [x] With rendezvous on Railway and public STUN, run the clients on two different networks and log the connection results. *(2026-10-15: the dev container (WSL2, behind its home NAT) and a Raspberry Pi running the armv7 build (`just client-armv7`), on a different network behind its own NAT, connected directly with the same token. `stun-check` reported cone NAT on both.)*
-* [ ] Check that the STUN-reported public addresses match each network's real public IP. If they don't, check whether the client sits behind extra NAT layers, such as a VPN or Docker without host networking.
-* [ ] Try at least one hostile case (e.g. symmetric NAT) to confirm the strict-failure behaviour.
-* **Done when:** a direct connection is logged across two networks and the failure case aborts without relaying.
+* [x] Check that the STUN-reported public addresses match each network's real public IP. If they don't, check whether the client sits behind extra NAT layers, such as a VPN or Docker without host networking.
+* [ ] ~~Try at least one hostile case (e.g. symmetric NAT) to confirm the strict-failure behaviour.~~ *Out of scope for the prototype. The abort paths (both peers symmetric, punch timeout) are covered by the step 7 tests but haven't been tried on a real hostile network.*
+* **Done when:** a direct connection is logged across two networks and the failure case aborts without relaying. *(2026-10-15: the cross-network connection is verified. The real-network failure case is out of scope, see above.)*
+
+---
+
+### Concluded (2026-10-15)
+
+The prototype met its goal, and the work stops here. The transport moves to [iroh](https://www.iroh.computer/) (1.x), and the next phase, [sync-plan.md](sync-plan.md), focuses on file sync instead. [quic-plan.md](quic-plan.md) is superseded.
+
+#### What we learned
+
+* **Direct connections work between our networks.** Two cone NATs on different networks punched through using only a rendezvous server and public STUN, connecting in milliseconds.
+* **Most of the stack ended up being ours.** We wrote the rendezvous server, the signaling protocol, the STUN client, NAT type detection, punch coordination, nonce-checked confirmation and the payload session. From `rust-p2p-core` we used only a UDP socket wrapper, the `NatInfo` structs (half their fields unused) and `Puncher::punch_now`. Its only substantial logic, port guessing for symmetric NATs, was never tried on a real network.
+* **Owning the transport means owning a lot more.** The datagram protocol has no encryption or peer authentication. Making it fit for real use meant QUIC, device identity with pinned certificates, and a socket adapter, because `rust-p2p-core` won't release its socket. iroh already provides all of that, plus more mature NAT traversal.
+* **A rendezvous server can't see the network.** It drops out once peers connect, so it can't track connections or group size. That state has to come from the peers themselves (e.g. gossip), and that's equally true with iroh's relays.
+* **Platform notes:** WSL2 adds its own NAT layer, so the dev container's local address and port aren't the host's. Railway proxies TCP only and hides client IPs, which rules out hosting STUN there.
+
+#### Why we stopped
+
+* iroh is a robust, maintained implementation of what this prototype was building, and from 1.x each connection reports its paths (`Path::is_ip()` / `is_relay()` / `is_selected()`), so the app can see and enforce whether it's direct.
+* The hard, product-defining problems are distributed state and file synchronisation, not the transport. Handing the connection to iroh puts the effort there.
+
+#### Decision: relayed traffic becomes a policy
+
+The original constraint was "direct only, never relayed". Sync is a background task that can afford slow, bandwidth-limited relays, so relayed traffic is no longer ruled out entirely. Instead it becomes a **policy**, set per peer or per folder:
+
+* **Direct only:** no application data is sent until the selected path is direct (`is_ip()`), and the connection is closed if it falls back to a relay. The QUIC handshake and hole-punching coordination still pass through the relay, end-to-end encrypted.
+* **Relay allowed:** data may flow through a relay, end-to-end encrypted.
+
+Running our own `iroh-relay` keeps even relayed traffic off third-party infrastructure.
+
+#### The prototype code
+
+The code is frozen as it stands (tag the final prototype commit). It isn't maintained as a second transport. If a network appears where iroh's traversal fails and ours wouldn't, start from iroh's `unstable-custom-transports` feature rather than running two stacks side by side. Any revival should first drop `rust-p2p-core` in favour of a plain `UdpSocket`, our own `NatInfo` and a ported punching routine.
