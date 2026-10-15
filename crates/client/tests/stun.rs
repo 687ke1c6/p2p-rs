@@ -1,89 +1,15 @@
 //! `stun::query` and `stun::probe` against fake STUN servers on loopback:
 //! real sockets, no internet.
 
+mod common;
+
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use p2p_client::stun::{self, Retry, TransactionId};
+use common::{success, tid_of, FakeServer, FAST};
+use p2p_client::stun::{self, Retry};
 use protocol::NatType;
 use tokio::net::UdpSocket;
-
-/// Short timeouts for tests that expect them to fire: gives up after 350ms.
-const FAST: Retry = Retry {
-    initial_rto: Duration::from_millis(50),
-    attempts: 3,
-};
-
-struct FakeServer {
-    addr: SocketAddr,
-    /// Every datagram received, in order.
-    requests: Arc<Mutex<Vec<Vec<u8>>>>,
-}
-
-impl FakeServer {
-    /// Starts a server that calls `handler(n, request, from)` for the n-th
-    /// datagram (0-based) and sends back whatever datagrams it returns.
-    async fn start<F>(mut handler: F) -> Self
-    where
-        F: FnMut(usize, &[u8], SocketAddr) -> Vec<Vec<u8>> + Send + 'static,
-    {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let log = requests.clone();
-        tokio::spawn(async move {
-            let mut buf = [0; 1500];
-            loop {
-                let (len, from) = socket.recv_from(&mut buf).await.unwrap();
-                let request = &buf[..len];
-                let n = {
-                    let mut log = log.lock().unwrap();
-                    log.push(request.to_vec());
-                    log.len() - 1
-                };
-                for reply in handler(n, request, from) {
-                    socket.send_to(&reply, from).await.unwrap();
-                }
-            }
-        });
-        Self { addr, requests }
-    }
-
-    /// A well-behaved server: reports each request's source address.
-    async fn echo() -> Self {
-        Self::start(|_, request, from| vec![success(request, from)]).await
-    }
-
-    /// A server that receives requests but never answers.
-    async fn silent() -> Self {
-        Self::start(|_, _, _| vec![]).await
-    }
-
-    fn requests(&self) -> Vec<Vec<u8>> {
-        self.requests.lock().unwrap().clone()
-    }
-}
-
-fn tid_of(request: &[u8]) -> TransactionId {
-    request[8..20].try_into().unwrap()
-}
-
-/// A Binding success response to `request` carrying `mapped` as an IPv4
-/// XOR-MAPPED-ADDRESS.
-fn success(request: &[u8], mapped: SocketAddr) -> Vec<u8> {
-    let SocketAddr::V4(mapped) = mapped else {
-        panic!("IPv4 only");
-    };
-    let cookie = 0x2112_A442u32.to_be_bytes();
-    let mut msg = request[..20].to_vec();
-    msg[0..2].copy_from_slice(&[0x01, 0x01]); // Binding success
-    msg[2..4].copy_from_slice(&12u16.to_be_bytes());
-    msg.extend([0x00, 0x20, 0x00, 0x08, 0x00, 0x01]); // XOR-MAPPED-ADDRESS, IPv4
-    msg.extend((mapped.port() ^ 0x2112).to_be_bytes());
-    msg.extend(mapped.ip().octets().iter().zip(cookie).map(|(b, k)| b ^ k));
-    msg
-}
 
 async fn client() -> (UdpSocket, SocketAddr) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -102,9 +28,9 @@ fn closed_port() -> SocketAddr {
 #[tokio::test]
 async fn reports_the_sockets_own_address() {
     let server = FakeServer::echo().await;
-    let (socket, local) = client().await;
+    let (mut socket, local) = client().await;
 
-    let mapped = stun::query(&socket, server.addr, Retry::DEFAULT).await;
+    let mapped = stun::query(&mut socket, server.addr, Retry::DEFAULT).await;
 
     assert_eq!(mapped.unwrap(), local);
     let requests = server.requests();
@@ -122,10 +48,10 @@ async fn retransmits_until_answered() {
         _ => vec![success(request, from)],
     })
     .await;
-    let (socket, local) = client().await;
+    let (mut socket, local) = client().await;
 
     assert_eq!(
-        stun::query(&socket, server.addr, FAST).await.unwrap(),
+        stun::query(&mut socket, server.addr, FAST).await.unwrap(),
         local
     );
 
@@ -141,10 +67,12 @@ async fn retransmits_until_answered() {
 #[tokio::test]
 async fn times_out_when_the_server_never_answers() {
     let server = FakeServer::silent().await;
-    let (socket, _) = client().await;
+    let (mut socket, _) = client().await;
 
     let started = Instant::now();
-    let err = stun::query(&socket, server.addr, FAST).await.unwrap_err();
+    let err = stun::query(&mut socket, server.addr, FAST)
+        .await
+        .unwrap_err();
     let elapsed = started.elapsed();
 
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
@@ -180,9 +108,9 @@ async fn ignores_noise_before_the_real_answer() {
         ]
     })
     .await;
-    let (socket, local) = client().await;
+    let (mut socket, local) = client().await;
 
-    let mapped = stun::query(&socket, server.addr, Retry::DEFAULT).await;
+    let mapped = stun::query(&mut socket, server.addr, Retry::DEFAULT).await;
 
     assert_eq!(mapped.unwrap(), local);
     assert_eq!(server.requests().len(), 1);
@@ -192,8 +120,10 @@ async fn ignores_noise_before_the_real_answer() {
 async fn closed_port_times_out_rather_than_erroring() {
     // On Windows the ICMP port-unreachable surfaces as a receive error, which
     // must not end the query early.
-    let (socket, _) = client().await;
-    let err = stun::query(&socket, closed_port(), FAST).await.unwrap_err();
+    let (mut socket, _) = client().await;
+    let err = stun::query(&mut socket, closed_port(), FAST)
+        .await
+        .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
 }
 
@@ -201,9 +131,9 @@ async fn closed_port_times_out_rather_than_erroring() {
 async fn probe_reports_each_server_in_order_past_failures() {
     let silent = FakeServer::silent().await;
     let live = FakeServer::echo().await;
-    let (socket, local) = client().await;
+    let (mut socket, local) = client().await;
 
-    let results = stun::probe(&socket, &[silent.addr, closed_port(), live.addr], FAST).await;
+    let results = stun::probe(&mut socket, &[silent.addr, closed_port(), live.addr], FAST).await;
 
     assert_eq!(results.len(), 3);
     assert!(results[0].is_err());
@@ -215,9 +145,9 @@ async fn probe_reports_each_server_in_order_past_failures() {
 async fn same_mapping_from_every_server_is_cone() {
     let a = FakeServer::echo().await;
     let b = FakeServer::echo().await;
-    let (socket, _) = client().await;
+    let (mut socket, _) = client().await;
 
-    let results = stun::probe(&socket, &[a.addr, b.addr], FAST).await;
+    let results = stun::probe(&mut socket, &[a.addr, b.addr], FAST).await;
     let mappings: Vec<_> = results.into_iter().map(Result::unwrap).collect();
 
     assert_eq!(stun::nat_type(&mappings), Some(NatType::Cone));
@@ -232,9 +162,9 @@ async fn different_mappings_are_symmetric() {
         vec![success(request, from)]
     })
     .await;
-    let (socket, _) = client().await;
+    let (mut socket, _) = client().await;
 
-    let results = stun::probe(&socket, &[a.addr, b.addr], FAST).await;
+    let results = stun::probe(&mut socket, &[a.addr, b.addr], FAST).await;
     let mappings: Vec<_> = results.into_iter().map(Result::unwrap).collect();
 
     assert_eq!(stun::nat_type(&mappings), Some(NatType::Symmetric));

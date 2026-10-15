@@ -114,10 +114,15 @@ Start from `rust-p2p-core`'s `examples/server.rs`. Keep its peer registration an
 
 #### Step 6: Client Handshake & NAT Detection (Section 1)
 
-* [ ] Client configuration: a required `--rendezvous <host:port>` and optional `--stun <host:port>` overrides of the public defaults (or `RENDEZVOUS_ADDR` / `STUN_ADDRS`). Resolve each hostname independently and report failures per service.
-* [ ] Send STUN Binding requests from the socket that will be used for punching, build `NatInfo` (public address, local addresses, cone or symmetric) and log it. The mapping is only valid for that socket.
-* [ ] Client connects to the rendezvous endpoint over TCP, registers with a token and receives the peer's `NatInfo`.
-* **Done when:** two client instances on one machine, pointed at the rendezvous server and the public STUN defaults, complete the candidate exchange.
+* [x] Client configuration: a required `--rendezvous <host:port>` and optional `--stun <host:port>` overrides of the public defaults (or `RENDEZVOUS_ADDR` / `STUN_ADDRS`). Resolve each hostname independently and report failures per service. The token comes from `--token` / `P2P_TOKEN`.
+* [x] Send STUN Binding requests from the socket that will be used for punching, build `NatInfo` (public address, local addresses, cone or symmetric) and log it. The mapping is only valid for that socket. STUN runs over `rust-p2p-core`'s main UDP tunnel (`Endpoint` in `crates/client/src/endpoint.rs`), so the `Puncher` sends from the socket the mapping describes. Detection reruns just before candidates are sent, so a long wait for the peer doesn't hand over a stale mapping.
+* [x] Client connects to the rendezvous endpoint over TCP, registers with a token and receives the peer's `NatInfo`. The newer peer (higher id) sends `PunchStart`, the older answers with `PunchReply`, so both never start at once. `Ping` every 20s keeps the connection inside the server's 60s idle timeout.
+* [x] Integration test (`crates/client/tests/exchange.rs`): two clients exchange candidates through an in-process server with fake STUN servers.
+* **Done when:** two client instances on one machine, pointed at the rendezvous server and the public STUN defaults, complete the candidate exchange. *(Verified 2026-10-15 against a local server with the public STUN defaults; Railway run pending.)*
+
+> **Decision: UDP only.** The endpoint opens no TCP sockets and sends no TCP candidates. TCP hole punching is hard to get right and unreliable, and it would need the public TCP port, which STUN over UDP can't report. The intended transport over the punched UDP socket is QUIC, with KCP as the fallback if MTU limits become a problem. That is probably the only fallback needed.
+>
+> **WSL2 adds a NAT layer.** In the dev container on WSL2, `--network=host` reaches the WSL2 VM, not Windows: the reported local address is the VM's (e.g. `172.27.x.x`), and the public port differs from the local port. For step 9, either run the client natively on Windows/Linux, or switch WSL2 to mirrored networking (`networkingMode=mirrored` in `.wslconfig`) and re-check.
 
 #### Step 7: Direct-Only Connection (Section 2)
 

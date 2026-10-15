@@ -660,6 +660,8 @@ dependencies = [
  "log",
  "protocol",
  "rand",
+ "rendezvous-server",
+ "rust-p2p-core",
  "tokio",
 ]
 

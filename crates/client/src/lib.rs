@@ -1,5 +1,8 @@
 //! Direct-only P2P client.
 
+pub mod endpoint;
+pub mod exchange;
+pub mod rendezvous;
 pub mod stun;
 
 use std::net::SocketAddr;

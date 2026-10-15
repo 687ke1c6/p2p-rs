@@ -1,16 +1,19 @@
 //! Minimal RFC 5389 STUN client: Binding requests only, over a socket the
 //! caller owns. A mapping is only valid for the socket that produced it, so
-//! the caller probes from the socket it will later punch with.
+//! the caller probes from the socket it will later punch with: in practice
+//! `rust-p2p-core`'s main UDP tunnel (see [`Transport`]).
 //!
 //! We don't use `rust_p2p_core::stun`: it probes from throwaway sockets of its
 //! own, doesn't check transaction ids, and sends the RFC 3489 CHANGE-REQUEST
 //! attribute, which RFC 5389-only servers may reject.
 
+use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use protocol::NatType;
+use rust_p2p_core::tunnel::udp::UdpTunnel;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
@@ -118,9 +121,54 @@ fn parse_address(value: &[u8], xor_tid: Option<&TransactionId>) -> Option<Socket
     }
 }
 
+/// A datagram socket STUN can run over.
+pub trait Transport {
+    fn send_to(
+        &mut self,
+        buf: &[u8],
+        to: SocketAddr,
+    ) -> impl Future<Output = io::Result<()>> + Send;
+    fn recv_from(
+        &mut self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
+}
+
+impl Transport for UdpSocket {
+    async fn send_to(&mut self, buf: &[u8], to: SocketAddr) -> io::Result<()> {
+        UdpSocket::send_to(self, buf, to).await.map(drop)
+    }
+    async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        UdpSocket::recv_from(self, buf).await
+    }
+}
+
+impl Transport for UdpTunnel {
+    async fn send_to(&mut self, buf: &[u8], to: SocketAddr) -> io::Result<()> {
+        UdpTunnel::send_to(self, buf, to).await
+    }
+    async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match UdpTunnel::recv_from(self, buf).await {
+            Some(Ok((len, route_key))) => Ok((len, route_key.addr())),
+            Some(Err(e)) => Err(e),
+            None => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "UDP tunnel closed",
+            )),
+        }
+    }
+}
+
 /// Sends a Binding request to `server` from `socket` and returns the public
 /// address the server saw. Retransmits per `retry`, then times out.
-pub async fn query(socket: &UdpSocket, server: SocketAddr, retry: Retry) -> io::Result<SocketAddr> {
+///
+/// Anything else that arrives on `socket` meanwhile is discarded, so nothing
+/// else may be reading from it.
+pub async fn query<T: Transport>(
+    socket: &mut T,
+    server: SocketAddr,
+    retry: Retry,
+) -> io::Result<SocketAddr> {
     let tid: TransactionId = rand::random();
     let request = binding_request(&tid);
     let mut buf = [0; 1500];
@@ -162,8 +210,8 @@ fn is_icmp_error(e: &io::Error) -> bool {
 
 /// Queries each server in turn from the same socket, so the mappings are
 /// comparable. Returns one result per server, in order.
-pub async fn probe(
-    socket: &UdpSocket,
+pub async fn probe<T: Transport>(
+    socket: &mut T,
     servers: &[SocketAddr],
     retry: Retry,
 ) -> Vec<io::Result<SocketAddr>> {

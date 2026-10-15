@@ -9,4 +9,8 @@ env_logger.workspace = true
 log.workspace = true
 protocol = { path = "../protocol" }
 rand.workspace = true
+rust-p2p-core.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+rendezvous-server = { path = "../server" }

@@ -9,7 +9,7 @@ use tokio::net::UdpSocket;
 
 /// Queries every default server from one socket. Panics listing every server
 /// that failed to resolve or answer.
-async fn query_defaults(socket: &UdpSocket) -> Vec<(&'static str, SocketAddr)> {
+async fn query_defaults(socket: &mut UdpSocket) -> Vec<(&'static str, SocketAddr)> {
     let mut mappings = Vec::new();
     let mut failures = Vec::new();
     for &server in DEFAULT_SERVERS {
@@ -30,9 +30,9 @@ async fn query_defaults(socket: &UdpSocket) -> Vec<(&'static str, SocketAddr)> {
 #[ignore = "queries public STUN servers; run with `just test-network`"]
 async fn default_servers_all_answer_with_one_public_ip() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let mut socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
 
-    let mappings = query_defaults(&socket).await;
+    let mappings = query_defaults(&mut socket).await;
     for (server, mapped) in &mappings {
         println!("{server} -> {mapped}");
     }
@@ -54,9 +54,9 @@ async fn default_servers_all_answer_with_one_public_ip() {
 #[tokio::test]
 #[ignore = "queries public STUN servers; run with `just test-network`"]
 async fn a_socket_keeps_its_mapping_across_queries() {
-    let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-    let first = query_defaults(&socket).await;
-    let second = query_defaults(&socket).await;
+    let mut socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let first = query_defaults(&mut socket).await;
+    let second = query_defaults(&mut socket).await;
     println!("first:  {first:?}\nsecond: {second:?}");
     assert_eq!(first, second, "the NAT remapped the socket between queries");
 }
