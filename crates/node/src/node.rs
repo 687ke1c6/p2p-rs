@@ -187,7 +187,7 @@ impl Node {
             gate,
             peers,
             view: View::new(config.presence_interval),
-            names,
+            names: names.clone(),
             folders: Folders::new(
                 config_dir,
                 docs.clone(),
@@ -195,6 +195,7 @@ impl Node {
                 router.endpoint(),
                 config.debounce,
                 config.content,
+                names,
             ),
             config,
             monitor: Mutex::new(None),

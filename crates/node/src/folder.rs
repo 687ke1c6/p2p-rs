@@ -301,6 +301,8 @@ struct Inner {
     debounce: Duration,
     /// Content transfer is on (`run --with-content`).
     content: bool,
+    /// Members' names, for naming conflict copies.
+    names: Names,
     running: Mutex<HashMap<NamespaceId, Running>>,
     /// Held by `add` and `check`, so they never start the same folder twice.
     starting: tokio::sync::Mutex<()>,
@@ -342,6 +344,7 @@ impl Folders {
         endpoint: &Endpoint,
         debounce: Duration,
         content: bool,
+        names: Names,
     ) -> Self {
         Self(Arc::new(Inner {
             config_dir: config_dir.to_owned(),
@@ -351,6 +354,7 @@ impl Folders {
             me: endpoint.id(),
             debounce,
             content,
+            names,
             running: Mutex::new(HashMap::new()),
             starting: tokio::sync::Mutex::new(()),
         }))
@@ -611,6 +615,7 @@ impl Folders {
                 downloader: self.0.downloader.clone(),
                 changed,
                 apply: tx,
+                names: self.0.names.clone(),
             };
             (Some(content), Some(rx))
         } else {

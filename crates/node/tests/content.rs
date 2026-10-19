@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::future::Future;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -55,24 +56,33 @@ fn read(root: &Path, rel: &str) -> Option<Vec<u8>> {
     fs::read(root.join(rel)).ok()
 }
 
-/// Every regular file under `root` but the marker: path → contents.
+/// Every regular file under `root` but the marker and the node's temporary
+/// files: path → contents. Files and directories that vanish while it reads
+/// (the node is still working) are skipped.
 fn tree(root: &Path) -> Vec<(String, Vec<u8>)> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
-        for entry in fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
-            let kind = entry.file_type().unwrap();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let name = entry.file_name();
+            let name = name.to_str().unwrap();
             if kind.is_dir() {
                 walk(root, &path, out);
-            } else if kind.is_file() {
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string();
-                if rel != ".syncfolder" {
-                    out.push((rel, fs::read(&path).unwrap()));
+            } else if kind.is_file() && rel != ".syncfolder" && !name.starts_with(".sync-node-tmp-")
+            {
+                if let Ok(bytes) = fs::read(&path) {
+                    out.push((rel, bytes));
                 }
             }
         }
@@ -81,6 +91,24 @@ fn tree(root: &Path) -> Vec<(String, Vec<u8>)> {
     walk(root, root, &mut out);
     out.sort();
     out
+}
+
+/// The conflict copies in `tree`.
+fn conflict_copies(tree: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
+    tree.iter()
+        .filter(|(p, _)| p.contains(".sync-conflict-"))
+        .cloned()
+        .collect()
+}
+
+/// The bytes `node` has received from `peer`.
+fn received(node: &Node, peer: &Node) -> u64 {
+    node.status()
+        .unwrap()
+        .member(peer.id())
+        .and_then(|m| m.peer.as_ref())
+        .map(|p| p.traffic.direct_recv + p.traffic.relay_recv)
+        .unwrap_or(0)
 }
 
 /// A group of a node per directory.
@@ -149,9 +177,20 @@ async fn two_nodes_converge() {
     .await;
     let mtime = |path: PathBuf| fs::metadata(path).unwrap().modified().unwrap();
     assert_eq!(mtime(ra.join("only-a.txt")), mtime(rb.join("only-a.txt")));
-    // A conflict is left alone until step 7.
-    assert_eq!(read(ra, "clash.txt").unwrap(), b"a's version");
-    assert_eq!(read(rb, "clash.txt").unwrap(), b"b's version");
+    // The conflict: the newer version keeps the name, and the other is
+    // kept beside it on both nodes.
+    eventually("the conflict to be resolved", || async {
+        let (ta, tb) = (tree(ra), tree(rb));
+        ta == tb && conflict_copies(&ta).len() == 1
+    })
+    .await;
+    let t = tree(ra);
+    let mut versions = vec![
+        read(ra, "clash.txt").unwrap(),
+        conflict_copies(&t)[0].1.clone(),
+    ];
+    versions.sort();
+    assert_eq!(versions, [b"a's version".to_vec(), b"b's version".to_vec()]);
 
     // Changes keep flowing: a delete, an edit, and a delete that empties
     // its directories.
@@ -165,16 +204,11 @@ async fn two_nodes_converge() {
     })
     .await;
 
-    let without_clash = |root| {
-        let mut t = tree(root);
-        t.retain(|(p, _)| p != "clash.txt");
-        t
-    };
-    assert_eq!(without_clash(ra), without_clash(rb));
-    // Every path but the conflict is in sync in the merged view.
+    assert_eq!(tree(ra), tree(rb));
+    // Every path is in sync in the merged view.
     eventually("the view to settle", || async {
         let v = a.folder_view(id).await.unwrap();
-        v.paths.iter().all(|p| p.in_sync() || p.path == "clash.txt")
+        v.paths.iter().all(|p| p.in_sync())
     })
     .await;
 
@@ -289,13 +323,7 @@ async fn a_partial_transfer_resumes() {
     })
     .await;
     // Only the missing half crossed the wire, plus overhead.
-    let received = b
-        .status()
-        .unwrap()
-        .member(a.id())
-        .and_then(|m| m.peer.as_ref())
-        .map(|p| p.traffic.direct_recv + p.traffic.relay_recv)
-        .unwrap();
+    let received = received(&b, &a);
     assert!(
         received < (SIZE as u64) * 3 / 4,
         "received {received} bytes for {SIZE}"
@@ -303,4 +331,117 @@ async fn a_partial_transfer_resumes() {
 
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_rename_moves_the_file() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ra, rb) = (pa.path(), pb.path());
+    const SIZE: usize = 2 << 20;
+    let data: Vec<u8> = (0..SIZE).map(|i| (i * 13 + i / 1021) as u8).collect();
+    write(ra, "old/photo.bin", &data);
+    let id = add_folder(a, "docs", ra, None).await;
+    add_folder(b, "docs", rb, Some(id)).await;
+    eventually("b to fetch the file", || async {
+        read(rb, "old/photo.bin").is_some_and(|got| got == data)
+    })
+    .await;
+    let inode = fs::metadata(rb.join("old/photo.bin")).unwrap().ino();
+    let before = received(b, a);
+
+    fs::create_dir(ra.join("new")).unwrap();
+    fs::rename(ra.join("old/photo.bin"), ra.join("new/photo.bin")).unwrap();
+    eventually("b to move the file", || async {
+        read(rb, "new/photo.bin").is_some_and(|got| got == data) && !rb.join("old").exists()
+    })
+    .await;
+    // The same file, moved: not fetched again, nor copied.
+    assert_eq!(fs::metadata(rb.join("new/photo.bin")).unwrap().ino(), inode);
+    let fetched = received(b, a) - before;
+    assert!(fetched < SIZE as u64 / 4, "received {fetched} bytes");
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// The plan's "done when" for step 7: three nodes converge through an edit
+/// conflict, a delete and a rename, all made while one of them is offline.
+#[tokio::test]
+async fn three_nodes_converge_with_one_offline() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let mut nodes = nodes.into_iter();
+    let (a, b, c) = (
+        nodes.next().unwrap(),
+        nodes.next().unwrap(),
+        nodes.next().unwrap(),
+    );
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (ra, rb, rc) = (roots[0].path(), roots[1].path(), roots[2].path());
+    write(ra, "edited.txt", b"original");
+    write(ra, "deleted.txt", b"to delete");
+    write(ra, "renamed.txt", b"to rename");
+    write(ra, "kept.txt", b"kept");
+    let id = add_folder(&a, "docs", ra, None).await;
+    add_folder(&b, "docs", rb, Some(id)).await;
+    add_folder(&c, "docs", rc, Some(id)).await;
+    eventually("all three to hold the folder", || async {
+        let t = tree(ra);
+        t.len() == 4 && tree(rb) == t && tree(rc) == t
+    })
+    .await;
+
+    // c goes offline, and everyone changes things.
+    let key = c.endpoint().secret_key().clone();
+    c.shutdown().await.unwrap();
+    write(rc, "edited.txt", b"c's edit");
+    // Written later, so newer: a's edit keeps the name.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    write(ra, "edited.txt", b"a's edit");
+    fs::remove_file(rb.join("deleted.txt")).unwrap();
+    fs::rename(ra.join("renamed.txt"), ra.join("moved.txt")).unwrap();
+    eventually("a and b to agree without c", || async {
+        let t = tree(ra);
+        tree(rb) == t && read(ra, "moved.txt").is_some() && read(ra, "deleted.txt").is_none()
+    })
+    .await;
+
+    // c comes back.
+    let c = spawn(dirs[2].path(), key, &book).await;
+    eventually("all three to converge", || async {
+        let t = tree(ra);
+        tree(rb) == t && tree(rc) == t && conflict_copies(&t).len() == 1
+    })
+    .await;
+    let t = tree(ra);
+    let names: Vec<&str> = t.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(read(ra, "edited.txt").unwrap(), b"a's edit");
+    let copy = &conflict_copies(&t)[0];
+    assert_eq!(copy.1, b"c's edit");
+    assert!(
+        copy.0.starts_with("edited.sync-conflict-")
+            && copy.0.ends_with(&format!("-{}.txt", c.id().fmt_short())),
+        "{}",
+        copy.0
+    );
+    // The delete stayed deleted and the rename moved, despite c's old copies.
+    assert_eq!(
+        names,
+        [copy.0.as_str(), "edited.txt", "kept.txt", "moved.txt"]
+    );
+    eventually("the view to settle", || async {
+        let v = c.folder_view(id).await.unwrap();
+        v.paths.iter().all(|p| p.in_sync())
+    })
+    .await;
+
+    for node in [a, b, c] {
+        node.shutdown().await.unwrap();
+    }
 }

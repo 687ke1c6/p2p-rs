@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, Metadata};
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -49,6 +49,21 @@ pub const SYNCIGNORE: &str = ".syncignore";
 /// Files starting with this are the node's own temporary files, always
 /// ignored.
 pub const TEMP_PREFIX: &str = ".sync-node-tmp-";
+
+/// The file placement in progress, at the folder root: a placement writes
+/// it before moving the file into place and removes it once the entry is
+/// written. If the node stops in between, opening the index finishes the
+/// placement; otherwise the next scan would index the file as a new local
+/// file, whose version would then beat a concurrent delete or rename made
+/// elsewhere. A temporary file, so never indexed.
+const JOURNAL: &str = ".sync-node-tmp-placing";
+
+/// What [`JOURNAL`] holds: the entry to write once the file is in place.
+#[derive(Debug, Serialize, Deserialize)]
+struct Placing {
+    path: String,
+    meta: FileMeta,
+}
 
 /// Marks a folder's root. A folder whose marker is missing is paused rather
 /// than scanned: its directory has moved, been deleted or isn't mounted, and
@@ -172,6 +187,27 @@ pub(crate) enum Apply {
         version: Version,
         done: oneshot::Sender<anyhow::Result<bool>>,
     },
+    /// A conflict this node's version of `path` lost: rename it to `copy`,
+    /// then put `meta`'s content (the winner) at `path`.
+    Resolve {
+        path: String,
+        expect: FileMeta,
+        copy: String,
+        meta: FileMeta,
+        done: oneshot::Sender<anyhow::Result<bool>>,
+    },
+    /// A rename elsewhere: move this node's file at `from` to `to`, rather
+    /// than fetch `to` and delete `from`. `meta` becomes the entry at `to`,
+    /// and `from` is tombstoned with `tombstone`.
+    Move {
+        from: String,
+        from_expect: FileMeta,
+        to: String,
+        to_expect: Option<FileMeta>,
+        meta: FileMeta,
+        tombstone: Version,
+        done: oneshot::Sender<anyhow::Result<bool>>,
+    },
 }
 
 pub struct FolderIndex {
@@ -201,7 +237,7 @@ impl FolderIndex {
         let author = docs.author_default().await?;
         let entries = read_entries(&doc, blobs, author).await?;
         let ignore = load_ignore(&root);
-        Ok(Self {
+        let mut index = Self {
             root,
             doc,
             blobs: blobs.clone(),
@@ -210,7 +246,31 @@ impl FolderIndex {
             entries,
             ignore,
             content,
-        })
+        };
+        index.finish_journal().await?;
+        Ok(index)
+    }
+
+    /// Finishes a placement the node stopped in the middle of (see
+    /// [`JOURNAL`]): writes its entry if the file is in place as planned.
+    async fn finish_journal(&mut self) -> anyhow::Result<()> {
+        let journal = self.root.join(JOURNAL);
+        let bytes = match fs::read(&journal) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err).context("reading the placement journal"),
+        };
+        if let Ok(Placing { path, meta }) = postcard::from_bytes(&bytes) {
+            let placed = safe_path(&path)
+                && fs::symlink_metadata(self.root.join(&path))
+                    .is_ok_and(|m| m.is_file() && Stat::of(&m) == meta.stat());
+            if placed && self.entries.get(&path) != Some(&meta) {
+                tracing::debug!("finishing the placement of {path}");
+                self.write(&path, meta).await?;
+            }
+        }
+        let _ = fs::remove_file(&journal);
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -365,17 +425,37 @@ impl FolderIndex {
         &mut self,
         path: &str,
         expect: Option<&FileMeta>,
-        mut meta: FileMeta,
+        meta: FileMeta,
     ) -> anyhow::Result<bool> {
         check_root(&self.root)?;
-        if !safe_path(path) || self.is_ignored(path, false) {
-            anyhow::bail!("refusing to write {path:?}: unsafe or ignored path");
-        }
+        self.check_writable(path)?;
         if self.entries.get(path) != expect {
             return Ok(false);
         }
-        let hash = meta.content.context("placing a tombstone")?;
         let expect = expect.filter(|e| !e.is_deleted()).map(FileMeta::stat);
+        self.place_at(path, expect, meta).await
+    }
+
+    /// Refuses a path from another node that isn't safe to write here.
+    fn check_writable(&self, path: &str) -> anyhow::Result<()> {
+        if !safe_path(path) || self.is_ignored(path, false) {
+            anyhow::bail!("refusing to write {path:?}: unsafe or ignored path");
+        }
+        Ok(())
+    }
+
+    /// Writes `meta`'s content at `path`, if the disk there matches
+    /// `expect`, and makes `meta` the entry. The content comes from the blob
+    /// store, or failing that from another of this node's files with the
+    /// same content: a file added by reference can't be read from the store
+    /// once it has moved.
+    async fn place_at(
+        &mut self,
+        path: &str,
+        expect: Option<Stat>,
+        mut meta: FileMeta,
+    ) -> anyhow::Result<bool> {
+        let hash = meta.content.context("placing a tombstone")?;
         let abs = self.root.join(path);
         let (root, rel, target) = (self.root.clone(), path.to_string(), abs.clone());
         let ready = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
@@ -388,14 +468,24 @@ impl FolderIndex {
         }
         let temp = abs.with_file_name(format!("{TEMP_PREFIX}{:016x}", rand::random::<u64>()));
         let result = async {
-            self.blobs
-                .export(hash, &temp)
-                .finish()
-                .await
-                .context("exporting from the blob store")?;
-            let (temp, size, mtime_ns) = (temp.clone(), meta.size, meta.mtime_ns);
+            let exported = self.blobs.export(hash, &temp).finish().await;
+            if let Err(err) = exported {
+                let Some(source) = self.local_copy(hash, path) else {
+                    return Err(err).context("exporting from the blob store");
+                };
+                let temp = temp.clone();
+                tokio::task::spawn_blocking(move || fs::copy(source, temp))
+                    .await?
+                    .context("copying a local file with the same content")?;
+            }
+            meta.node = self.node;
+            let placing = Placing {
+                path: path.to_string(),
+                meta: meta.clone(),
+            };
+            let (temp, journal) = (temp.clone(), self.root.join(JOURNAL));
             tokio::task::spawn_blocking(move || {
-                finish_place(&temp, &abs, hash, size, mtime_ns, expect)
+                finish_place(&temp, &abs, hash, expect, &journal, placing)
             })
             .await?
         }
@@ -409,8 +499,121 @@ impl FolderIndex {
         };
         meta.size = stat.size;
         meta.mtime_ns = stat.mtime_ns;
-        meta.node = self.node;
         self.write(path, meta).await?;
+        let _ = fs::remove_file(self.root.join(JOURNAL));
+        Ok(true)
+    }
+
+    /// Another of this node's files holding `hash`, as its entry says,
+    /// other than `except`.
+    fn local_copy(&self, hash: Hash, except: &str) -> Option<PathBuf> {
+        self.entries
+            .iter()
+            .find(|(path, meta)| *path != except && meta.content == Some(hash))
+            .map(|(path, _)| self.root.join(path))
+    }
+
+    /// Resolves a conflict this node's version lost: renames its file at
+    /// `path` (still as `expect` says) to `copy`, indexes the copy as a new
+    /// file, and puts the winner, `meta`, at `path`. Returns whether it did.
+    pub async fn resolve(
+        &mut self,
+        path: &str,
+        expect: &FileMeta,
+        copy: &str,
+        meta: FileMeta,
+    ) -> anyhow::Result<bool> {
+        check_root(&self.root)?;
+        self.check_writable(path)?;
+        self.check_writable(copy)?;
+        if expect.is_deleted()
+            || self.entries.get(path) != Some(expect)
+            || self.entries.get(copy).is_some_and(|e| !e.is_deleted())
+        {
+            return Ok(false);
+        }
+        let (from, to, expect) = (self.root.join(path), self.root.join(copy), expect.stat());
+        let moved = tokio::task::spawn_blocking(move || -> io::Result<Option<Stat>> {
+            if !disk_matches(&from, Some(expect))? || !disk_matches(&to, None)? {
+                return Ok(None);
+            }
+            fs::rename(&from, &to)?;
+            Ok(Some(Stat::of(&fs::symlink_metadata(&to)?)))
+        })
+        .await??;
+        let Some(stat) = moved else {
+            return Ok(false);
+        };
+        self.index_file(copy, stat).await?;
+        // The name is free now. If this fails, the next reconcile tombstones
+        // `path`, the winner's edit beats that, and a later pass fetches it.
+        self.place_at(path, None, meta).await
+    }
+
+    /// Moves this node's file at `from` (still as `from_expect` says) to
+    /// `to`, where this node has nothing (`to_expect` is missing or a
+    /// tombstone), gives it `meta`'s modification time, and records `meta`
+    /// at `to` and a tombstone with version `tombstone` at `from`. Returns
+    /// whether it did.
+    pub async fn move_file(
+        &mut self,
+        from: &str,
+        from_expect: &FileMeta,
+        to: &str,
+        to_expect: Option<&FileMeta>,
+        mut meta: FileMeta,
+        tombstone: Version,
+    ) -> anyhow::Result<bool> {
+        check_root(&self.root)?;
+        self.check_writable(to)?;
+        if !safe_path(from)
+            || from_expect.is_deleted()
+            || from_expect.content != meta.content
+            || to_expect.is_some_and(|e| !e.is_deleted())
+            || self.entries.get(from) != Some(from_expect)
+            || self.entries.get(to) != to_expect
+        {
+            return Ok(false);
+        }
+        let (root, src, dst) = (self.root.clone(), from.to_string(), to.to_string());
+        let (expect, mtime_ns) = (from_expect.stat(), meta.mtime_ns);
+        let moved = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Stat>> {
+            let (from, to) = (root.join(&src), root.join(&dst));
+            make_parents(&root, &dst)?;
+            if !disk_matches(&from, Some(expect))? || !disk_matches(&to, None)? {
+                return Ok(None);
+            }
+            File::options()
+                .write(true)
+                .open(&from)?
+                .set_modified(UNIX_EPOCH + Duration::from_nanos(mtime_ns))?;
+            fs::rename(&from, &to)?;
+            remove_empty_parents(&root, &src);
+            Ok(Some(Stat::of(&fs::symlink_metadata(&to)?)))
+        })
+        .await??;
+        let Some(stat) = moved else {
+            return Ok(false);
+        };
+        meta.size = stat.size;
+        meta.mtime_ns = stat.mtime_ns;
+        meta.node = self.node;
+        self.write(to, meta).await?;
+        let gone = FileMeta {
+            content: None,
+            size: 0,
+            mtime_ns: unix_now_ns(),
+            node: self.node,
+            version: tombstone,
+        };
+        self.write(from, gone).await?;
+        if self.content {
+            // Records the new path in the blob store, so the file can still be
+            // sent from here.
+            if let Err(err) = self.import(self.root.join(to)).await {
+                tracing::debug!("adding moved {to} to the blob store: {err:#}");
+            }
+        }
         Ok(true)
     }
 
@@ -472,6 +675,36 @@ impl FolderIndex {
                 done,
             } => {
                 let _ = done.send(self.remove(&path, &expect, version).await);
+            }
+            Apply::Resolve {
+                path,
+                expect,
+                copy,
+                meta,
+                done,
+            } => {
+                let _ = done.send(self.resolve(&path, &expect, &copy, meta).await);
+            }
+            Apply::Move {
+                from,
+                from_expect,
+                to,
+                to_expect,
+                meta,
+                tombstone,
+                done,
+            } => {
+                let result = self
+                    .move_file(
+                        &from,
+                        &from_expect,
+                        &to,
+                        to_expect.as_ref(),
+                        meta,
+                        tombstone,
+                    )
+                    .await;
+                let _ = done.send(result);
             }
         }
     }
@@ -723,18 +956,20 @@ fn remove_empty_parents(root: &Path, rel: &str) {
     }
 }
 
-/// Checks the exported file at `temp` against `hash` and `size`, gives it
-/// modification time `mtime_ns` and moves it to `abs`, if the disk there
-/// still matches `expect`. Returns the placed file's size and modification
-/// time, or `None` if the disk changed.
+/// Checks the exported file at `temp` against `hash` and the entry's size,
+/// gives it the entry's modification time and moves it to `abs`, if the disk
+/// there still matches `expect`. The entry, with the file's final size and
+/// modification time, goes to `journal` first. Returns that size and
+/// modification time, or `None` if the disk changed.
 fn finish_place(
     temp: &Path,
     abs: &Path,
     hash: Hash,
-    size: u64,
-    mtime_ns: u64,
     expect: Option<Stat>,
+    journal: &Path,
+    mut placing: Placing,
 ) -> anyhow::Result<Option<Stat>> {
+    let (size, mtime_ns) = (placing.meta.size, placing.meta.mtime_ns);
     let file = File::options().read(true).write(true).open(temp)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update_reader(&file)?;
@@ -748,12 +983,19 @@ fn finish_place(
     }
     file.set_modified(UNIX_EPOCH + Duration::from_nanos(mtime_ns))?;
     file.sync_all()?;
+    // The file system may store a coarser modification time.
+    let stat = Stat::of(&file.metadata()?);
     drop(file);
     if !disk_matches(abs, expect)? {
         return Ok(None);
     }
+    placing.meta.size = stat.size;
+    placing.meta.mtime_ns = stat.mtime_ns;
+    let mut record = File::create(journal)?;
+    record.write_all(&postcard::to_stdvec(&placing)?)?;
+    record.sync_all()?;
     fs::rename(temp, abs)?;
-    Ok(Some(Stat::of(&fs::symlink_metadata(abs)?)))
+    Ok(Some(stat))
 }
 
 /// Hashes the file at `path`, or `None` if it isn't a regular file any more
