@@ -8,6 +8,8 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1"
+# Tests only: the chunk ranges iroh-blobs takes, at the version it uses.
+bao-tree = "=0.16.1"
 blake3 = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }

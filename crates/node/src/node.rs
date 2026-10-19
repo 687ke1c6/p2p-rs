@@ -69,6 +69,10 @@ pub struct Config {
     /// each node adds itself to when it starts, as n0's DNS does outside
     /// tests. Lets a node reach another by ID alone, whenever it started.
     pub address_book: Option<MemoryLookup>,
+    /// Transfer file contents: fetch what the merged view says this node is
+    /// missing and delete what was deleted (`run --with-content`). Off, only
+    /// the index syncs.
+    pub content: bool,
 }
 
 impl Config {
@@ -78,6 +82,7 @@ impl Config {
             presence_interval: PRESENCE_INTERVAL,
             debounce: DEBOUNCE,
             address_book: None,
+            content: false,
         }
     }
 }
@@ -189,6 +194,7 @@ impl Node {
                 blobs.clone(),
                 router.endpoint(),
                 config.debounce,
+                config.content,
             ),
             config,
             monitor: Mutex::new(None),

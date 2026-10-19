@@ -33,10 +33,13 @@ use iroh_docs::engine::LiveEvent;
 use iroh_docs::protocol::Docs;
 use iroh_docs::store::Query;
 use iroh_docs::{Capability, NamespaceId, NamespaceSecret};
+use n0_future::task::AbortOnDropHandle;
 use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
+use crate::content::Content;
 use crate::index::{self, FileMeta, FolderIndex, IndexStats};
 use crate::member::{check_name, NameError, Names};
 use crate::record::{unix_now, GroupId};
@@ -296,6 +299,8 @@ struct Inner {
     /// Fetches index metadata docs failed to fetch.
     downloader: Downloader,
     debounce: Duration,
+    /// Content transfer is on (`run --with-content`).
+    content: bool,
     running: Mutex<HashMap<NamespaceId, Running>>,
     /// Held by `add` and `check`, so they never start the same folder twice.
     starting: tokio::sync::Mutex<()>,
@@ -307,9 +312,11 @@ struct Running {
     stats: Arc<Mutex<IndexStats>>,
     /// The index task. `None`, or finished, while the folder is paused.
     task: Option<JoinHandle<()>>,
-    /// Sets `dirty` on every change to the doc.
+    /// Sets `dirty` and notifies `changed` on every change to the doc.
     events: JoinHandle<()>,
     dirty: Arc<AtomicBool>,
+    /// Wakes the content task.
+    changed: Arc<Notify>,
     /// The nodes the doc is synced with.
     peers: BTreeSet<EndpointId>,
 }
@@ -334,6 +341,7 @@ impl Folders {
         blobs: FsStore,
         endpoint: &Endpoint,
         debounce: Duration,
+        content: bool,
     ) -> Self {
         Self(Arc::new(Inner {
             config_dir: config_dir.to_owned(),
@@ -342,6 +350,7 @@ impl Folders {
             blobs,
             me: endpoint.id(),
             debounce,
+            content,
             running: Mutex::new(HashMap::new()),
             starting: tokio::sync::Mutex::new(()),
         }))
@@ -475,7 +484,8 @@ impl Folders {
             .context("folder doc missing")?;
         let mut events = doc.subscribe().await?;
         let dirty = Arc::new(AtomicBool::new(true));
-        let flag = dirty.clone();
+        let changed = Arc::new(Notify::new());
+        let (flag, notify) = (dirty.clone(), changed.clone());
         let events = tokio::spawn(async move {
             while let Some(event) = events.next().await {
                 if matches!(
@@ -485,6 +495,7 @@ impl Folders {
                         | LiveEvent::ContentReady { .. })
                 ) {
                     flag.store(true, Ordering::Relaxed);
+                    notify.notify_one();
                 }
             }
         });
@@ -494,6 +505,7 @@ impl Folders {
             task: None,
             events,
             dirty,
+            changed,
             peers: BTreeSet::new(),
         })
     }
@@ -566,7 +578,8 @@ impl Folders {
         Ok(())
     }
 
-    /// Starts the index task, if the folder's root is there.
+    /// Starts the index task, if the folder's root is there, and with
+    /// content transfer on, the content task, which stops with it.
     async fn start_index(&self, config: &FolderConfig) -> anyhow::Result<JoinHandle<()>> {
         index::check_root(&config.path)?;
         let index = FolderIndex::open(
@@ -575,23 +588,40 @@ impl Folders {
             config.id,
             config.path.clone(),
             self.0.me,
+            self.0.content,
         )
         .await?;
-        let stats = self
+        let (stats, changed) = self
             .0
             .running
             .lock()
             .unwrap()
             .get(&config.id)
-            .map(|r| r.stats.clone())
+            .map(|r| (r.stats.clone(), r.changed.clone()))
             .unwrap_or_default();
         *stats.lock().unwrap() = index.stats();
-        Ok(tokio::spawn(index::watch(
-            index,
-            config.name.clone(),
-            self.0.debounce,
-            stats,
-        )))
+        let (content, apply) = if self.0.content {
+            let (tx, rx) = mpsc::channel(1);
+            let content = Content {
+                name: config.name.clone(),
+                folder: config.id,
+                me: self.0.me,
+                docs: self.0.docs.clone(),
+                blobs: self.0.blobs.clone(),
+                downloader: self.0.downloader.clone(),
+                changed,
+                apply: tx,
+            };
+            (Some(content), Some(rx))
+        } else {
+            (None, None)
+        };
+        let watch = index::watch(index, config.name.clone(), self.0.debounce, stats, apply);
+        Ok(tokio::spawn(async move {
+            // Aborted when the index task ends or is aborted.
+            let _content = content.map(|c| AbortOnDropHandle::new(tokio::spawn(c.run())));
+            watch.await;
+        }))
     }
 
     /// Keeps a folder named `name` at `path` on this node: joins the

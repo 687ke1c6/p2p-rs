@@ -1,5 +1,6 @@
 //! Local-first folder sync over iroh. See `plans/sync-plan.md`.
 
+pub mod content;
 pub mod folder;
 pub mod gate;
 pub mod group;

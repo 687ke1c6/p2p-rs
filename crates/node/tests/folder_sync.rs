@@ -25,6 +25,7 @@ async fn spawn(dir: &Path, key: SecretKey, book: &MemoryLookup) -> Node {
         presence_interval: INTERVAL,
         debounce: DEBOUNCE,
         address_book: Some(book.clone()),
+        content: false,
     };
     Node::spawn_with(dir, key, config).await.unwrap()
 }

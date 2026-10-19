@@ -61,6 +61,7 @@ Decided 2026-10-18.
 * **Folder marker:** a `.syncfolder` file at the folder root, created by `folder add`, always ignored. A folder whose marker is missing is paused, not scanned: its directory moved, was deleted or isn't mounted, and scanning it would tombstone every file on every node. The node resumes it once the marker is back.
 * **Ignore rules:** a `.syncignore` file at the folder root, in `.gitignore` syntax (the `ignore` crate's matcher). It is an ordinary file, so it syncs and every node ignores the same paths. The node's own temporary files are always ignored.
 
+#### Signed Membership
 
 * **The founder** creates the group: the `iroh-docs` namespace for the membership document and a self-signed record for itself.
 * **A membership record** is `{ group, member: EndpointId, added_by: EndpointId, added_at }`, signed by `added_by`'s endpoint key. It is stored in the membership document under `members/<EndpointId>`. A record is valid if its signer has a valid record, following the chain back to the founder.
@@ -226,7 +227,7 @@ Built as two parts, done together.
 * [x] Fix the join protocol's one-at-a-time permit: release it before waiting for the connection to close, and put a timeout on reading the request, so an idle connection can't block other joins.
 * [x] Tests: a name set on one node shows on every node; a rename replaces it everywhere; a duplicate name is refused.
 * [x] Tests: a node added by ID joins without an invite, through the member that added it and through another member once the record has synced; an ID not in the doc is refused; an idle connection on the join ALPN doesn't block a real join.
-* [ ] armv7: the developer rebuilds and adds the Pi to the dev container's group by ID.
+* [x] armv7: the developer rebuilds and adds the Pi to the dev container's group by ID.
 * **Done when:** a node added by ID joins a two-node group through either member, and all three hold the same membership doc.
 
 **Notes:**
@@ -245,14 +246,14 @@ Built as two parts, done together.
 * [x] Scan a folder into an index (per the index-model decision), hashing with BLAKE3 so hashes match `iroh-blobs`. Persist it across restarts.
 * [x] Watch the folder for changes, with debouncing so editors and bulk copies don't flood the index. Apply ignore rules.
 * [x] Tests: scan, change, rename, delete and restart all leave the index correct; a burst of changes yields one update per file.
-* [ ] armv7: new dependencies `notify` (inotify on Linux) and `ignore` (gitignore matching), both pure Rust. The developer rebuilds, runs `folder add` on the Pi and edits files in it.
+* [x] armv7: new dependencies `notify` (inotify on Linux) and `ignore` (gitignore matching), both pure Rust. The developer rebuilds, runs `folder add` on the Pi and edits files in it.
 * **Done when:** the index tracks a working folder accurately through edits and restarts.
 
 **Notes:**
 
 * **Code:** `index.rs` holds `FileMeta`, `FolderIndex` (scan and reconcile) and `watch` (the watcher task); `folder.rs` holds the `folders` file, the `folder-adds/` queue, the `folders/` listing in the membership doc and `Folders`, which runs one watcher per folder. `status` lists each folder with its file count and size, or `paused`.
 * **Reconcile:** `FolderIndex::reconcile(path)` walks the path (without following symlinks), indexes each file whose size or modification time differs from its entry, and tombstones live entries under the path that are gone. It never tombstones an ignored path, or anything under a directory it couldn't read, and checks the marker before writing any tombstone. A file that changes while it is hashed is skipped; its next event brings it back. Only this node's own entries (its docs author) are read and written.
-* **Unchanged content:** a file whose modification time changed but whose content didn't gets its entry rewritten with the same hash and `replaces`, so the next restart doesn't hash it again. Other nodes see the same content hash and have nothing to fetch.
+* **Unchanged content:** a file whose modification time changed but whose content didn't gets its entry rewritten with the same hash and version, so the next restart doesn't hash it again. Other nodes see the same content hash and have nothing to fetch.
 * **Watcher:** `notify` with recursive watching, started before the first scan so nothing is missed. Changed paths are collected until none has changed for the debounce interval (`Config::debounce`, 1 s by default), then each is reconciled; a path that keeps changing is indexed anyway after 10 intervals. A watcher error, a queue overflow, a change to the root or to `.syncignore` triggers a full rescan.
 * **Adding a folder:** `folder add <name> <path>` queues `folder-adds/<name>` holding the path; the monitor applies it on its next interval. A later request for the same name replaces an unapplied one. A name the group already has, or a path overlapping another folder, is refused in the node's log. A new folder's doc isn't shared with other members yet: that is step 6.
 * **Tests:** `tests/index.rs`: scan, edit (including a same-size rewrite), rename, delete, a renamed directory, ignore and un-ignore, and changes made while the node was down are all indexed correctly, and unchanged files aren't rewritten on restart; 200 writes to 10 files give one entry update per file; a queued folder add is applied once per name; a missing root pauses the folder with no tombstones, and it resumes when the root is back.
@@ -268,7 +269,7 @@ Indexes only: no file contents move and nothing on disk changes. The merged view
 * [x] The merged view, computed the same on every node: per path, in sync, to fetch, deleted, or a conflict with the name each version would get.
 * [x] `sync-node folder show <name>` prints it (written by the running node, like `status`).
 * [x] Tests: two nodes with overlapping folders show the same view; files on one side are in the union; the same content on both is in sync; different content is a conflict with the expected names; a delete of a file the other has; repeated edits on one node while the other holds the old version are not a conflict; an edit beats a concurrent delete; concurrent folder creation settles on one folder; three nodes agree.
-* [ ] armv7: no new dependencies. The developer adds a folder of the same name on the Pi and the dev container and compares `folder show` on both.
+* [x] armv7: no new dependencies. The developer adds a folder of the same name on the Pi and the dev container and compares `folder show` on both.
 * **Done when:** two and three nodes with overlapping folders show identical merged views that match the rules above.
 
 **Notes:**
@@ -290,10 +291,26 @@ Indexes only: no file contents move and nothing on disk changes. The merged view
 
 #### Step 6b: Content Transfer
 
-* [ ] Nodes apply the merged view (step 6a): fetch content they're missing and delete what was deleted. Write each file to a temporary file and move it into place only after its hash checks out.
-* [ ] An interrupted transfer resumes rather than starting over.
-* [ ] Tests: two nodes converge from different starting folders; a transfer killed midway resumes; an unsafe path from a peer is refused.
+* [x] Nodes apply the merged view (step 6a): fetch content they're missing and delete what was deleted. Write each file to a temporary file and move it into place only after its hash checks out.
+* [x] An interrupted transfer resumes rather than starting over.
+* [x] Tests: two nodes converge from different starting folders; a transfer killed midway resumes; an unsafe path from a peer is refused.
+* [x] CLI run: two nodes with `run --with-content` converge on a folder, checked with `b3sum` against `folder show --entries`.
+* [x] armv7: no new runtime dependencies (`bao-tree` is for tests only). The developer rebuilds and runs the CLI check with the Pi.
 * **Done when:** two nodes converge on the same folder contents, verified by hash.
+
+**Notes:**
+
+* **Behind a flag, for now:** `run --with-content` (`Config::content`). Without it a node behaves as in step 6a: it syncs the index and changes nothing on disk. Remove the flag once content transfer has proved itself.
+* **Code:** `content.rs` holds the content task, one per folder, started and stopped with the folder's index task. It wakes on every change to the folder doc and every 10 s (`RETRY`), merges every path, and for each path where this node is behind: fetches the winning content from the nodes holding it (`Downloader`) and asks the index task to place it, or asks it to delete the file. Deletes go first. Conflicts are left alone (step 7).
+* **The index task makes every disk change** (`index::Apply`), since it owns this node's entries: `FolderIndex::place` and `remove` change the disk and write the entry together. Each first checks that this node's entry is still the one the content task saw and that the disk still matches it (same size and modification time, or no file), so a local edit not indexed yet is never overwritten or deleted; the reconcile then indexes it, and the merge decides.
+* **Placing a file:** exported from the blob store to `.sync-node-tmp-<random>` beside the target, hashed again with BLAKE3 and checked against the entry's hash and size, given the entry's modification time, synced, and renamed into place. The new entry takes that size and modification time, so the watcher's event for the rename finds nothing to index. Its version merges this node's old version with every entry holding that content, without a new edit of its own. Deleting a file also removes the directories it leaves empty.
+* **Unsafe paths:** a path from another node is written only if it is relative, `/`-separated, has no empty, `.` or `..` part and no NUL (`index::safe_path`), and isn't ignored here (the marker, temporary files, `.syncignore`). Parent directories are created one at a time and must be real directories, never symlinks. Refusals are logged once per path.
+* **Blob store (decided):** with content on, the index adds every file to the store **by reference** (`ImportMode::TryReference`): no copy, and the import's hash replaces our own hashing. A file indexed earlier without `--with-content` is imported on the next scan. The store never deletes a referenced file. If a file changes, its old hash's reference goes stale; a node fetching that old hash gets a verification error and tries another node.
+* **Fetched files are stored twice:** the downloaded blob stays in the store after it is exported to the folder, since iroh-blobs only deletes blobs through GC, which is off. Open: turn GC on with tags protecting docs' blobs, or re-import placed files by reference and drop the owned copy.
+* **First CLI run (2026-10-19, the Pi and the dev container):** both nodes ran `run --with-content` and converged on a shared folder.
+* **Resume:** iroh-blobs keeps a partial download in the store across restarts and fetches only the missing chunks. The test puts half a blob into the store directly (the state a cut-off download leaves) rather than killing a transfer at a precise moment, restarts the node, and checks that only about half the file crosses the wire.
+* **Not yet:** leftover temporary files after a crash aren't cleaned up (they're ignored, so they never sync); no progress is logged during a large download, and one slow download holds up the rest of that folder's pass; file permissions aren't synced, so a fetched file gets the default mode.
+* **Tests:** `tests/content.rs`: two nodes converge (files on one side, nested directories, the same file on both), a conflict is left alone, then a delete, an edit and a delete that empties its directories all reach the other node; unsafe paths (`../`, `x/../../`, absolute, the marker, through a symlink) are refused while an honest file arrives; a partial download resumes after a restart.
 
 #### Step 7: Conflicts, Deletes & Renames
 
