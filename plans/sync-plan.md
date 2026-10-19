@@ -3,6 +3,7 @@
 * **Builds on:** [prototype-plan.md](archive/prototype-plan.md) (concluded). The prototype proved that direct connections work between our networks; this phase hands the transport to iroh and builds the sync on top.
 * **Objective:** A local-first sync tool in Rust. Nodes in a group keep one or more folders in sync over iroh connections, and each node can see who else is in the group and how it's connected to them (direct or relayed).
 * **Focus:** Distributed state and synchronisation. Transport, NAT traversal, encryption and peer identity come from iroh.
+* **Paused after step 7 (2026-10-19)** for the [block protocol plan](blocks/plan.md): file contents move to our own BEP-like protocol instead of iroh-blobs ([ADR 0001](../docs/adr/0001-own-block-protocol-for-file-contents.md)). Steps 8 and 9 resume on top of it.
 
 ### Constraints
 
@@ -18,7 +19,7 @@
 
 * **`iroh` 1.x**  for endpoints, connections and path information. Pin exact versions: the protocol crates below are still pre-1.0.
 * **From n0, pinned in step 1** (see its findings):
-  * **`iroh-blobs`:** content-addressed transfer (BLAKE3), verified while streaming and resumable. Covers moving file contents.
+  * **`iroh-blobs`:** content-addressed transfer (BLAKE3), verified while streaming and resumable. Covered moving file contents until [ADR 0001](../docs/adr/0001-own-block-protocol-for-file-contents.md); now only iroh-docs' index metadata.
   * **`iroh-gossip`:** topic-based gossip. Covers group membership and connection-type sharing (step 4).
   * **`iroh-docs`:** a multi-writer key-value store that syncs between peers, built on blobs and gossip. **Decided: it holds the file index and the membership records**, so we don't keep our own. Step 1 still confirms the version, its maturity and the armv7 build. Our conflict rules need causal information it doesn't store itself (see **Index model**).
 * The node must still cross-compile for armv7 (`just armv7`) to run on the Raspberry Pi.
@@ -28,9 +29,9 @@
 Settle each before or during the step that needs it, and record the decision in this file.
 
 * **Index model:** decided 2026-10-18, see **Folders & the File Index** below.
-* **Conflicts:** decided 2026-10-18, see **Folders & the File Index**. Step 7 implements the renames.
-* **Deletes:** tombstones, so a file deleted on one node isn't restored from another (decided: a tombstone is an index entry with no content, see below). Still open: when tombstones can be cleaned up.
-* **Renames:** detect them (same hash, new path) rather than treating them as a delete plus a new file.
+* **Conflicts:** decided 2026-10-18, see **Folders & the File Index**. Implemented in step 7.
+* **Deletes:** tombstones, so a file deleted on one node isn't restored from another (decided: a tombstone is an index entry with no content, see below). Still open: when tombstones can be cleaned up. For now they are kept forever; cleaning one up safely needs every member to have seen it, which ties in with **Removing a member**.
+* **Renames:** detect them (same hash, new path) rather than treating them as a delete plus a new file. Implemented in step 7, on the receiving side.
 * **Removing a member:** who may revoke a membership record, and what happens when an add and a remove race. The likely default is that any member may remove any other, and a removal always wins.
 * **Ignore rules:** decided 2026-10-18, see **Folders & the File Index** below.
 
@@ -302,7 +303,7 @@ Indexes only: no file contents move and nothing on disk changes. The merged view
 **Notes:**
 
 * **Behind a flag, for now:** `run --with-content` (`Config::content`). Without it a node behaves as in step 6a: it syncs the index and changes nothing on disk. Remove the flag once content transfer has proved itself.
-* **Code:** `content.rs` holds the content task, one per folder, started and stopped with the folder's index task. It wakes on every change to the folder doc and every 10 s (`RETRY`), merges every path, and for each path where this node is behind: fetches the winning content from the nodes holding it (`Downloader`) and asks the index task to place it, or asks it to delete the file. Deletes go first. Conflicts are left alone (step 7).
+* **Code:** `content.rs` holds the content task, one per folder, started and stopped with the folder's index task. It wakes on every change to the folder doc and every 10 s (`RETRY`), merges every path, and for each path where this node is behind: fetches the winning content from the nodes holding it (`Downloader`) and asks the index task to place it, or asks it to delete the file. Step 7 adds moves and conflict resolution.
 * **The index task makes every disk change** (`index::Apply`), since it owns this node's entries: `FolderIndex::place` and `remove` change the disk and write the entry together. Each first checks that this node's entry is still the one the content task saw and that the disk still matches it (same size and modification time, or no file), so a local edit not indexed yet is never overwritten or deleted; the reconcile then indexes it, and the merge decides.
 * **Placing a file:** exported from the blob store to `.sync-node-tmp-<random>` beside the target, hashed again with BLAKE3 and checked against the entry's hash and size, given the entry's modification time, synced, and renamed into place. The new entry takes that size and modification time, so the watcher's event for the rename finds nothing to index. Its version merges this node's old version with every entry holding that content, without a new edit of its own. Deleting a file also removes the directories it leaves empty.
 * **Unsafe paths:** a path from another node is written only if it is relative, `/`-separated, has no empty, `.` or `..` part and no NUL (`index::safe_path`), and isn't ignored here (the marker, temporary files, `.syncignore`). Parent directories are created one at a time and must be real directories, never symlinks. Refusals are logged once per path.
@@ -315,11 +316,25 @@ Indexes only: no file contents move and nothing on disk changes. The merged view
 
 #### Step 7: Conflicts, Deletes & Renames
 
-* [ ] Implement the conflict, tombstone and rename decisions.
-* [ ] Tests for each: concurrent edits keep both versions; a delete stays deleted after an offline node returns; a rename moves the file without re-sending its content.
+* [x] Implement the conflict, tombstone and rename decisions.
+* [x] Tests for each: concurrent edits keep both versions; a delete stays deleted after an offline node returns; a rename moves the file without re-sending its content.
+* [ ] CLI run: with `run --with-content` on the Pi and the dev container, edit one file on both while they can't reach each other, then reconnect; rename and delete files. Both end with the same files and one conflict copy.
+* [ ] armv7: no new dependencies. The developer rebuilds and runs the CLI check.
 * **Done when:** a three-node group converges correctly through concurrent edits, deletes and renames, including one node offline during the changes.
 
+**Notes:**
+
+* **Conflicts:** only a node holding a losing version acts. Its index task renames its file to the conflict copy's name, indexes the copy as a new file (which reaches the other nodes like any other), and places the winner, fetched first. Its new entry for the path has seen both versions, so the conflict is gone once it syncs. Nodes holding the winner do nothing; nodes holding neither fetch the winner. The copy is named after the losing version's newest copy (`view::conflict_name`), so every node holding that version picks the same name, as long as they agree on that node's display name.
+* **Renames:** a planned delete and a planned fetch of the same content, where this node has nothing at the new path, become a move: the index task renames the file, gives it the new entry's modification time, and writes the new entry and the tombstone. Nothing is fetched or copied (the test checks the inode). The sending side needs nothing new: its rename is already a tombstone plus a new file.
+* **Waiting for the other half (`RENAME_GRACE`, 2 s):** a rename's tombstone and new entry can arrive in separate syncs, in either order. So a delete, and a fetch of content this node already holds at another path, wait 2 s after this node first plans them. Without this the rename test failed 2 runs in 5 (delete first) and, once that was fixed, 3 in 5 under load (new file first).
+* **Placement journal:** a placement writes `.sync-node-tmp-placing` at the folder root (the path and the entry, with the file's final size and modification time) before it moves the file into place, and removes it once the entry is written. Opening the index finishes a placement whose file is in place. Without it, a node stopped between the two (Ctrl-C, a crash, or the test's shutdown) indexed the file as a new local file on restart; that version was concurrent with a rename made meanwhile elsewhere, so "the edit wins" brought the old path back on every node. Found by the three-node test, about 1 run in 20 under load.
+* **Fallback source:** a placement whose blob can't be read from the store (see below) copies another of this node's files with the same content instead, still checked by hash.
+* **Deferred (decided 2026-10-19): moved files and the blob store.** A file added by reference is recorded in the store under a list of paths, and a move adds its new path; but the store reads only the first path in sorted order and doesn't try the others (`iroh-blobs` `bao_file.rs`). After a rename, a conflict copy or a move to a path that sorts later, the first path is gone, so this node can't send that content any more. Nodes that already have the content are unaffected (moves are local); a node that needs it from scratch (a new member, or one that was away) can't get it if every holder moved it this way. Fix options: patch `iroh-blobs` to try each path (as with `iroh-gossip`), or copy files into the store. Decide before step 9.
+* **Tests:** `tests/content.rs`: `two_nodes_converge` now checks the conflict is resolved on both nodes (one copy, both versions kept); `a_rename_moves_the_file` (same inode, under a quarter of the file's bytes received); `three_nodes_converge_with_one_offline` (the "done when": c offline while it and a edit one file, b deletes one and a renames one; all three end identical with a's edit in place, c's as the conflict copy named after c, the delete and the rename kept). Checked by breaking the code: without the rename pairing, without conflict resolution, and without the grace, the tests fail.
+
 #### Step 8: Relay Policy
+
+Waits for the [block protocol plan](blocks/plan.md). File contents then move over our own ALPN, which can refuse each request (block spec §8); the findings below about gating iroh-blobs apply only to the index metadata that iroh-docs still moves.
 
 Deferred until membership and sync work. This step adds the hook that keeps file data (folder index and contents) off relays under direct-only; connectivity, gossip, join and membership keep using relays under either policy (see **Constraints**). Step 1 found that an `after_handshake` hook can hold a connection until a direct path is selected, per peer, before any protocol crate gets it, but that docs and blobs connections also carry membership, so the gate has to be finer than per ALPN (see step 1's findings for the catches). If that doesn't hold up in practice, fall back to a per-node policy, or to stopping file sync once a path moves to a relay (some file data may already have crossed it). Turning relays off is not a fallback.
 
