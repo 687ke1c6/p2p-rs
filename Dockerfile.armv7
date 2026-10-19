@@ -20,6 +20,9 @@ WORKDIR /build
 # doesn't rebuild every dependency. Every workspace member's manifest must be
 # present for cargo to load the workspace.
 COPY Cargo.toml Cargo.lock ./
+# Patched upstream crates ([patch.crates-io] in Cargo.toml), built with the
+# other dependencies.
+COPY patches patches
 COPY crates/node/Cargo.toml crates/node/
 RUN mkdir -p crates/node/src \
     && echo 'fn main() {}' > crates/node/src/main.rs \

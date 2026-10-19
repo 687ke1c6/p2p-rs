@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/node"]
+# Patched copies of upstream crates: built as dependencies, not linted or
+# tested as our own.
+exclude = ["patches"]
 
 [workspace.package]
 edition = "2021"
@@ -32,3 +35,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# iroh-gossip 0.101.0 never redials a peer whose first dial failed; the copy
+# in patches/ forgets such a peer so the next message dials it again. Remove
+# once a release fixes it. See plans/sync-plan.md, step 6a.
+[patch.crates-io]
+iroh-gossip = { path = "patches/iroh-gossip" }
