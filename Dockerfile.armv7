@@ -1,0 +1,41 @@
+# sync-node cross-compiled for 32-bit ARM (armv7, hard float), linked
+# against Debian bookworm's glibc, so it runs on bookworm armhf systems.
+#
+#   just armv7     # writes target/release/armv7/sync-node
+#
+# The final stage is `scratch` holding only the binary: it exists to be
+# exported with `docker build --output`, not run.
+
+# Cross-compile on the build machine's native platform; no ARM emulation.
+FROM --platform=$BUILDPLATFORM rust:1.99-bookworm AS builder
+ARG TARGET=armv7-unknown-linux-gnueabihf
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add $TARGET
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+WORKDIR /build
+
+# Build dependencies against stub sources first, so editing our own code
+# doesn't rebuild every dependency. Every workspace member's manifest must be
+# present for cargo to load the workspace.
+COPY Cargo.toml Cargo.lock ./
+# Patched upstream crates ([patch.crates-io] in Cargo.toml), built with the
+# other dependencies.
+COPY patches patches
+COPY crates/node/Cargo.toml crates/node/
+RUN mkdir -p crates/node/src \
+    && echo 'fn main() {}' > crates/node/src/main.rs \
+    && touch crates/node/src/lib.rs \
+    && cargo build --release --locked -p sync-node --target $TARGET \
+    && rm -r crates/*/src
+
+COPY crates crates
+# COPY keeps the files' original mtimes, which can be older than the stub
+# build, and cargo would then reuse the stub binary. Touch to force a rebuild.
+RUN find crates -name '*.rs' -exec touch {} + \
+    && cargo build --release --locked -p sync-node --target $TARGET \
+    && cp target/$TARGET/release/sync-node /sync-node
+
+FROM scratch
+COPY --from=builder /sync-node /sync-node
