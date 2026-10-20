@@ -2,6 +2,7 @@
 
 use iroh::{EndpointId, SecretKey};
 use iroh_blobs::Hash;
+use sync_node::blocks::Hasher;
 use sync_node::index::FileMeta;
 use sync_node::view::{
     conflict_name, merge, node_state, render_entries, Candidate, NodeState, Outcome, Version,
@@ -16,22 +17,21 @@ fn v(edits: &[(EndpointId, u64)]) -> Version {
 }
 
 fn file(node: EndpointId, content: &str, mtime_ns: u64, version: Version) -> FileMeta {
-    FileMeta {
-        content: Some(Hash::new(content)),
-        size: content.len() as u64,
+    let mut hasher = Hasher::new(content.len() as u64);
+    hasher.update(content.as_bytes());
+    FileMeta::file(
+        hasher.finish(),
+        content.len() as u64,
         mtime_ns,
         node,
         version,
-    }
+    )
 }
 
 fn deleted(node: EndpointId, version: Version) -> FileMeta {
     FileMeta {
-        content: None,
-        size: 0,
         mtime_ns: 0,
-        node,
-        version,
+        ..FileMeta::tombstone(node, version)
     }
 }
 
@@ -205,11 +205,11 @@ fn raw_entries_render() {
         ("{bb:1, a:2}", true)
     };
     let a_line = format!(
-        "  a   {}           1 B  20261019-100102.000000007  {a_version}",
+        "  a   {}           1 B      1 × 128K  20261019-100102.000000007  {a_version}",
         Hash::new("x")
     );
     let b_line = format!(
-        "  bb  {:64}           0 B  19700101-000000.000000000  {{bb:1}}",
+        "  bb  {:64}           0 B             -  19700101-000000.000000000  {{bb:1}}",
         "deleted"
     );
     let expected = if b_first {

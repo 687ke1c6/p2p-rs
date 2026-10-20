@@ -25,7 +25,6 @@ fn config() -> Config {
         presence_interval: INTERVAL,
         debounce: DEBOUNCE,
         address_book: None,
-        content: false,
     }
 }
 

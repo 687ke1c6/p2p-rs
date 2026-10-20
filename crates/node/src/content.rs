@@ -1,14 +1,16 @@
 //! Content transfer: brings this node's copy of a folder in line with the
-//! merged view (see `view`). On while `run --with-content` is given.
+//! merged view (see `view`).
 //!
 //! One task per folder, woken whenever the folder's doc changes and every
 //! [`RETRY`] otherwise. Each pass merges every path and acts where this node
 //! is behind:
 //!
-//! * a file this node is missing or holds an older version of is fetched by
-//!   hash from the nodes holding it (`iroh-blobs` verifies it while streaming
-//!   and resumes a partial download from what the store already has), then
-//!   placed on disk;
+//! * a file this node is missing or holds an older version of is built
+//!   block by block: from what an earlier try left, then from this node's
+//!   own files (the old version at that path first, then any other file
+//!   with the same blocks), and the rest fetched over the block protocol
+//!   from the nodes holding it (`blocks::Client`). Every block is checked
+//!   against the block list. Then the file is placed on disk;
 //! * a file that was deleted is deleted here too;
 //! * a delete and a new file with the same content, where this node has
 //!   nothing at the new path, is a rename: the file is moved, not fetched;
@@ -23,18 +25,20 @@
 //! never overwritten.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iroh::EndpointId;
-use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::Hash;
 use iroh_docs::protocol::Docs;
 use iroh_docs::NamespaceId;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
-use crate::index::{self, safe_path, Apply, FileMeta};
+use crate::blocks::{self, Client, Source, Staged};
+use crate::index::{self, safe_path, Apply, Entries, FileMeta};
 use crate::member::Names;
 use crate::view::{conflict_name, merge, node_state, Candidate, NodeState, Outcome, Version};
 
@@ -49,6 +53,13 @@ pub const RETRY: Duration = Duration::from_secs(10);
 /// deleted and copied.
 pub const RENAME_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a staging file must have gone unwritten before it is removed
+/// as stale. A pass can't tell which version a staging file is for (its
+/// name is a hash), and right after a start, before the folder's doc has
+/// synced, no fetch is planned yet: without this, a node would delete the
+/// partial downloads it is about to resume.
+pub const STALE_STAGING: Duration = Duration::from_secs(24 * 3600);
+
 /// One folder's content task.
 pub(crate) struct Content {
     pub name: String,
@@ -56,7 +67,12 @@ pub(crate) struct Content {
     pub me: EndpointId,
     pub docs: Docs,
     pub blobs: FsStore,
-    pub downloader: Downloader,
+    /// Fetches blocks from other nodes.
+    pub client: Client,
+    /// The folder root, where fetched files are staged.
+    pub root: PathBuf,
+    /// This node's entries, to find local copies of content.
+    pub entries: Entries,
     /// Notified whenever the folder's doc changes.
     pub changed: Arc<Notify>,
     /// To the folder's index task.
@@ -107,6 +123,10 @@ struct Memory {
     failed: HashSet<String>,
     /// When each action waiting for `RENAME_GRACE` was first planned.
     waiting: HashMap<String, Instant>,
+    /// Fetches that failed, by path and version, and when to try again:
+    /// not on every change to the folder, which would ask a node that sent
+    /// bad blocks again and again.
+    retry_at: HashMap<String, Instant>,
 }
 
 impl Content {
@@ -142,7 +162,9 @@ impl Content {
         let mut wait = RETRY;
         let mut waiting = HashMap::new();
         let mut ready = Vec::new();
-        for action in self.plan(entries, &mut memory.refused) {
+        let actions = self.plan(entries, &mut memory.refused);
+        self.remove_stale_staging(&actions).await;
+        for action in actions {
             // Either half of a rename whose other half may not have arrived
             // yet waits RENAME_GRACE.
             let key = match &action {
@@ -169,11 +191,58 @@ impl Content {
         // Moves first, so a moved file is never deleted before it moves;
         // then deletes, which are quick and free space; then fetches.
         for action in ready {
-            if !self.act(action, &mut memory.failed).await? {
+            if !self.act(action, memory).await? {
                 return Ok(None);
             }
         }
         Ok(Some(wait))
+    }
+
+    /// Removes the staging files at the folder root that none of `actions`
+    /// will fetch into and that nothing has written to for
+    /// [`STALE_STAGING`]: left by a fetch of a version no longer wanted (a
+    /// newer one came, or the file was deleted). One for a version still
+    /// wanted stays, for the fetch to resume. Runs between passes' actions,
+    /// so no fetch is writing.
+    async fn remove_stale_staging(&self, actions: &[Action]) {
+        let wanted: HashSet<PathBuf> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fetch { path, meta, .. } | Action::Resolve { path, meta, .. } => {
+                    let content = meta.content?;
+                    Some(blocks::staging_path(&self.root, path, content))
+                }
+                _ => None,
+            })
+            .collect();
+        let root = self.root.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            let mut removed = Vec::new();
+            for entry in std::fs::read_dir(&root)?.flatten() {
+                let name = entry.file_name();
+                let staging = name.to_str().is_some_and(blocks::is_staging_name);
+                let path = entry.path();
+                let old = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > STALE_STAGING));
+                if staging && old && !wanted.contains(&path) && std::fs::remove_file(&path).is_ok()
+                {
+                    removed.push(path);
+                }
+            }
+            std::io::Result::Ok(removed)
+        })
+        .await;
+        match removed {
+            Ok(Ok(removed)) => {
+                for path in removed {
+                    tracing::info!("folder {}: removed stale {}", self.name, path.display());
+                }
+            }
+            Ok(Err(err)) => tracing::debug!("folder {}: listing staging files: {err}", self.name),
+            Err(err) => tracing::debug!("folder {}: listing staging files: {err}", self.name),
+        }
     }
 
     /// What this node must do to match the merged view of `entries`.
@@ -304,7 +373,8 @@ impl Content {
 
     /// The entry this node writes when it takes candidate `c` for a path:
     /// its version has seen this node's own entry and every entry holding
-    /// `c`'s content. Also returns the other nodes holding that content.
+    /// `c`'s content, and its block list is theirs (the content's). Also
+    /// returns the other nodes holding that content.
     fn take(
         &self,
         mine: Option<&FileMeta>,
@@ -313,8 +383,10 @@ impl Content {
     ) -> (FileMeta, Vec<EndpointId>) {
         let mut version = mine.map(|m| m.version.clone()).unwrap_or_default();
         let mut providers = Vec::new();
+        let mut blocks = (0, Vec::new());
         for m in metas.iter().filter(|m| m.content == Some(c.content)) {
             version.merge(&m.version);
+            blocks = (m.block_size, m.blocks.clone());
             if m.node != self.me {
                 providers.push(m.node);
             }
@@ -325,12 +397,14 @@ impl Content {
             mtime_ns: c.mtime_ns,
             node: self.me,
             version,
+            block_size: blocks.0,
+            blocks: blocks.1,
         };
         (meta, providers)
     }
 
     /// Carries out one action. Returns `false` once the index task is gone.
-    async fn act(&self, action: Action, failed: &mut HashSet<String>) -> anyhow::Result<bool> {
+    async fn act(&self, action: Action, memory: &mut Memory) -> anyhow::Result<bool> {
         let name = &self.name;
         let (done, result) = oneshot::channel();
         let (request, what) = match action {
@@ -374,18 +448,15 @@ impl Content {
                 meta,
                 providers,
             } => {
-                let hash = meta.content.expect("a fetch has content");
-                if !self
-                    .fetch(&path, hash, meta.size, providers, failed)
-                    .await?
-                {
+                let Some(temp) = self.fetch(&path, &meta, providers, memory).await? else {
                     return Ok(true);
-                }
+                };
                 let what = format!("writing {path}");
                 let request = Apply::Place {
                     path,
                     expect: mine,
                     meta,
+                    temp,
                     done,
                 };
                 (request, what)
@@ -397,13 +468,9 @@ impl Content {
                 meta,
                 providers,
             } => {
-                let hash = meta.content.expect("a winner has content");
-                if !self
-                    .fetch(&path, hash, meta.size, providers, failed)
-                    .await?
-                {
+                let Some(temp) = self.fetch(&path, &meta, providers, memory).await? else {
                     return Ok(true);
-                }
+                };
                 let what = format!(
                     "resolving the conflict on {path}: keeping this node's version as {copy}"
                 );
@@ -412,6 +479,7 @@ impl Content {
                     expect: mine,
                     copy,
                     meta,
+                    temp,
                     done,
                 };
                 (request, what)
@@ -424,7 +492,7 @@ impl Content {
             Ok(true) => tracing::info!("folder {name}: {what}"),
             Ok(false) => tracing::debug!("folder {name}: {what}: the path changed; skipped"),
             Err(err) => {
-                if failed.insert(what.clone()) {
+                if memory.failed.insert(what.clone()) {
                     tracing::warn!("folder {name}: {what}: {err:#}");
                 } else {
                     tracing::debug!("folder {name}: {what}: {err:#}");
@@ -434,41 +502,153 @@ impl Content {
         Ok(true)
     }
 
-    /// Makes sure blob `hash` is complete in the store, downloading it from
-    /// `providers` if not. Returns whether it is.
+    /// Gets version `meta` of `path` into its staging file (see
+    /// `blocks::staging_path`): the blocks this node already holds are
+    /// copied from its own files, the rest fetched from `providers`. Returns
+    /// the file once it is complete; the index task checks it before placing
+    /// it.
     async fn fetch(
         &self,
         path: &str,
-        hash: Hash,
-        size: u64,
+        meta: &FileMeta,
         providers: Vec<EndpointId>,
-        failed: &mut HashSet<String>,
-    ) -> anyhow::Result<bool> {
-        if self.blobs.has(hash).await? {
-            return Ok(true);
+        memory: &mut Memory,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        let content = meta.content.expect("fetching a file with content");
+        let temp = blocks::staging_path(&self.root, path, content);
+        let key = format!("fetching {path} {content}");
+        let waiting = memory
+            .retry_at
+            .get(&key)
+            .is_some_and(|at| Instant::now() < *at);
+        if waiting {
+            return Ok(None);
         }
-        if providers.is_empty() {
-            return Ok(false);
-        }
-        let from: Vec<String> = providers
-            .iter()
-            .map(|p| p.fmt_short().to_string())
-            .collect();
-        tracing::info!(
-            "folder {}: fetching {path} ({}) from {}",
-            self.name,
-            crate::peers::bytes(size),
-            from.join(", ")
-        );
-        let result = self.downloader.download(hash, providers).await;
-        if let Err(err) = &result {
-            if failed.insert(format!("fetching {path} {hash}")) {
-                tracing::warn!("folder {}: fetching {path}: {err:#}", self.name);
-            } else {
-                tracing::debug!("folder {}: fetching {path}: {err:#}", self.name);
+        let sources = self.sources(path, meta);
+        let (staging, wanted, root) = (temp.clone(), meta.clone(), self.root.clone());
+        let staged =
+            tokio::task::spawn_blocking(move || Staged::open(&staging, &wanted, &root, &sources))
+                .await?;
+        let done = match staged {
+            Err(err) => Err(anyhow::Error::from(err).context("staging")),
+            Ok(staged) if staged.is_complete() => {
+                tokio::task::spawn_blocking(move || staged.sync())
+                    .await?
+                    .map(|()| true)
+                    .map_err(anyhow::Error::from)
             }
+            Ok(_) if providers.is_empty() => {
+                // Nobody to ask: try again later, quietly.
+                memory.retry_at.insert(key, Instant::now() + RETRY);
+                return Ok(None);
+            }
+            Ok(staged) => {
+                let from: Vec<String> = providers.iter().map(|p| self.names.display(*p)).collect();
+                let copied = match staged.copied {
+                    0 => String::new(),
+                    n => format!("; {} copied locally", crate::peers::bytes(n)),
+                };
+                tracing::info!(
+                    "folder {}: fetching {path} ({}{copied}) from {}",
+                    self.name,
+                    crate::peers::bytes(staged.to_fetch),
+                    from.join(", ")
+                );
+                self.fetch_from(path, meta, providers.clone(), staged).await
+            }
+        };
+        let err = match done {
+            Ok(true) => {
+                memory.retry_at.remove(&key);
+                return Ok(Some(temp));
+            }
+            Ok(false) => anyhow::anyhow!("no node could send all of it; trying again later"),
+            Err(err) => err,
+        };
+        memory.retry_at.insert(key.clone(), Instant::now() + RETRY);
+        if memory.failed.insert(key) {
+            tracing::warn!("folder {}: fetching {path}: {err:#}", self.name);
+        } else {
+            tracing::debug!("folder {}: fetching {path}: {err:#}", self.name);
         }
-        Ok(self.blobs.has(hash).await?)
+        Ok(None)
+    }
+
+    /// Fetches what `staged` lacks from `providers`, and from nodes that come
+    /// to hold version `meta` of `path` meanwhile: the folder's doc is
+    /// watched during the fetch, and new providers join it.
+    async fn fetch_from(
+        &self,
+        path: &str,
+        meta: &FileMeta,
+        providers: Vec<EndpointId>,
+        staged: Staged,
+    ) -> anyhow::Result<bool> {
+        let content = meta.content.expect("fetching a file with content");
+        let (offer, offered) = watch::channel(providers);
+        // Whether the watch took a wake meant for `run`.
+        let woken = AtomicBool::new(false);
+        let watch = async {
+            loop {
+                self.changed.notified().await;
+                woken.store(true, Ordering::Relaxed);
+                let per_node =
+                    match index::read_path(&self.docs, &self.blobs, self.folder, path).await {
+                        Ok(per_node) => per_node,
+                        Err(err) => {
+                            tracing::debug!("folder {}: reading {path}: {err:#}", self.name);
+                            continue;
+                        }
+                    };
+                let holding = per_node
+                    .values()
+                    .filter(|m| m.content == Some(content) && m.node != self.me)
+                    .map(|m| m.node);
+                offer.send_if_modified(|ids| {
+                    let mut grew = false;
+                    for id in holding {
+                        if !ids.contains(&id) {
+                            tracing::info!(
+                                "folder {}: fetching {path}: {} has it now",
+                                self.name,
+                                self.names.display(id)
+                            );
+                            ids.push(id);
+                            grew = true;
+                        }
+                    }
+                    grew
+                });
+            }
+        };
+        let fetched = tokio::select! {
+            fetched = self.client.fetch_file(self.folder, path, meta, offered, staged) => fetched,
+            never = watch => never,
+        };
+        if woken.load(Ordering::Relaxed) {
+            // Other changes may have come with it: let the next pass see them.
+            self.changed.notify_one();
+        }
+        fetched
+    }
+
+    /// This node's files that blocks of version `meta` of `path` can be
+    /// copied from: the old version at `path` first, then every other file
+    /// sharing a block with it.
+    fn sources(&self, path: &str, meta: &FileMeta) -> Vec<Source> {
+        let wanted: HashSet<Hash> = meta.blocks.iter().copied().collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        self.entries.with(|entries| {
+            let shares = |m: &FileMeta| m.blocks.iter().any(|h| wanted.contains(h));
+            let old = entries.get_key_value(path).filter(|(_, m)| shares(m));
+            let others = entries.iter().filter(|(p, m)| *p != path && shares(m));
+            old.into_iter()
+                .chain(others)
+                .map(|(p, m)| (p.clone(), m.clone()))
+                .collect()
+        })
     }
 
     /// Sends `request` to the index task and waits for its answer. `None` if

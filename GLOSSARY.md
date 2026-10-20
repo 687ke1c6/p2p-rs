@@ -10,7 +10,7 @@ _Avoid_: Network, cluster, swarm
 
 **Node**:
 One running instance, identified by its public key.
-_Avoid_: Peer (except for "the other end of a connection"), device, client
+_Avoid_: Device, client. A node is a **peer** only in a swarm (see Content).
 
 **Member**:
 A node holding a valid signed record in its group.
@@ -47,14 +47,55 @@ _Avoid_: Backup, duplicate
 
 ## Content
 
+Content moves as in BitTorrent, and uses its terms. One version of one file (its content hash) is the torrent; the content hash has the role of the info hash.
+
+**Piece**:
+A fixed-size part of a file's content, identified by its hash. The unit that is verified, written and announced.
+_Avoid_: Block (that's a part of a piece), chunk
+
+**Piece hashes**:
+The hashes of a file's pieces, in order, carried in its entry.
+_Avoid_: Block list, manifest, outboard
+
+**Piece length**:
+The size of every piece of a file but the last. It depends on the file size only.
+_Avoid_: Block size
+
 **Block**:
-A fixed-size piece of a file's content, identified by its hash.
-_Avoid_: Chunk, piece
+A part of a piece (16 KiB, the last one may be short) that one request asks for. Not verified by itself: its piece is.
+_Avoid_: Slice, chunk
 
-**Block list**:
-The hashes of a file's blocks, in order, carried in its entry.
-_Avoid_: Manifest, outboard
+**Swarm**:
+The nodes that hold or fetch one version of one file in a folder.
 
-**Provider**:
-A node whose entry for a path has the content another node wants.
-_Avoid_: Source, seeder
+**Peer**:
+Another node in the same swarm, at the other end of a peer-wire connection.
+_Avoid_: Provider, source
+
+**Seeder**:
+A peer that has every piece: its entry has the version.
+
+**Leecher**:
+A peer that is still fetching. It serves the pieces it has verified.
+
+**Bitfield**:
+Which pieces a peer has, sent once when a swarm starts on a connection. **Have** then announces each piece as it is verified.
+
+**Interested**:
+A peer wants pieces the other end has.
+
+**Choke**:
+A peer doesn't serve the other end's requests now. **Unchoke** ends it. Upload slots are managed with it; there is no tit-for-tat.
+
+**Optimistic unchoke**:
+An unchoke that rotates to another interested peer, so its speed can be measured.
+
+**Rarest first**:
+Pieces held by the fewest peers are asked for first.
+
+**Endgame**:
+Once every missing block is asked for, an overdue block is asked of another peer too; the first answer wins and the other is cancelled.
+
+**Staging file**:
+The file a fetch writes pieces into, at the folder root, until it is complete and placed. A leecher serves its verified pieces from it.
+_Avoid_: Temporary file, partial file

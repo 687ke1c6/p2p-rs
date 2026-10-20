@@ -23,6 +23,7 @@ use n0_future::StreamExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+use crate::blocks::{self, BlocksProtocol};
 use crate::folder::{FolderState, Folders};
 use crate::gate::{Gate, GateHooks, MembersProtocol, JOIN_ALPN, MEMBERS_ALPN};
 use crate::group::{Group, GroupError};
@@ -31,7 +32,7 @@ use crate::invite::{self, InviteTicket};
 use crate::join::{self, JoinProtocol, JoinReply, Ticket};
 use crate::member::{self, Names};
 use crate::monitor::Monitor;
-use crate::peers::Peers;
+use crate::peers::{PeerSnapshot, Peers};
 use crate::presence::{View, PRESENCE_INTERVAL};
 use crate::record::{validate_chain, GroupId, Record, SignedRecord, MEMBERS_PREFIX};
 use crate::status::Status;
@@ -69,10 +70,6 @@ pub struct Config {
     /// each node adds itself to when it starts, as n0's DNS does outside
     /// tests. Lets a node reach another by ID alone, whenever it started.
     pub address_book: Option<MemoryLookup>,
-    /// Transfer file contents: fetch what the merged view says this node is
-    /// missing and delete what was deleted (`run --with-content`). Off, only
-    /// the index syncs.
-    pub content: bool,
 }
 
 impl Config {
@@ -82,7 +79,6 @@ impl Config {
             presence_interval: PRESENCE_INTERVAL,
             debounce: DEBOUNCE,
             address_book: None,
-            content: false,
         }
     }
 }
@@ -163,8 +159,17 @@ impl Node {
             .await
             .context("opening docs store")?;
 
+        let folders = Folders::new(
+            config_dir,
+            docs.clone(),
+            blobs.clone(),
+            &endpoint,
+            config.debounce,
+            names.clone(),
+        );
         let router = Router::builder(endpoint)
             .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
+            .accept(blocks::ALPN, BlocksProtocol::new(folders.clone()))
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(iroh_docs::ALPN, docs.clone())
             .accept(MEMBERS_ALPN, MembersProtocol(gate.clone()))
@@ -187,16 +192,8 @@ impl Node {
             gate,
             peers,
             view: View::new(config.presence_interval),
-            names: names.clone(),
-            folders: Folders::new(
-                config_dir,
-                docs.clone(),
-                blobs.clone(),
-                router.endpoint(),
-                config.debounce,
-                config.content,
-                names,
-            ),
+            names,
+            folders,
             config,
             monitor: Mutex::new(None),
             router,
@@ -317,6 +314,19 @@ impl Node {
     /// `id`'s name, as of the last presence interval.
     pub fn name(&self, id: EndpointId) -> Option<String> {
         self.names.get(id)
+    }
+
+    /// Bytes of file data this node has fetched from each node since it
+    /// started: verified blocks only, each counted once. Unlike the traffic
+    /// in [`peers`](Self::peers), no protocol overhead or other traffic.
+    pub fn fetched(&self) -> HashMap<EndpointId, u64> {
+        self.folders.fetched()
+    }
+
+    /// This node's connections and traffic to each node it has connected
+    /// to, member or not, whether or not its membership doc lists it yet.
+    pub fn peers(&self) -> Vec<PeerSnapshot> {
+        self.peers.snapshot()
     }
 
     /// The group as this node sees it: members, who is online, this node's

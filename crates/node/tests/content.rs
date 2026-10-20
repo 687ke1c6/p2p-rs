@@ -6,12 +6,12 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use bao_tree::{ChunkNum, ChunkRanges};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::SecretKey;
-use iroh_blobs::api::proto::BlobStatus;
 use iroh_blobs::Hash;
 use iroh_docs::NamespaceId;
+use sync_node::blocks::{staging_path, Hasher, MIN_BLOCK_SIZE};
+use sync_node::content::{RENAME_GRACE, STALE_STAGING};
 use sync_node::index::FileMeta;
 use sync_node::view::Version;
 use sync_node::{Config, Network, Node};
@@ -28,7 +28,6 @@ async fn spawn(dir: &Path, key: SecretKey, book: &MemoryLookup) -> Node {
         presence_interval: INTERVAL,
         debounce: DEBOUNCE,
         address_book: Some(book.clone()),
-        content: true,
     };
     Node::spawn_with(dir, key, config).await.unwrap()
 }
@@ -101,12 +100,18 @@ fn conflict_copies(tree: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// The bytes `node` has received from `peer`.
+/// The file data `node` has fetched from `peer`: verified blocks, each
+/// counted once.
+fn fetched(node: &Node, peer: &Node) -> u64 {
+    node.fetched().get(&peer.id()).copied().unwrap_or(0)
+}
+
+/// All the bytes `node` has received from `peer`, protocol overhead and
+/// other traffic included.
 fn received(node: &Node, peer: &Node) -> u64 {
-    node.status()
-        .unwrap()
-        .member(peer.id())
-        .and_then(|m| m.peer.as_ref())
+    node.peers()
+        .iter()
+        .find(|p| p.id == peer.id())
         .map(|p| p.traffic.direct_recv + p.traffic.relay_recv)
         .unwrap_or(0)
 }
@@ -234,26 +239,31 @@ async fn unsafe_paths_are_refused() {
     std::os::unix::fs::symlink(&outside, rb.join("link")).unwrap();
     write(ra, "link/through.txt", b"through a symlink");
     write(ra, "ok.txt", b"ok");
+    // b already has the bad entries' content, so it can copy it locally
+    // rather than fetch it (which a, serving only its own files, refuses):
+    // only the path checks stand between it and the escape.
+    write(&rb, "decoy.txt", b"evil");
 
     let id = add_folder(a, "docs", ra, None).await;
     // a writes entries no honest node would: paths leaving the folder, and
     // the marker.
     let doc = a.docs().open(id).await.unwrap().unwrap();
     let author = a.docs().author_default().await.unwrap();
-    let evil = a.blobs().add_bytes(&b"evil"[..]).temp_tag().await.unwrap();
     for path in [
         "../escape.txt",
         "x/../../escape.txt",
         "/abs.txt",
         ".syncfolder",
     ] {
-        let meta = FileMeta {
-            content: Some(evil.hash()),
-            size: 4,
-            mtime_ns: 1,
-            node: a.id(),
-            version: Version::default().bumped(a.id()),
-        };
+        let mut hasher = Hasher::new(4);
+        hasher.update(b"evil");
+        let meta = FileMeta::file(
+            hasher.finish(),
+            4,
+            1,
+            a.id(),
+            Version::default().bumped(a.id()),
+        );
         doc.set_bytes(
             author,
             path.as_bytes().to_vec(),
@@ -262,18 +272,38 @@ async fn unsafe_paths_are_refused() {
         .await
         .unwrap();
     }
+    // A safe path whose block list doesn't describe its content.
+    let mut hasher = Hasher::new(4);
+    hasher.update(b"evil");
+    let mut liar = FileMeta::file(
+        hasher.finish(),
+        4,
+        1,
+        a.id(),
+        Version::default().bumped(a.id()),
+    );
+    liar.blocks = vec![Hash::new(b"something else")];
+    doc.set_bytes(
+        author,
+        b"liar.txt".to_vec(),
+        postcard::to_stdvec(&liar).unwrap(),
+    )
+    .await
+    .unwrap();
     add_folder(b, "docs", &rb, Some(id)).await;
 
     eventually("b to fetch the honest file", || async {
         read(&rb, "ok.txt").as_deref() == Some(b"ok")
     })
     .await;
-    // Give the refused ones a few passes too.
-    tokio::time::sleep(INTERVAL * 5).await;
+    // Give the refused ones a few passes too, after the wait for content
+    // this node holds elsewhere.
+    tokio::time::sleep(RENAME_GRACE + INTERVAL * 5).await;
     assert!(!pb.path().join("escape.txt").exists());
     assert!(!Path::new("/abs.txt").exists());
     assert_eq!(read(&rb, ".syncfolder").unwrap(), b"");
     assert!(!outside.join("through.txt").exists());
+    assert!(!rb.join("liar.txt").exists());
 
     for node in nodes {
         node.shutdown().await.unwrap();
@@ -285,52 +315,176 @@ async fn a_partial_transfer_resumes() {
     let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
     let book = MemoryLookup::new();
     let nodes = group(&dirs, &book).await;
-    let mut nodes = nodes.into_iter();
-    let (a, b) = (nodes.next().unwrap(), nodes.next().unwrap());
+    let (a, b) = (&nodes[0], &nodes[1]);
     let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (ra, rb) = (pa.path(), pb.path());
+    let (ra, rb) = (pa.path(), pb.path().canonicalize().unwrap());
     const SIZE: usize = 8 << 20;
     let data: Vec<u8> = (0..SIZE).map(|i| (i * 7 + i / 4093) as u8).collect();
     let hash = Hash::new(&data);
     write(ra, "big.bin", &data);
-    let id = add_folder(&a, "docs", ra, None).await;
-    eventually("a to add big.bin to its store", || async {
-        a.blobs().has(hash).await.unwrap()
+    let id = add_folder(a, "docs", ra, None).await;
+
+    // What a fetch stopped half way leaves behind: the staging file at full
+    // length, its first half written.
+    let mut partial = data[..SIZE / 2].to_vec();
+    partial.resize(SIZE, 0);
+    fs::write(staging_path(&rb, "big.bin", hash), &partial).unwrap();
+
+    add_folder(b, "docs", &rb, Some(id)).await;
+    eventually("b to write big.bin", || async {
+        read(&rb, "big.bin").is_some_and(|got| got == data)
     })
     .await;
+    // Only the missing half was fetched.
+    assert_eq!(fetched(b, a), SIZE as u64 / 2);
 
-    // b got the first half before the transfer stopped (as a download cut
-    // off midway leaves it), then restarted.
-    let half = ChunkRanges::from(..ChunkNum((SIZE / 2 / 1024) as u64));
-    let bao = a
-        .blobs()
-        .export_bao(hash, half.clone())
-        .bao_to_vec()
-        .await
-        .unwrap();
-    b.blobs().import_bao_bytes(hash, half, bao).await.unwrap();
-    let key = b.endpoint().secret_key().clone();
-    b.shutdown().await.unwrap();
-    let b = spawn(dirs[1].path(), key, &book).await;
-    assert!(matches!(
-        b.blobs().status(hash).await.unwrap(),
-        BlobStatus::Partial { .. }
-    ));
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
 
-    add_folder(&b, "docs", rb, Some(id)).await;
-    eventually("b to write big.bin", || async {
+/// Two nodes, a and b, holding `data` at `big.bin` in a folder at `roots`.
+async fn synced(
+    dirs: &[tempfile::TempDir],
+    roots: [&Path; 2],
+    book: &MemoryLookup,
+    data: &[u8],
+) -> Vec<Node> {
+    let nodes = group(dirs, book).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    write(roots[0], "big.bin", data);
+    let id = add_folder(a, "docs", roots[0], None).await;
+    add_folder(b, "docs", roots[1], Some(id)).await;
+    eventually("b to fetch big.bin", || async {
+        read(roots[1], "big.bin").is_some_and(|got| got == data)
+    })
+    .await;
+    nodes
+}
+
+const BIG: usize = 10 << 20;
+
+fn big_data() -> Vec<u8> {
+    (0..BIG).map(|i| (i * 7 + i / 4093) as u8).collect()
+}
+
+#[tokio::test]
+async fn an_append_fetches_only_the_new_blocks() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ra, rb) = (pa.path(), pb.path());
+    let mut data = big_data();
+    let nodes = synced(&dirs, [ra, rb], &book, &data).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let before = fetched(b, a);
+
+    const TAIL: usize = 1 << 20;
+    data.extend((0..TAIL).map(|i| (i * 11 + 5) as u8));
+    write(ra, "big.bin", &data);
+    eventually("b to take the append", || async {
         read(rb, "big.bin").is_some_and(|got| got == data)
     })
     .await;
-    // Only the missing half crossed the wire, plus overhead.
-    let received = received(&b, &a);
-    assert!(
-        received < (SIZE as u64) * 3 / 4,
-        "received {received} bytes for {SIZE}"
-    );
+    // The appended blocks only.
+    assert_eq!(fetched(b, a) - before, TAIL as u64);
 
-    a.shutdown().await.unwrap();
-    b.shutdown().await.unwrap();
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn an_edit_in_the_middle_fetches_one_block() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ra, rb) = (pa.path(), pb.path());
+    let mut data = big_data();
+    let nodes = synced(&dirs, [ra, rb], &book, &data).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let before = fetched(b, a);
+
+    data[BIG / 2..BIG / 2 + 100].fill(0xAA);
+    write(ra, "big.bin", &data);
+    eventually("b to take the edit", || async {
+        read(rb, "big.bin").is_some_and(|got| got == data)
+    })
+    .await;
+    assert_eq!(fetched(b, a) - before, u64::from(MIN_BLOCK_SIZE));
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn blocks_are_copied_from_other_files() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ra, rb) = (pa.path(), pb.path());
+    let data = big_data();
+    let nodes = synced(&dirs, [ra, rb], &book, &data).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let before = fetched(b, a);
+
+    // A new file: the first half of big.bin, then new bytes.
+    const TAIL: usize = 1 << 20;
+    let mut other = data[..BIG / 2].to_vec();
+    other.extend((0..TAIL).map(|i| (i * 11 + 5) as u8));
+    write(ra, "other.bin", &other);
+    eventually("b to fetch other.bin", || async {
+        read(rb, "other.bin").is_some_and(|got| got == other)
+    })
+    .await;
+    assert_eq!(read(rb, "big.bin").unwrap(), data);
+    // The new bytes only: the first half was copied from big.bin.
+    assert_eq!(fetched(b, a) - before, TAIL as u64);
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn stale_staging_files_are_removed() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ra, rb) = (pa.path(), pb.path().canonicalize().unwrap());
+    write(ra, "doc.txt", b"current");
+    // Left by fetches of versions nobody wants any more, untouched for
+    // longer than STALE_STAGING; one as old that only looks like one; and
+    // one as unwanted but written recently, which may be about to resume.
+    let stale = staging_path(&rb, "doc.txt", Hash::new(b"an old version"));
+    let gone = staging_path(&rb, "deleted.txt", Hash::new(b"deleted since"));
+    let other = rb.join(".sync-node-tmp-not-a-staging-file");
+    let recent = staging_path(&rb, "doc.txt", Hash::new(b"another version"));
+    let long_ago = std::time::SystemTime::now() - STALE_STAGING * 2;
+    for path in [&stale, &gone, &other, &recent] {
+        fs::write(path, b"part of it").unwrap();
+    }
+    for path in [&stale, &gone, &other] {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(long_ago).unwrap();
+    }
+
+    let id = add_folder(a, "docs", ra, None).await;
+    add_folder(b, "docs", &rb, Some(id)).await;
+    eventually("b to fetch doc.txt and clean up", || async {
+        read(&rb, "doc.txt").is_some_and(|got| got == b"current")
+            && !stale.exists()
+            && !gone.exists()
+    })
+    .await;
+    assert!(other.exists() && recent.exists());
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -351,7 +505,7 @@ async fn a_rename_moves_the_file() {
     })
     .await;
     let inode = fs::metadata(rb.join("old/photo.bin")).unwrap().ino();
-    let before = received(b, a);
+    let before = fetched(b, a);
 
     fs::create_dir(ra.join("new")).unwrap();
     fs::rename(ra.join("old/photo.bin"), ra.join("new/photo.bin")).unwrap();
@@ -361,8 +515,7 @@ async fn a_rename_moves_the_file() {
     .await;
     // The same file, moved: not fetched again, nor copied.
     assert_eq!(fs::metadata(rb.join("new/photo.bin")).unwrap().ino(), inode);
-    let fetched = received(b, a) - before;
-    assert!(fetched < SIZE as u64 / 4, "received {fetched} bytes");
+    assert_eq!(fetched(b, a), before);
 
     for node in nodes {
         node.shutdown().await.unwrap();
@@ -442,6 +595,270 @@ async fn three_nodes_converge_with_one_offline() {
     .await;
 
     for node in [a, b, c] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Total size of the regular files under `dir`.
+fn dir_size(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => dir_size(&entry.path()),
+                    Ok(_) => entry.metadata().map(|m| m.len()).unwrap_or(0),
+                    Err(_) => 0,
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// A file renamed on one node can still be fetched from it by a node that
+/// never had it (R4), and a received file is stored once (R1).
+#[tokio::test]
+async fn a_renamed_file_reaches_a_new_node() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let (a, c) = (&nodes[0], &nodes[1]);
+    let (pa, pc) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ra, rc) = (pa.path(), pc.path());
+    const SIZE: usize = 4 << 20;
+    let data: Vec<u8> = (0..SIZE).map(|i| (i * 11 + i / 2039) as u8).collect();
+    write(ra, "zzz/original.bin", &data);
+    let id = add_folder(a, "docs", ra, None).await;
+    eventually("a to index the file", || async {
+        a.folder_index(id)
+            .await
+            .unwrap()
+            .contains_key("zzz/original.bin")
+    })
+    .await;
+    // Renamed to a path that sorts first: the case iroh-blobs' store got
+    // wrong.
+    fs::create_dir(ra.join("aaa")).unwrap();
+    fs::rename(ra.join("zzz/original.bin"), ra.join("aaa/renamed.bin")).unwrap();
+    eventually("a to index the rename", || async {
+        a.folder_index(id)
+            .await
+            .unwrap()
+            .contains_key("aaa/renamed.bin")
+    })
+    .await;
+
+    let blobs = dirs[1].path().join("blobs");
+    let before = dir_size(&blobs);
+    add_folder(c, "docs", rc, Some(id)).await;
+    eventually("c to fetch the renamed file", || async {
+        read(rc, "aaa/renamed.bin").is_some_and(|got| got == data)
+    })
+    .await;
+    assert!(read(rc, "zzz/original.bin").is_none());
+    // Stored once: in the folder, not again in the blob store.
+    let grown = dir_size(&blobs).saturating_sub(before);
+    assert!(
+        grown < SIZE as u64 / 8,
+        "the blob store grew by {grown} bytes"
+    );
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A provider that can't send hands the rest of the file over to the next.
+#[tokio::test]
+async fn a_failing_provider_hands_over() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    const SIZE: usize = 4 << 20;
+    let data: Vec<u8> = (0..SIZE).map(|i| (i * 5 + i / 3001) as u8).collect();
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    write(roots[0].path(), "shared.bin", &data);
+    write(roots[1].path(), "shared.bin", &data);
+    let id = add_folder(a, "docs", roots[0].path(), None).await;
+    add_folder(b, "docs", roots[1].path(), Some(id)).await;
+    eventually("a and b to agree", || async {
+        let v = a.folder_view(id).await.unwrap();
+        v.path("shared.bin").is_some_and(|p| p.in_sync())
+    })
+    .await;
+    // Providers are tried in node ID order: break the first one, which can
+    // then no longer read its copy (its index doesn't notice: the size and
+    // time are unchanged).
+    let (first, second) = if a.id() < b.id() { (0, 1) } else { (1, 0) };
+    let broken = roots[first].path().join("shared.bin");
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&broken, fs::Permissions::from_mode(0o000)).unwrap();
+
+    add_folder(c, "docs", roots[2].path(), Some(id)).await;
+    eventually("c to fetch the file", || async {
+        read(roots[2].path(), "shared.bin").is_some_and(|got| got == data)
+    })
+    .await;
+    assert_eq!(fetched(c, &nodes[first]), 0);
+    assert_eq!(fetched(c, &nodes[second]), SIZE as u64);
+
+    fs::set_permissions(&broken, fs::Permissions::from_mode(0o644)).unwrap();
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Bytes that don't match the block list are never written, and the node
+/// that sent them is dropped rather than asked for the whole file.
+#[tokio::test]
+async fn providers_share_the_load() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    // Several files: a fetch uses the providers c knows when it starts, and
+    // c may learn of b's copy only during the first one.
+    const FILES: usize = 4;
+    const SIZE: usize = 4 << 20;
+    let files: Vec<(String, Vec<u8>)> = (0..FILES)
+        .map(|f| {
+            let data = (0..SIZE).map(|i| (i * 5 + i / 3001 + f) as u8).collect();
+            (format!("shared-{f}.bin"), data)
+        })
+        .collect();
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    for (name, data) in &files {
+        write(roots[0].path(), name, data);
+        write(roots[1].path(), name, data);
+    }
+    let id = add_folder(a, "docs", roots[0].path(), None).await;
+    add_folder(b, "docs", roots[1].path(), Some(id)).await;
+    eventually("a and b to agree", || async {
+        let v = a.folder_view(id).await.unwrap();
+        files
+            .iter()
+            .all(|(name, _)| v.path(name).is_some_and(|p| p.in_sync()))
+    })
+    .await;
+
+    add_folder(c, "docs", roots[2].path(), Some(id)).await;
+    eventually("c to fetch the files", || async {
+        files
+            .iter()
+            .all(|(name, data)| read(roots[2].path(), name).is_some_and(|got| got == *data))
+    })
+    .await;
+    // Both sent a part (under load, c may learn of one provider only after
+    // most of the data has arrived), and together each block once.
+    let total = (FILES * SIZE) as u64;
+    let (from_a, from_b) = (fetched(c, a), fetched(c, b));
+    assert!(
+        from_a > total / 16 && from_b > total / 16,
+        "from a {from_a} bytes, from b {from_b}"
+    );
+    assert_eq!(from_a + from_b, total);
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_new_provider_joins_a_running_fetch() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    const SIZE: usize = 32 << 20;
+    let data: Vec<u8> = (0..SIZE).map(|i| (i * 5 + i / 3001) as u8).collect();
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    // b holds the file too, but keeps the folder only once c is fetching.
+    write(roots[0].path(), "big.bin", &data);
+    write(roots[1].path(), "big.bin", &data);
+    let id = add_folder(a, "docs", roots[0].path(), None).await;
+    eventually("b to see the folder listed", || async {
+        b.group_folders()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(f, _)| *f == id)
+    })
+    .await;
+    add_folder(c, "docs", roots[2].path(), Some(id)).await;
+    eventually("c to be fetching from a", || async {
+        fetched(c, a) > 2 << 20
+    })
+    .await;
+
+    b.add_folder("docs", roots[1].path()).await.unwrap();
+    eventually("c to fetch the file", || async {
+        read(roots[2].path(), "big.bin").is_some_and(|got| got == data)
+    })
+    .await;
+    let (from_a, from_b) = (fetched(c, a), fetched(c, b));
+    assert!(
+        from_b > SIZE as u64 / 32,
+        "from a {from_a} bytes, from b {from_b}: b didn't join, or c finished first"
+    );
+    assert_eq!(from_a + from_b, SIZE as u64);
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn blocks_that_dont_match_are_refused() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ra, rb) = (pa.path(), pb.path().canonicalize().unwrap());
+    const SIZE: usize = 8 << 20;
+    let data: Vec<u8> = (0..SIZE).map(|i| (i * 3 + i / 7919) as u8).collect();
+    write(ra, "real.bin", &data);
+    let id = add_folder(a, "docs", ra, None).await;
+    eventually("a to index the file", || async {
+        a.folder_index(id).await.unwrap().contains_key("real.bin")
+    })
+    .await;
+    // a's doc now tells other nodes a block list that doesn't describe the
+    // file; a's own index (what it serves by) still has the true one.
+    let mut lie = a
+        .folder_index(id)
+        .await
+        .unwrap()
+        .remove("real.bin")
+        .unwrap();
+    for block in lie.blocks.iter_mut() {
+        *block = Hash::new(block.as_bytes());
+    }
+    let doc = a.docs().open(id).await.unwrap().unwrap();
+    let author = a.docs().author_default().await.unwrap();
+    doc.set_bytes(
+        author,
+        b"real.bin".to_vec(),
+        postcard::to_stdvec(&lie).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    add_folder(b, "docs", &rb, Some(id)).await;
+    let staged = staging_path(&rb, "real.bin", Hash::new(&data));
+    eventually("b to try", || async { staged.exists() }).await;
+    tokio::time::sleep(INTERVAL * 10).await;
+    assert!(read(&rb, "real.bin").is_none());
+    // Nothing that failed the check reached the staging file.
+    assert!(fs::read(&staged).unwrap().iter().all(|byte| *byte == 0));
+    // Nothing counted as fetched, and one window of blocks crossed the
+    // wire, not the whole file.
+    assert_eq!(fetched(b, a), 0);
+    let received = received(b, a);
+    assert!(received < SIZE as u64 / 4, "received {received} bytes");
+
+    for node in nodes {
         node.shutdown().await.unwrap();
     }
 }

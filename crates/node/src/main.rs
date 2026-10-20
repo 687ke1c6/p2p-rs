@@ -37,13 +37,7 @@ enum Command {
     /// Print this node's ID, creating its key if there isn't one.
     Id,
     /// Run the node until Ctrl-C, creating its key if there isn't one.
-    Run {
-        /// Also transfer file contents: fetch files this node is missing and
-        /// delete files deleted elsewhere. Without it only the index syncs.
-        /// Temporary, while content transfer is new.
-        #[arg(long)]
-        with_content: bool,
-    },
+    Run,
     /// Found a new group with this node as its only member.
     Create,
     /// Manage invites to this node's group.
@@ -172,16 +166,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
     match command {
         Command::Id => println!("{}", key.public()),
-        Command::Run { with_content } => {
-            let config = Config {
-                content: with_content,
-                ..Config::new(Network::N0)
-            };
+        Command::Run => {
+            let config = Config::new(Network::N0);
             let node = Node::spawn_with(&config_dir, key, config).await?;
             tracing::info!("node {} running from {}", node.id(), config_dir.display());
-            if with_content {
-                tracing::info!("content transfer on: folders' files are fetched and deleted");
-            }
             tokio::select! {
                 _ = node.endpoint().online() => {
                     tracing::info!("online at {:?}", node.addr());

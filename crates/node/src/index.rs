@@ -13,24 +13,23 @@
 //! files) are neither indexed nor tombstoned: ignoring a file must not delete
 //! it on other nodes. Nor is anything under a directory that can't be read.
 //!
-//! With content transfer on, every indexed file is also added to the blob
-//! store by reference (not copied), so other nodes can fetch it, and the
-//! index task makes the changes the content task asks for ([`Apply`]):
-//! the disk and this node's entries only ever change in this task.
+//! The index task makes the changes the content task asks for, and re-reads
+//! files the block server asks it to ([`Apply`]): the disk and this node's
+//! entries only ever change in this task. The block server reads the entries
+//! through a shared handle ([`Entries`]) and serves files straight from disk.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, Metadata};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Context;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use iroh::EndpointId;
-use iroh_blobs::api::blobs::{AddPathOptions, ImportMode};
 use iroh_blobs::store::fs::FsStore;
-use iroh_blobs::{BlobFormat, Hash};
+use iroh_blobs::Hash;
 use iroh_docs::api::Doc;
 use iroh_docs::protocol::Docs;
 use iroh_docs::store::Query;
@@ -41,6 +40,7 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::blocks::{self, Hashed};
 use crate::view::Version;
 
 /// The ignore file at a folder's root, in `.gitignore` syntax.
@@ -102,7 +102,7 @@ const MAX_DELAY_INTERVALS: u32 = 10;
 /// What a folder entry points at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMeta {
-    /// BLAKE3 hash of the contents, as `iroh-blobs` computes it. `None` for a
+    /// BLAKE3 hash of the whole contents, as `b3sum` prints it. `None` for a
     /// tombstone.
     pub content: Option<Hash>,
     pub size: u64,
@@ -113,9 +113,47 @@ pub struct FileMeta {
     pub node: EndpointId,
     /// Which edits this version has seen (see `view`).
     pub version: Version,
+    /// The size of each block in `blocks` (see `blocks::block_size`). 0 for
+    /// a tombstone or an empty file.
+    pub block_size: u32,
+    /// BLAKE3 of each block of the contents, in order. Empty for a
+    /// tombstone or an empty file.
+    pub blocks: Vec<Hash>,
 }
 
 impl FileMeta {
+    /// A file with content `hashed`, as described by `node`.
+    pub fn file(
+        hashed: Hashed,
+        size: u64,
+        mtime_ns: u64,
+        node: EndpointId,
+        version: Version,
+    ) -> Self {
+        Self {
+            content: Some(hashed.content),
+            size,
+            mtime_ns,
+            node,
+            version,
+            block_size: hashed.block_size,
+            blocks: hashed.blocks,
+        }
+    }
+
+    /// A tombstone written by `node` now.
+    pub fn tombstone(node: EndpointId, version: Version) -> Self {
+        Self {
+            content: None,
+            size: 0,
+            mtime_ns: unix_now_ns(),
+            node,
+            version,
+            block_size: 0,
+            blocks: Vec::new(),
+        }
+    }
+
     pub fn is_deleted(&self) -> bool {
         self.content.is_none()
     }
@@ -124,7 +162,7 @@ impl FileMeta {
         postcard::to_stdvec(self).expect("meta serializes")
     }
 
-    fn stat(&self) -> Stat {
+    pub(crate) fn stat(&self) -> Stat {
         Stat {
             size: self.size,
             mtime_ns: self.mtime_ns,
@@ -139,14 +177,16 @@ pub struct IndexStats {
     pub bytes: u64,
 }
 
+/// A file's size and modification time: what tells the index a file
+/// changed without reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stat {
-    size: u64,
-    mtime_ns: u64,
+pub(crate) struct Stat {
+    pub size: u64,
+    pub mtime_ns: u64,
 }
 
 impl Stat {
-    fn of(meta: &Metadata) -> Self {
+    pub fn of(meta: &Metadata) -> Self {
         let mtime_ns = meta
             .modified()
             .ok()
@@ -168,9 +208,10 @@ struct Walk {
     unreadable: Vec<String>,
 }
 
-/// A change the content task asks the index task to make. `done` gets
-/// whether it was made: it isn't if this node's entry is no longer `expect`,
-/// or the disk no longer matches it (a local change not indexed yet).
+/// A change the content task (or the block server) asks the index task to
+/// make. `done` gets whether it was made: it isn't if this node's entry is no
+/// longer `expect`, or the disk no longer matches it (a local change not
+/// indexed yet).
 #[derive(Debug)]
 pub(crate) enum Apply {
     /// Put `meta`'s content at `path` and make `meta` this node's entry.
@@ -178,6 +219,8 @@ pub(crate) enum Apply {
         path: String,
         expect: Option<FileMeta>,
         meta: FileMeta,
+        /// The fetched file (see `blocks::staging_path`).
+        temp: PathBuf,
         done: oneshot::Sender<anyhow::Result<bool>>,
     },
     /// Delete the file at `path` and tombstone it with `version`.
@@ -194,8 +237,12 @@ pub(crate) enum Apply {
         expect: FileMeta,
         copy: String,
         meta: FileMeta,
+        temp: PathBuf,
         done: oneshot::Sender<anyhow::Result<bool>>,
     },
+    /// Read the file at `path` again even if its size and modification time
+    /// match its entry: the block server found bytes that don't match it.
+    Rehash { path: String },
     /// A rename elsewhere: move this node's file at `from` to `to`, rather
     /// than fetch `to` and delete `from`. `meta` becomes the entry at `to`,
     /// and `from` is tombstoned with `tombstone`.
@@ -210,32 +257,66 @@ pub(crate) enum Apply {
     },
 }
 
+/// This node's entries for one folder, by path, tombstones included. The
+/// index task is the only writer; the block server reads them to know what
+/// it may serve.
+#[derive(Debug, Clone, Default)]
+pub struct Entries(Arc<RwLock<HashMap<String, Arc<FileMeta>>>>);
+
+impl Entries {
+    pub fn get(&self, path: &str) -> Option<Arc<FileMeta>> {
+        self.0.read().unwrap().get(path).cloned()
+    }
+
+    fn insert(&self, path: &str, meta: FileMeta) {
+        self.0
+            .write()
+            .unwrap()
+            .insert(path.to_string(), Arc::new(meta));
+    }
+
+    fn replace(&self, entries: HashMap<String, FileMeta>) {
+        *self.0.write().unwrap() = entries
+            .into_iter()
+            .map(|(path, meta)| (path, Arc::new(meta)))
+            .collect();
+    }
+
+    /// Whether the entry for `path` is `expect` (`None`: no entry).
+    fn is(&self, path: &str, expect: Option<&FileMeta>) -> bool {
+        self.get(path).as_deref() == expect
+    }
+
+    /// Runs `f` on every entry.
+    pub(crate) fn with<T>(&self, f: impl FnOnce(&HashMap<String, Arc<FileMeta>>) -> T) -> T {
+        f(&self.0.read().unwrap())
+    }
+}
+
 pub struct FolderIndex {
     root: PathBuf,
     doc: Doc,
     blobs: FsStore,
     author: AuthorId,
     node: EndpointId,
-    entries: HashMap<String, FileMeta>,
+    entries: Entries,
     ignore: Gitignore,
-    /// Content transfer is on: files are added to the blob store.
-    content: bool,
 }
 
 impl FolderIndex {
-    /// Opens `node`'s index of the folder at `root`, kept in doc `id`. With
-    /// `content`, indexed files are also added to the blob store.
+    /// Opens `node`'s index of the folder at `root`, kept in doc `id`, and
+    /// loads its entries into `entries`.
     pub async fn open(
         docs: &Docs,
         blobs: &FsStore,
         id: NamespaceId,
         root: PathBuf,
         node: EndpointId,
-        content: bool,
+        entries: Entries,
     ) -> anyhow::Result<Self> {
         let doc = docs.open(id).await?.context("folder doc missing")?;
         let author = docs.author_default().await?;
-        let entries = read_entries(&doc, blobs, author).await?;
+        entries.replace(read_entries(&doc, blobs, author).await?);
         let ignore = load_ignore(&root);
         let mut index = Self {
             root,
@@ -245,7 +326,6 @@ impl FolderIndex {
             node,
             entries,
             ignore,
-            content,
         };
         index.finish_journal().await?;
         Ok(index)
@@ -264,7 +344,7 @@ impl FolderIndex {
             let placed = safe_path(&path)
                 && fs::symlink_metadata(self.root.join(&path))
                     .is_ok_and(|m| m.is_file() && Stat::of(&m) == meta.stat());
-            if placed && self.entries.get(&path) != Some(&meta) {
+            if placed && !self.entries.is(&path, Some(&meta)) {
                 tracing::debug!("finishing the placement of {path}");
                 self.write(&path, meta).await?;
             }
@@ -277,17 +357,14 @@ impl FolderIndex {
         &self.root
     }
 
-    /// This node's entries, tombstones included.
-    pub fn entries(&self) -> &HashMap<String, FileMeta> {
-        &self.entries
-    }
-
     pub fn stats(&self) -> IndexStats {
-        let live = self.entries.values().filter(|m| !m.is_deleted());
-        IndexStats {
-            files: live.clone().count(),
-            bytes: live.map(|m| m.size).sum(),
-        }
+        self.entries.with(|entries| {
+            let live = entries.values().filter(|m| !m.is_deleted());
+            IndexStats {
+                files: live.clone().count(),
+                bytes: live.map(|m| m.size).sum(),
+            }
+        })
     }
 
     /// Re-reads `.syncignore`.
@@ -309,22 +386,23 @@ impl FolderIndex {
         let mut seen = HashSet::new();
         for (path, stat) in walk.files {
             seen.insert(path.clone());
-            if self.index_file(&path, stat).await? {
+            if self.index_file(&path, stat, false).await? {
                 written += 1;
             }
         }
-        let gone: Vec<String> = self
-            .entries
-            .iter()
-            .filter(|(path, meta)| {
-                !meta.is_deleted()
-                    && is_under(path, rel)
-                    && !seen.contains(*path)
-                    && !walk.unreadable.iter().any(|dir| is_under(path, dir))
-                    && !self.is_ignored(path, false)
-            })
-            .map(|(path, _)| path.clone())
-            .collect();
+        let gone: Vec<String> = self.entries.with(|entries| {
+            entries
+                .iter()
+                .filter(|(path, meta)| {
+                    !meta.is_deleted()
+                        && is_under(path, rel)
+                        && !seen.contains(*path)
+                        && !walk.unreadable.iter().any(|dir| is_under(path, dir))
+                        && !self.is_ignored(path, false)
+                })
+                .map(|(path, _)| path.clone())
+                .collect()
+        });
         if !gone.is_empty() {
             // The root may have gone during the walk.
             check_root(&self.root)?;
@@ -337,103 +415,54 @@ impl FolderIndex {
     }
 
     /// Indexes one file found at `stat`. Returns whether it wrote an entry.
-    async fn index_file(&mut self, path: &str, stat: Stat) -> anyhow::Result<bool> {
-        let old = self.entries.get(path).cloned();
+    /// A file whose size and modification time match its entry isn't read
+    /// again, unless `force`.
+    async fn index_file(&mut self, path: &str, stat: Stat, force: bool) -> anyhow::Result<bool> {
+        let old = self.entries.get(path).map(|m| (*m).clone());
         let unchanged = old.as_ref().and_then(|old| {
-            let same = old.size == stat.size && old.mtime_ns == stat.mtime_ns;
+            let same = old.size == stat.size && old.mtime_ns == stat.mtime_ns && !force;
             old.content.filter(|_| same)
         });
-        if let Some(hash) = unchanged {
-            // Indexed before content transfer was on, or the store lost it.
-            if !self.content || self.blobs.has(hash).await? {
-                return Ok(false);
-            }
+        if unchanged.is_some() {
+            return Ok(false);
         }
         let abs = self.root.join(path);
-        let hashed = if self.content {
-            self.import(abs).await?
-        } else {
-            tokio::task::spawn_blocking(move || hash_file(&abs)).await??
-        };
-        let Some((hash, stat)) = hashed else {
+        let Some((hashed, stat)) = tokio::task::spawn_blocking(move || hash_file(&abs)).await??
+        else {
             // Gone or changed while hashing: its next event brings it back.
             return Ok(false);
         };
-        if unchanged == Some(hash) && Some(stat) == old.as_ref().map(FileMeta::stat) {
-            // Only added to the store.
-            return Ok(false);
-        }
+        let hash = hashed.content;
         let version = match &old {
             // Only the modification time changed: the same version.
             Some(old) if old.content == Some(hash) => old.version.clone(),
             _ => self.next_version(path, old.as_ref()).await?,
         };
-        let meta = FileMeta {
-            content: Some(hash),
-            size: stat.size,
-            mtime_ns: stat.mtime_ns,
-            node: self.node,
-            version,
-        };
+        let meta = FileMeta::file(hashed, stat.size, stat.mtime_ns, self.node, version);
         self.write(path, meta).await?;
         Ok(true)
     }
 
-    /// Adds the file at `abs` to the blob store by reference, returning its
-    /// hash, or `None` if it isn't a regular file any more or changed while
-    /// being read.
-    async fn import(&self, abs: PathBuf) -> anyhow::Result<Option<(Hash, Stat)>> {
-        let stat = |path: PathBuf| async move {
-            match tokio::fs::symlink_metadata(&path).await {
-                Ok(meta) if meta.is_file() => Ok(Some(Stat::of(&meta))),
-                Ok(_) => Ok(None),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-                Err(err) => Err(err),
-            }
-        };
-        let Some(before) = stat(abs.clone()).await? else {
-            return Ok(None);
-        };
-        let tag = self
-            .blobs
-            .add_path_with_opts(AddPathOptions {
-                path: abs.clone(),
-                format: BlobFormat::Raw,
-                mode: ImportMode::TryReference,
-            })
-            .temp_tag()
-            .await;
-        let tag = match tag {
-            Ok(tag) => tag,
-            // Gone while being read.
-            Err(_) if stat(abs.clone()).await?.is_none() => return Ok(None),
-            Err(err) => return Err(err).context("adding to the blob store"),
-        };
-        if stat(abs).await? != Some(before) {
-            return Ok(None);
-        }
-        Ok(Some((tag.hash(), before)))
-    }
-
-    /// Puts blob `meta.content` at `path` and makes `meta` (with the size
-    /// and modification time the file ends up with) this node's entry, if
-    /// the entry is still `expect` and the disk matches it. The blob is
-    /// written to a temporary file next to the target, checked against its
-    /// hash, given the entry's modification time, and only then moved into
-    /// place. Returns whether it placed the file.
+    /// Puts the fetched file `temp` (`meta`'s content) at `path` and makes
+    /// `meta` (with the size and modification time the file ends up with)
+    /// this node's entry, if the entry is still `expect` and the disk
+    /// matches it. The file is checked against `meta`'s hash and block list
+    /// and given its modification time before it is moved into place.
+    /// Returns whether it placed the file.
     pub async fn place(
         &mut self,
         path: &str,
         expect: Option<&FileMeta>,
         meta: FileMeta,
+        temp: PathBuf,
     ) -> anyhow::Result<bool> {
         check_root(&self.root)?;
         self.check_writable(path)?;
-        if self.entries.get(path) != expect {
+        if !self.entries.is(path, expect) {
             return Ok(false);
         }
         let expect = expect.filter(|e| !e.is_deleted()).map(FileMeta::stat);
-        self.place_at(path, expect, meta).await
+        self.place_at(path, expect, meta, temp).await
     }
 
     /// Refuses a path from another node that isn't safe to write here.
@@ -444,16 +473,15 @@ impl FolderIndex {
         Ok(())
     }
 
-    /// Writes `meta`'s content at `path`, if the disk there matches
-    /// `expect`, and makes `meta` the entry. The content comes from the blob
-    /// store, or failing that from another of this node's files with the
-    /// same content: a file added by reference can't be read from the store
-    /// once it has moved.
+    /// Moves the fetched file `temp` to `path`, if the disk there matches
+    /// `expect` and the file checks out against `meta`, and makes `meta` the
+    /// entry.
     async fn place_at(
         &mut self,
         path: &str,
         expect: Option<Stat>,
         mut meta: FileMeta,
+        temp: PathBuf,
     ) -> anyhow::Result<bool> {
         let hash = meta.content.context("placing a tombstone")?;
         let abs = self.root.join(path);
@@ -466,35 +494,24 @@ impl FolderIndex {
         if !ready {
             return Ok(false);
         }
-        let temp = abs.with_file_name(format!("{TEMP_PREFIX}{:016x}", rand::random::<u64>()));
-        let result = async {
-            let exported = self.blobs.export(hash, &temp).finish().await;
-            if let Err(err) = exported {
-                let Some(source) = self.local_copy(hash, path) else {
-                    return Err(err).context("exporting from the blob store");
-                };
-                let temp = temp.clone();
-                tokio::task::spawn_blocking(move || fs::copy(source, temp))
-                    .await?
-                    .context("copying a local file with the same content")?;
-            }
-            meta.node = self.node;
-            let placing = Placing {
-                path: path.to_string(),
-                meta: meta.clone(),
-            };
-            let (temp, journal) = (temp.clone(), self.root.join(JOURNAL));
-            tokio::task::spawn_blocking(move || {
-                finish_place(&temp, &abs, hash, expect, &journal, placing)
-            })
-            .await?
-        }
-        .await;
+        meta.node = self.node;
+        let placing = Placing {
+            path: path.to_string(),
+            meta: meta.clone(),
+        };
+        let (staged, journal) = (temp.clone(), self.root.join(JOURNAL));
+        let result = tokio::task::spawn_blocking(move || {
+            finish_place(&staged, &abs, hash, expect, &journal, placing)
+        })
+        .await?;
         let stat = match result {
             Ok(Some(stat)) => stat,
-            other => {
+            // The disk changed: keep the fetched file for a later try.
+            Ok(None) => return Ok(false),
+            Err(err) => {
+                // It didn't check out: fetch it again.
                 let _ = fs::remove_file(&temp);
-                return other.map(|_| false);
+                return Err(err);
             }
         };
         meta.size = stat.size;
@@ -504,30 +521,23 @@ impl FolderIndex {
         Ok(true)
     }
 
-    /// Another of this node's files holding `hash`, as its entry says,
-    /// other than `except`.
-    fn local_copy(&self, hash: Hash, except: &str) -> Option<PathBuf> {
-        self.entries
-            .iter()
-            .find(|(path, meta)| *path != except && meta.content == Some(hash))
-            .map(|(path, _)| self.root.join(path))
-    }
-
     /// Resolves a conflict this node's version lost: renames its file at
     /// `path` (still as `expect` says) to `copy`, indexes the copy as a new
-    /// file, and puts the winner, `meta`, at `path`. Returns whether it did.
+    /// file, and puts the winner, `meta`, fetched into `temp`, at `path`.
+    /// Returns whether it did.
     pub async fn resolve(
         &mut self,
         path: &str,
         expect: &FileMeta,
         copy: &str,
         meta: FileMeta,
+        temp: PathBuf,
     ) -> anyhow::Result<bool> {
         check_root(&self.root)?;
         self.check_writable(path)?;
         self.check_writable(copy)?;
         if expect.is_deleted()
-            || self.entries.get(path) != Some(expect)
+            || !self.entries.is(path, Some(expect))
             || self.entries.get(copy).is_some_and(|e| !e.is_deleted())
         {
             return Ok(false);
@@ -544,10 +554,10 @@ impl FolderIndex {
         let Some(stat) = moved else {
             return Ok(false);
         };
-        self.index_file(copy, stat).await?;
+        self.index_file(copy, stat, false).await?;
         // The name is free now. If this fails, the next reconcile tombstones
         // `path`, the winner's edit beats that, and a later pass fetches it.
-        self.place_at(path, None, meta).await
+        self.place_at(path, None, meta, temp).await
     }
 
     /// Moves this node's file at `from` (still as `from_expect` says) to
@@ -570,8 +580,8 @@ impl FolderIndex {
             || from_expect.is_deleted()
             || from_expect.content != meta.content
             || to_expect.is_some_and(|e| !e.is_deleted())
-            || self.entries.get(from) != Some(from_expect)
-            || self.entries.get(to) != to_expect
+            || !self.entries.is(from, Some(from_expect))
+            || !self.entries.is(to, to_expect)
         {
             return Ok(false);
         }
@@ -599,21 +609,8 @@ impl FolderIndex {
         meta.mtime_ns = stat.mtime_ns;
         meta.node = self.node;
         self.write(to, meta).await?;
-        let gone = FileMeta {
-            content: None,
-            size: 0,
-            mtime_ns: unix_now_ns(),
-            node: self.node,
-            version: tombstone,
-        };
-        self.write(from, gone).await?;
-        if self.content {
-            // Records the new path in the blob store, so the file can still be
-            // sent from here.
-            if let Err(err) = self.import(self.root.join(to)).await {
-                tracing::debug!("adding moved {to} to the blob store: {err:#}");
-            }
-        }
+        self.write(from, FileMeta::tombstone(self.node, tombstone))
+            .await?;
         Ok(true)
     }
 
@@ -627,7 +624,7 @@ impl FolderIndex {
         version: Version,
     ) -> anyhow::Result<bool> {
         check_root(&self.root)?;
-        if !safe_path(path) || expect.is_deleted() || self.entries.get(path) != Some(expect) {
+        if !safe_path(path) || expect.is_deleted() || !self.entries.is(path, Some(expect)) {
             return Ok(false);
         }
         let (root, rel, expect) = (self.root.clone(), path.to_string(), expect.stat());
@@ -646,27 +643,34 @@ impl FolderIndex {
         if !removed {
             return Ok(false);
         }
-        let meta = FileMeta {
-            content: None,
-            size: 0,
-            mtime_ns: unix_now_ns(),
-            node: self.node,
-            version,
-        };
-        self.write(path, meta).await?;
+        self.write(path, FileMeta::tombstone(self.node, version))
+            .await?;
         Ok(true)
     }
 
     /// Makes a change the content task asked for and reports back.
     async fn apply(&mut self, apply: Apply) {
         match apply {
+            Apply::Rehash { path } => {
+                let abs = self.root.join(&path);
+                match fs::symlink_metadata(&abs) {
+                    Ok(meta) if meta.is_file() && safe_path(&path) => {
+                        if let Err(err) = self.index_file(&path, Stat::of(&meta), true).await {
+                            tracing::debug!("re-reading {path}: {err:#}");
+                        }
+                    }
+                    // Gone or replaced: the watcher reports it.
+                    _ => {}
+                }
+            }
             Apply::Place {
                 path,
                 expect,
                 meta,
+                temp,
                 done,
             } => {
-                let _ = done.send(self.place(&path, expect.as_ref(), meta).await);
+                let _ = done.send(self.place(&path, expect.as_ref(), meta, temp).await);
             }
             Apply::Delete {
                 path,
@@ -681,9 +685,11 @@ impl FolderIndex {
                 expect,
                 copy,
                 meta,
+                temp,
                 done,
             } => {
-                let _ = done.send(self.resolve(&path, &expect, &copy, meta).await);
+                let result = self.resolve(&path, &expect, &copy, meta, temp).await;
+                let _ = done.send(result);
             }
             Apply::Move {
                 from,
@@ -710,16 +716,10 @@ impl FolderIndex {
     }
 
     async fn tombstone(&mut self, path: &str) -> anyhow::Result<()> {
-        let old = self.entries.get(path).cloned();
+        let old = self.entries.get(path).map(|m| (*m).clone());
         let version = self.next_version(path, old.as_ref()).await?;
-        let meta = FileMeta {
-            content: None,
-            size: 0,
-            mtime_ns: unix_now_ns(),
-            node: self.node,
-            version,
-        };
-        self.write(path, meta).await
+        self.write(path, FileMeta::tombstone(self.node, version))
+            .await
     }
 
     /// The version of a change to `path` replacing this node's `old` entry:
@@ -759,7 +759,7 @@ impl FolderIndex {
             .set_bytes(self.author, path.as_bytes().to_vec(), meta.to_bytes())
             .await?;
         tracing::debug!("indexed {path}: {meta:?}");
-        self.entries.insert(path.to_string(), meta);
+        self.entries.insert(path, meta);
         Ok(())
     }
 }
@@ -776,6 +776,7 @@ async fn read_entries(
         .collect::<Vec<_>>()
         .await;
     let mut out = HashMap::new();
+    let mut unreadable = 0;
     for entry in entries {
         let entry = entry?;
         let Ok(path) = std::str::from_utf8(entry.key()) else {
@@ -784,9 +785,18 @@ async fn read_entries(
         let Ok(bytes) = blobs.get_bytes(entry.content_hash()).await else {
             continue;
         };
-        if let Ok(meta) = postcard::from_bytes::<FileMeta>(&bytes) {
-            out.insert(path.to_string(), meta);
+        match postcard::from_bytes::<FileMeta>(&bytes) {
+            Ok(meta) => {
+                out.insert(path.to_string(), meta);
+            }
+            Err(_) => unreadable += 1,
         }
+    }
+    if unreadable > 0 {
+        tracing::warn!(
+            "{unreadable} of this node's index entries can't be read: written by an older \
+             version? Clear the config dir (sync-node --clear-config) and start again"
+        );
     }
     Ok(out)
 }
@@ -809,8 +819,28 @@ pub async fn read_all(
     blobs: &FsStore,
     id: NamespaceId,
 ) -> anyhow::Result<BTreeMap<String, BTreeMap<EndpointId, FileMeta>>> {
+    read_query(docs, blobs, id, Query::all()).await
+}
+
+/// Every node's entry for `path` in folder doc `id`, as [`read_all`].
+pub async fn read_path(
+    docs: &Docs,
+    blobs: &FsStore,
+    id: NamespaceId,
+    path: &str,
+) -> anyhow::Result<BTreeMap<EndpointId, FileMeta>> {
+    let mut out = read_query(docs, blobs, id, Query::key_exact(path)).await?;
+    Ok(out.remove(path).unwrap_or_default())
+}
+
+async fn read_query(
+    docs: &Docs,
+    blobs: &FsStore,
+    id: NamespaceId,
+    query: impl Into<Query>,
+) -> anyhow::Result<BTreeMap<String, BTreeMap<EndpointId, FileMeta>>> {
     let doc = docs.open(id).await?.context("folder doc missing")?;
-    let entries = doc.get_many(Query::all()).await?.collect::<Vec<_>>().await;
+    let entries = doc.get_many(query).await?.collect::<Vec<_>>().await;
     let mut out: BTreeMap<String, BTreeMap<EndpointId, FileMeta>> = BTreeMap::new();
     for entry in entries {
         let entry = entry?;
@@ -956,9 +986,9 @@ fn remove_empty_parents(root: &Path, rel: &str) {
     }
 }
 
-/// Checks the exported file at `temp` against `hash` and the entry's size,
-/// gives it the entry's modification time and moves it to `abs`, if the disk
-/// there still matches `expect`. The entry, with the file's final size and
+/// Checks the fetched file at `temp` against `hash`, the entry's size and
+/// its block list, gives it the entry's modification time and moves it to
+/// `abs`, if the disk there still matches `expect`. The entry, with the file's final size and
 /// modification time, goes to `journal` first. Returns that size and
 /// modification time, or `None` if the disk changed.
 fn finish_place(
@@ -971,14 +1001,20 @@ fn finish_place(
 ) -> anyhow::Result<Option<Stat>> {
     let (size, mtime_ns) = (placing.meta.size, placing.meta.mtime_ns);
     let file = File::options().read(true).write(true).open(temp)?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update_reader(&file)?;
-    let (got, len) = (Hash::from(hasher.finalize()), file.metadata()?.len());
-    if got != hash || len != size {
+    let (got, len) = blocks::hash_reader(size, &file)?;
+    if got.content != hash || len != size {
         anyhow::bail!(
-            "exported {} doesn't match: got {} ({len} bytes)",
+            "fetched {} doesn't match: got {} ({len} bytes)",
             hash.fmt_short(),
-            got.fmt_short()
+            got.content.fmt_short()
+        );
+    }
+    // The block list came from another node's entry: it must describe this
+    // content too.
+    if got.block_size != placing.meta.block_size || got.blocks != placing.meta.blocks {
+        anyhow::bail!(
+            "{}'s block list doesn't match its content",
+            hash.fmt_short()
         );
     }
     file.set_modified(UNIX_EPOCH + Duration::from_nanos(mtime_ns))?;
@@ -1000,7 +1036,7 @@ fn finish_place(
 
 /// Hashes the file at `path`, or `None` if it isn't a regular file any more
 /// or changed while being read.
-fn hash_file(path: &Path) -> io::Result<Option<(Hash, Stat)>> {
+fn hash_file(path: &Path) -> io::Result<Option<(Hashed, Stat)>> {
     let not_found = |err: io::Error| {
         if err.kind() == io::ErrorKind::NotFound {
             Ok(None)
@@ -1017,29 +1053,28 @@ fn hash_file(path: &Path) -> io::Result<Option<(Hash, Stat)>> {
         Ok(file) => file,
         Err(err) => return not_found(err),
     };
-    let mut hasher = blake3::Hasher::new();
-    hasher.update_reader(file)?;
+    let (hashed, read) = blocks::hash_reader(before.len(), file)?;
     let after = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) => return not_found(err),
     };
     let stat = Stat::of(&after);
-    if Stat::of(&before) != stat {
+    if Stat::of(&before) != stat || read != stat.size {
         return Ok(None);
     }
-    Ok(Some((hasher.finalize().into(), stat)))
+    Ok(Some((hashed, stat)))
 }
 
 /// Keeps `index` in line with its folder until the task is dropped: a full
 /// reconcile now, then the paths the watcher reports, each once it has been
-/// quiet for `debounce`. In between, makes the changes the content task
-/// sends on `apply`. `stats` is updated after every pass and change.
+/// quiet for `debounce`. In between, makes the changes sent on `apply`.
+/// `stats` is updated after every pass and change.
 pub(crate) async fn watch(
     mut index: FolderIndex,
     name: String,
     debounce: Duration,
     stats: Arc<Mutex<IndexStats>>,
-    mut apply: Option<mpsc::Receiver<Apply>>,
+    mut apply: mpsc::Receiver<Apply>,
 ) {
     let root = index.root().to_path_buf();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1095,12 +1130,7 @@ pub(crate) async fn watch(
                 }
             }
         };
-        let requested = async {
-            match apply.as_mut() {
-                Some(apply) => apply.recv().await,
-                None => std::future::pending().await,
-            }
-        };
+        let requested = apply.recv();
         let event = tokio::select! {
             event = rx.recv() => match event {
                 Some(event) => Some(event),

@@ -3499,7 +3499,6 @@ name = "sync-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bao-tree",
  "blake3",
  "bytes",
  "clap",

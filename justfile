@@ -8,6 +8,10 @@ check:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
 
+# Load and contention tests (slow; ignored by `check`)
+stress:
+    cargo test --workspace -- --ignored
+
 # Run the sync node, passing any extra args through
 node *args:
     cargo run -p sync-node -- {{args}}

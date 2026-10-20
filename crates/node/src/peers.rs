@@ -56,20 +56,24 @@ pub struct Traffic {
 }
 
 impl Traffic {
-    fn add_path(&mut self, kind: LinkKind, stats: &PathStats) {
+    /// One path's bytes so far, under its kind.
+    fn of(kind: LinkKind, stats: &PathStats) -> Self {
+        let (sent, recv) = (stats.udp_tx.bytes, stats.udp_rx.bytes);
         match kind {
-            LinkKind::Direct => {
-                self.direct_sent += stats.udp_tx.bytes;
-                self.direct_recv += stats.udp_rx.bytes;
-            }
-            LinkKind::Relay => {
-                self.relay_sent += stats.udp_tx.bytes;
-                self.relay_recv += stats.udp_rx.bytes;
-            }
+            LinkKind::Direct => Self {
+                direct_sent: sent,
+                direct_recv: recv,
+                ..Self::default()
+            },
+            LinkKind::Relay => Self {
+                relay_sent: sent,
+                relay_recv: recv,
+                ..Self::default()
+            },
         }
     }
 
-    fn add(&mut self, other: &Traffic) {
+    pub fn add(&mut self, other: &Traffic) {
         self.direct_sent += other.direct_sent;
         self.direct_recv += other.direct_recv;
         self.relay_sent += other.relay_sent;
@@ -87,6 +91,66 @@ impl fmt::Display for Traffic {
             bytes(self.relay_sent),
             bytes(self.relay_recv)
         )
+    }
+}
+
+/// One connection's traffic, per path, counted so that the total never goes
+/// down: a path that has gone from the connection's list but whose close
+/// event hasn't been handled yet still counts, at the bytes last seen.
+/// Generic over the path key, so the rules can be tested on their own.
+#[derive(Debug, Clone)]
+pub struct PathTotals<K> {
+    /// Open paths (or gone, close not handled yet): bytes last seen.
+    seen: HashMap<K, Traffic>,
+    /// Paths whose close was handled.
+    closed: HashSet<K>,
+    /// Their final bytes.
+    closed_traffic: Traffic,
+}
+
+impl<K> Default for PathTotals<K> {
+    fn default() -> Self {
+        Self {
+            seen: HashMap::new(),
+            closed: HashSet::new(),
+            closed_traffic: Traffic::default(),
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> PathTotals<K> {
+    /// An open path's bytes so far. Ignored once the path has closed.
+    pub fn observe(&mut self, path: K, traffic: Traffic) {
+        if !self.closed.contains(&path) {
+            self.seen.insert(path, traffic);
+        }
+    }
+
+    /// A path closed, with its final bytes. Counted once.
+    pub fn path_closed(&mut self, path: K, last: Traffic) {
+        if self.closed.insert(path.clone()) {
+            self.seen.remove(&path);
+            self.closed_traffic.add(&last);
+        }
+    }
+
+    /// Everything so far.
+    pub fn total(&self) -> Traffic {
+        let mut total = self.closed_traffic;
+        for traffic in self.seen.values() {
+            total.add(traffic);
+        }
+        total
+    }
+
+    /// The connection closed, with the final bytes of the paths it still
+    /// had (none if they couldn't be had): its total from now on. A path
+    /// without final bytes counts at the bytes last seen.
+    pub fn finish(mut self, last: impl IntoIterator<Item = (K, Traffic)>) -> Traffic {
+        for (path, traffic) in last {
+            self.path_closed(path, traffic);
+        }
+        self.total()
     }
 }
 
@@ -142,9 +206,7 @@ struct TrackedConn {
     alpn: Vec<u8>,
     handle: WeakConnectionHandle,
     kinds: HashMap<PathId, LinkKind>,
-    /// Paths that closed while the connection stayed open.
-    closed_paths: HashSet<PathId>,
-    closed_traffic: Traffic,
+    traffic: PathTotals<PathId>,
 }
 
 impl Peers {
@@ -179,8 +241,7 @@ impl Peers {
                     alpn: alpn.clone(),
                     handle,
                     kinds,
-                    closed_paths: HashSet::new(),
-                    closed_traffic: Traffic::default(),
+                    traffic: PathTotals::default(),
                 },
             );
             first
@@ -252,9 +313,7 @@ impl Peers {
                         .get(&id)
                         .copied()
                         .unwrap_or(LinkKind::of(&remote_addr));
-                    if conn.closed_paths.insert(id) {
-                        conn.closed_traffic.add_path(kind, &last_stats);
-                    }
+                    conn.traffic.path_closed(id, Traffic::of(kind, &last_stats));
                 }
                 PathEvent::Selected {
                     id, remote_addr, ..
@@ -291,13 +350,12 @@ impl Peers {
         let Some(conn) = peer.conns.remove(&stable_id) else {
             return;
         };
-        let mut traffic = conn.closed_traffic;
-        for (id, stats) in &path_stats {
-            if !conn.closed_paths.contains(id) {
-                let kind = conn.kinds.get(id).copied().unwrap_or(LinkKind::Direct);
-                traffic.add_path(kind, stats);
-            }
-        }
+        let kinds = &conn.kinds;
+        let last = path_stats.iter().map(|(id, stats)| {
+            let kind = kinds.get(id).copied().unwrap_or(LinkKind::Direct);
+            (*id, Traffic::of(kind, stats))
+        });
+        let traffic = conn.traffic.clone().finish(last);
         peer.closed.add(&traffic);
         tracing::debug!(
             "{} connection {stable_id} on {} closed: {traffic}",
@@ -329,26 +387,25 @@ impl Peers {
 
     /// The peers this node has had a connection to since it started.
     pub fn snapshot(&self) -> Vec<PeerSnapshot> {
-        let peers = self.state.lock().unwrap();
+        let mut peers = self.state.lock().unwrap();
         let mut out: Vec<_> = peers
-            .iter()
+            .iter_mut()
             .map(|(id, peer)| {
                 let mut traffic = peer.closed;
                 let mut kind = None;
                 let mut path = None;
                 let mut rtt = None;
                 let mut connections = 0;
-                for conn in peer.conns.values() {
+                for conn in peer.conns.values_mut() {
                     let Some(strong) = conn.handle.upgrade() else {
+                        // Gone, close not handled yet: as last seen.
+                        traffic.add(&conn.traffic.total());
                         continue;
                     };
                     connections += 1;
-                    traffic.add(&conn.closed_traffic);
                     for p in strong.paths().iter() {
                         let k = LinkKind::of(p.remote_addr());
-                        if !conn.closed_paths.contains(&p.id()) {
-                            traffic.add_path(k, &p.stats());
-                        }
+                        conn.traffic.observe(p.id(), Traffic::of(k, &p.stats()));
                         // Prefer a direct selected path if connections disagree.
                         if p.is_selected() && kind != Some(LinkKind::Direct) {
                             kind = Some(k);
@@ -356,6 +413,7 @@ impl Peers {
                             rtt = Some(p.rtt());
                         }
                     }
+                    traffic.add(&conn.traffic.total());
                 }
                 PeerSnapshot {
                     id: *id,

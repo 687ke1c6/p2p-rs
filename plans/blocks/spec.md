@@ -15,7 +15,7 @@ The model is Syncthing's Block Exchange Protocol (BEP), cut down to what sync-no
 | Local files in the blob store | imported by reference | **not imported** |
 | Fetching a file | iroh-blobs `Downloader`, then export to a temporary file | **block protocol**, straight into the temporary file |
 | Placing, conflicts, renames, journal, merge rules | index task, `content.rs` | unchanged (place takes a finished temporary file) |
-| `run --with-content` | turns content transfer on | unchanged until the end of this plan |
+| `run --with-content` | turns content transfer on | removed in plan step 5: content transfer is always on |
 
 ## 2. Block lists in the index
 
@@ -96,14 +96,15 @@ A node only ever serves bytes it has just read and checked against its own index
 
 The content task, for an `Action::Fetch` or the winner of an `Action::Resolve`:
 
-1. **Temporary file:** `.sync-node-tmp-<16 hex of BLAKE3(path ‖ content)>` beside the target. The name is fixed for a path and version, so a restart finds it again. Temporary files are ignored by the index, as today.
+1. **Temporary file:** `.sync-node-tmp-<16 hex of BLAKE3(path ‖ 0 ‖ content)>` at the folder root (changed in step 3 from "beside the target": nothing is written below the root before the index task has checked the way, and it creates the parent directories when it places the file). The name is fixed for a path and version, so a restart finds it again. Temporary files are ignored by the index, as today. Limit: a file can't be placed across a mount point inside a folder (the rename fails and is logged).
 2. **Resume:** if the file exists with the right length, each block is read and checked against the block list; matching blocks count as done. Otherwise it is created at the full length.
-3. **Providers:** the nodes whose entry for the path has the wanted content (as today), online first, in random order.
-4. **Requests:** up to 8 open at once to the current provider. Each received block is hashed and compared with the block list before it is written at its offset; a mismatch drops that provider for this file.
-5. **Failures:** a timeout (30 s per block), a refusal or a broken connection moves the remaining blocks to the next provider. `Busy` is retried after a short wait. When no provider is left, the temporary file stays for the content task's next pass (every 10 s, or on a change to the folder).
-6. **Done:** once every block is verified, the file is synced to disk and handed to the index task: `Apply::Place { path, expect, meta, temp }`. The index task re-hashes the whole file against `content` (R10, and a guard against a block list that doesn't match its content hash), sets the modification time, writes the journal, renames, and writes the entry, exactly as today.
+3. **Providers:** the nodes whose entry for the path has the wanted content, which means a complete copy of that version (as today). All are connected at once (changed in plan step 4 from one at a time), so an unreachable one costs nothing but its own connect timeout (10 s). During the fetch the content task watches the folder's doc: a node whose entry comes to hold the wanted content (it finished its own copy) joins the fetch. A dropped provider stays dropped for that fetch. Connections are kept per provider and reused across files.
+4. **Requests:** up to 8 open at once to each provider, all drawing from one queue of missing blocks: a faster provider finishes sooner and is given more. Each received block is hashed and compared with the block list before it is written at its offset; a mismatch drops that provider for this file. Only the fetch loop writes, and only a block still wanted, so a stopped request never writes.
+5. **Endgame:** once the queue is empty, a provider with room is also asked for a block whose request to another provider is overdue: open more than twice as long as requests in this fetch typically take (a moving average of delivered requests). The first answer is written and the other request is stopped. A block is asked of at most two providers at once. Providers of about the same speed are rarely asked twice for a block; a slow or stalled one can't hold up the end.
+6. **Failures:** a timeout (30 s per block), a refusal or a broken connection drops that provider for this file; its open blocks go back to the queue for the others. `Busy` pauses that provider for a short wait, then it is asked again. When no provider is left, the temporary file stays, and that file waits 10 s before the next try (not every change to the folder, which would ask a node sending bad blocks again and again).
+7. **Done:** once every block is verified, the file is synced to disk and handed to the index task: `Apply::Place { path, expect, meta, temp }`. The index task re-hashes the whole file against `content` (R10, and a guard against a block list that doesn't match its content hash), sets the modification time, writes the journal, renames, and writes the entry, exactly as today.
 
-**Local sources first** (a later step): blocks whose hash already exists locally, in the old version of the same path or another file with the same content, are copied from disk instead of requested. Today's whole-file `local_copy` is the simplest case.
+**Local sources first** (plan step 4): before any request, blocks whose hash already exists locally, in the old version of the same path or any other file of this node sharing a block, are copied from disk instead of requested. Each is checked against the block list before it is written. A file complete from local blocks alone is placed without asking any node.
 
 ## 6. Code layout
 
@@ -125,7 +126,7 @@ The content task, for an `Action::Fetch` or the winner of an `Action::Resolve`:
 | File edited on the provider mid-transfer | `Changed`; the provider re-indexes; the receiver's next pass sees the new version and starts over for it (old temporary file cleaned up later). |
 | Provider sends wrong bytes | Block hash mismatch; that provider is dropped for the file. |
 | Block list doesn't match the content hash (bad entry) | Whole-file check fails at placement; the temporary file is deleted; logged. |
-| Stale temporary files (version no longer wanted) | Removed at scan time once they no longer match any wanted version (plan step 5). |
+| Stale temporary files (version no longer wanted) | Removed by the content task once no planned fetch uses them and nothing has written to them for 24 h (plan step 5). |
 
 ## 8. Relay policy (sync-plan step 8)
 
@@ -134,5 +135,6 @@ Both ends know the connection's selected path at every request. The server refus
 ## 9. Open questions
 
 * **Window and limits** (8 requests per provider, 64 served at once, 30 s per block) are first guesses; step 9 of the sync plan measures them on the Pi.
-* **Several providers at once** for one file (BEP does this). Start with one at a time; add it if a single provider can't fill the link.
+* **Several providers at once:** done in plan step 4, among nodes holding the complete file, with an endgame for overdue blocks (§5). Not done: the window is a number of requests, not bytes or a measured speed, so with 16 MiB blocks a slow provider holds up to 128 MiB.
+* **Serving part of a file** (BitTorrent's model): a node fetching a file could serve the blocks it already has, so a new file reaches several nodes while its author uploads each block about once. Needs a way to say which blocks a node has, and serving from staging files, which §4 rules out today. Decide after the Pi measurements.
 * **Bigger index entries over iroh-docs:** a 64 KiB metadata blob per large file. Expected to be fine; check in the Pi run.

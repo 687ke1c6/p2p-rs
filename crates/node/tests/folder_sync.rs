@@ -1,4 +1,5 @@
-//! Folder indexes syncing between nodes, and the merged view they agree on.
+//! Folder indexes syncing between nodes, the merged view they agree on, and
+//! the files it brings to each node.
 
 use std::fs;
 use std::future::Future;
@@ -25,7 +26,6 @@ async fn spawn(dir: &Path, key: SecretKey, book: &MemoryLookup) -> Node {
         presence_interval: INTERVAL,
         debounce: DEBOUNCE,
         address_book: Some(book.clone()),
-        content: false,
     };
     Node::spawn_with(dir, key, config).await.unwrap()
 }
@@ -90,6 +90,15 @@ async fn agreed_view(
 
 fn state(view: &FolderView, path: &str, node: EndpointId) -> Option<NodeState> {
     view.path(path)?.nodes.get(&node).copied()
+}
+
+/// Whether every path is in sync on every node: content transfer done.
+fn settled(view: &FolderView) -> bool {
+    view.paths.iter().all(|p| p.in_sync())
+}
+
+fn read(root: &Path, rel: &str) -> Option<String> {
+    fs::read_to_string(root.join(rel)).ok()
 }
 
 fn file_content(view: &FolderView, path: &str) -> Option<Hash> {
@@ -158,32 +167,25 @@ async fn two_nodes_merge_overlapping_folders() {
     indexed(a, 5).await;
     indexed(b, 5).await;
 
-    let first = agreed_view(&[a, b], id, |v| v.paths.len() == 6).await;
-    // On both, same content: in sync.
-    assert!(first.path("same.jpg").unwrap().in_sync());
-    // On one side: the other fetches it.
-    assert_eq!(
-        state(&first, "only-a.jpg", b.id()),
-        Some(NodeState::Missing)
-    );
-    assert_eq!(
-        state(&first, "only-b.jpg", a.id()),
-        Some(NodeState::Missing)
-    );
-    // Made separately, different: a conflict, b's newer version keeps the name.
-    let Outcome::Conflict { winner, others } = &first.path("clash.jpg").unwrap().outcome else {
-        panic!("clash.jpg should be a conflict");
-    };
-    assert_eq!(winner.node, b.id());
-    assert_eq!(others[0].node, a.id());
-    let shown = first.render(
-        &|id| if id == a.id() { "a".into() } else { "b".into() },
-        false,
-    );
-    assert!(
-        shown.contains("clash.sync-conflict-") && shown.contains("-a.jpg"),
-        "{shown}"
-    );
+    // Seven paths once the conflict copy is made, all in sync.
+    let first = agreed_view(&[a, b], id, |v| v.paths.len() == 7 && settled(v)).await;
+    // On one side: the other fetched it.
+    assert_eq!(read(rb, "only-a.jpg").as_deref(), Some("a"));
+    assert_eq!(read(ra, "only-b.jpg").as_deref(), Some("b"));
+    // Made separately, different: a conflict. b's newer version keeps the
+    // name; a's is kept as a conflict copy named after a, on both.
+    assert_eq!(file_content(&first, "clash.jpg"), Some(hash("b's version")));
+    let copy = first
+        .paths
+        .iter()
+        .map(|p| p.path.clone())
+        .find(|p| p.starts_with("clash.sync-conflict-"))
+        .expect("a conflict copy");
+    assert!(copy.ends_with(".jpg"), "{copy}");
+    for root in [ra, rb] {
+        assert_eq!(read(root, "clash.jpg").as_deref(), Some("b's version"));
+        assert_eq!(read(root, &copy).as_deref(), Some("a's version"));
+    }
 
     // a edits same.jpg three times while b holds the old version: no conflict.
     for edit in ["edit 1", "edit 2", "edit 3"] {
@@ -200,16 +202,21 @@ async fn two_nodes_merge_overlapping_folders() {
     fs::remove_file(rb.join("both.txt")).unwrap();
 
     let v = agreed_view(&[a, b], id, |v| {
-        file_content(v, "same.jpg") == Some(hash("edit 3"))
+        settled(v)
+            && file_content(v, "same.jpg") == Some(hash("edit 3"))
             && v.path("gone.jpg")
                 .is_some_and(|p| p.outcome == Outcome::Deleted)
             && file_content(v, "both.txt") == Some(hash("edited by a"))
     })
     .await;
-    assert_eq!(state(&v, "same.jpg", a.id()), Some(NodeState::Current));
-    assert_eq!(state(&v, "same.jpg", b.id()), Some(NodeState::Outdated));
-    assert_eq!(state(&v, "gone.jpg", b.id()), Some(NodeState::WillDelete));
-    assert_eq!(state(&v, "both.txt", b.id()), Some(NodeState::Missing));
+    assert_eq!(state(&v, "same.jpg", b.id()), Some(NodeState::Current));
+    assert_eq!(read(rb, "same.jpg").as_deref(), Some("edit 3"));
+    assert!(read(rb, "gone.jpg").is_none());
+    assert_eq!(read(rb, "both.txt").as_deref(), Some("edited by a"));
+    assert!(!v
+        .paths
+        .iter()
+        .any(|p| p.path.starts_with("same.sync-conflict-")));
 
     for node in nodes {
         node.shutdown().await.unwrap();
@@ -247,10 +254,11 @@ async fn folders_created_apart_settle_on_one() {
     })
     .await;
     assert_eq!(b.folders()[0].config.id, b_id);
-    let v = agreed_view(&[&a, &b], b_id, |v| v.paths.len() == 2).await;
-    assert_eq!(state(&v, "from-a.jpg", a.id()), Some(NodeState::Current));
-    assert_eq!(state(&v, "from-a.jpg", b.id()), Some(NodeState::Missing));
-    assert_eq!(state(&v, "from-b.jpg", a.id()), Some(NodeState::Missing));
+    agreed_view(&[&a, &b], b_id, |v| v.paths.len() == 2 && settled(v)).await;
+    for root in [pa.path(), pb.path()] {
+        assert_eq!(read(root, "from-a.jpg").as_deref(), Some("a"));
+        assert_eq!(read(root, "from-b.jpg").as_deref(), Some("b"));
+    }
 
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
@@ -280,17 +288,18 @@ async fn three_nodes_agree() {
     }
 
     let all: Vec<&Node> = nodes.iter().collect();
-    let v = agreed_view(&all, id, |v| v.paths.len() == 4 && v.nodes.len() == 3).await;
-    assert!(v.path("shared.txt").unwrap().in_sync());
-    for (i, node) in nodes.iter().enumerate() {
-        let path = format!("node-{i}.txt");
-        for other in &nodes {
-            let expected = if other.id() == node.id() {
-                NodeState::Current
-            } else {
-                NodeState::Missing
-            };
-            assert_eq!(state(&v, &path, other.id()), Some(expected));
+    agreed_view(&all, id, |v| {
+        v.paths.len() == 4 && v.nodes.len() == 3 && settled(v)
+    })
+    .await;
+    // Every node has every node's file.
+    for root in &roots {
+        assert_eq!(read(root.path(), "shared.txt").as_deref(), Some("everyone"));
+        for i in 0..3 {
+            assert_eq!(
+                read(root.path(), &format!("node-{i}.txt")).as_deref(),
+                Some("mine")
+            );
         }
     }
 

@@ -98,8 +98,34 @@ impl Monitor {
             .collect()
     }
 
+    /// The nodes to fetch missing membership records from: the members this
+    /// node can read, and its chain up to the founder, which it holds
+    /// itself (with no member readable, it would have no one to ask).
+    fn record_sources(&self) -> Vec<EndpointId> {
+        let mut ids = self.others();
+        ids.extend(
+            self.group
+                .chain
+                .iter()
+                .map(|signed| signed.record.member)
+                .filter(|id| *id != self.me()),
+        );
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     async fn on_tick(&self, sender: &GossipSender, neighbours: &HashSet<EndpointId>) {
         self.apply_queued_adds().await;
+        // Records whose content didn't arrive with them (members, folders)
+        // are unreadable until it does.
+        if let Err(err) = self
+            .folders
+            .fetch_missing(self.group.id, self.record_sources())
+            .await
+        {
+            tracing::debug!("fetching membership records: {err:#}");
+        }
         self.folders.apply_queued(self.group.id).await;
         if let Err(err) = self.folders.check(self.group.id).await {
             tracing::warn!("checking folders: {err:#}");

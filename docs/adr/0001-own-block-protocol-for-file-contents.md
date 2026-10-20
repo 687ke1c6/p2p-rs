@@ -6,7 +6,7 @@ status: accepted
 
 File contents move between nodes over our own block protocol on iroh, modelled on Syncthing's Block Exchange Protocol: each index entry carries a block list, a node asks a peer for one block of one file, and the peer reads it straight from the file on disk. iroh-blobs is a content-addressed store for immutable data that wants to own the bytes, while a synced folder is mutable and the disk is its only source of truth; using it for file contents cost us a store copy of every received file, stale references once a file moved (renames, conflict copies), and no way to apply the relay policy per request. iroh stays as the transport, iroh-docs as the index and membership store, iroh-gossip for presence; iroh-blobs stays only because iroh-docs uses it for index metadata.
 
-Decided 2026-10-19, after sync-plan step 7. See `plans/blocks/`.
+Decided 2026-10-19, after sync-plan step 7. Its transport is replaced by ADR 0002, which also renames the terms: a block here is a piece, a block list is the piece hashes. See `plans/blocks/`.
 
 ## Considered Options
 

@@ -39,8 +39,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
+use crate::blocks::{Client, Refusal};
 use crate::content::Content;
-use crate::index::{self, FileMeta, FolderIndex, IndexStats};
+use crate::index::{self, Apply, Entries, FileMeta, FolderIndex, IndexStats};
 use crate::member::{check_name, NameError, Names};
 use crate::record::{unix_now, GroupId};
 use crate::view::FolderView;
@@ -60,6 +61,9 @@ pub const FOLDER_NODES_PREFIX: &str = "folder-nodes/";
 
 /// How long fetching one missing index metadata blob may take.
 const META_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Requests waiting for a folder's index task.
+const APPLY_QUEUE: usize = 16;
 
 /// Directory of rendered folder views inside the config directory, one file
 /// per folder name, for `folder show`.
@@ -222,6 +226,15 @@ pub(crate) async fn folder_nodes(
     Ok(out)
 }
 
+/// A folder the block server serves from.
+#[derive(Debug, Clone)]
+pub(crate) struct Serving {
+    pub root: PathBuf,
+    pub entries: Entries,
+    /// To the folder's index task, to ask it to re-read a file.
+    pub apply: Option<mpsc::Sender<Apply>>,
+}
+
 /// A folder this node keeps, as `status` shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderState {
@@ -298,9 +311,9 @@ struct Inner {
     me: EndpointId,
     /// Fetches index metadata docs failed to fetch.
     downloader: Downloader,
+    /// Fetches file contents over the block protocol.
+    client: Client,
     debounce: Duration,
-    /// Content transfer is on (`run --with-content`).
-    content: bool,
     /// Members' names, for naming conflict copies.
     names: Names,
     running: Mutex<HashMap<NamespaceId, Running>>,
@@ -321,6 +334,10 @@ struct Running {
     changed: Arc<Notify>,
     /// The nodes the doc is synced with.
     peers: BTreeSet<EndpointId>,
+    /// This node's entries, kept by the index task.
+    entries: Entries,
+    /// To the index task, while it runs.
+    apply: Option<mpsc::Sender<Apply>>,
 }
 
 impl Running {
@@ -337,23 +354,28 @@ impl Running {
 }
 
 impl Folders {
+    /// Bytes of file data fetched from each provider (see
+    /// [`Client::fetched`]).
+    pub(crate) fn fetched(&self) -> HashMap<EndpointId, u64> {
+        self.0.client.fetched()
+    }
+
     pub(crate) fn new(
         config_dir: &Path,
         docs: Docs,
         blobs: FsStore,
         endpoint: &Endpoint,
         debounce: Duration,
-        content: bool,
         names: Names,
     ) -> Self {
         Self(Arc::new(Inner {
             config_dir: config_dir.to_owned(),
             docs,
             downloader: blobs.downloader(endpoint),
+            client: Client::new(endpoint.clone()),
             blobs,
             me: endpoint.id(),
             debounce,
-            content,
             names,
             running: Mutex::new(HashMap::new()),
             starting: tokio::sync::Mutex::new(()),
@@ -511,6 +533,8 @@ impl Folders {
             dirty,
             changed,
             peers: BTreeSet::new(),
+            entries: Entries::default(),
+            apply: None,
         })
     }
 
@@ -544,15 +568,36 @@ impl Folders {
     }
 
     /// Fetches the metadata blobs of entries docs synced but couldn't fetch
-    /// the content of, from the nodes the folder is synced with. Docs only
-    /// retries such a blob when a neighbour announces it over gossip, which
-    /// may never reach this node.
+    /// the content of, from the nodes the folder is synced with (see
+    /// [`fetch_missing`](Self::fetch_missing)).
     async fn fetch_missing_meta(&self, id: NamespaceId) -> anyhow::Result<()> {
         let peers: Vec<EndpointId> = match self.0.running.lock().unwrap().get(&id) {
             Some(running) if !running.peers.is_empty() => running.peers.iter().copied().collect(),
             _ => return Ok(()),
         };
-        let doc = self.0.docs.open(id).await?.context("folder doc missing")?;
+        if self.fetch_missing(id, peers).await? {
+            if let Some(running) = self.0.running.lock().unwrap().get(&id) {
+                running.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetches the content of every entry in doc `id` this node has the
+    /// entry but not the content of, from `peers`. Returns whether any
+    /// arrived. Docs fetches an entry's content when the entry arrives, and
+    /// tries again only when a neighbour announces it over gossip, which may
+    /// never reach this node: a fetch that failed (a timeout on a busy
+    /// machine) would leave the entry unreadable for good.
+    pub(crate) async fn fetch_missing(
+        &self,
+        id: NamespaceId,
+        peers: Vec<EndpointId>,
+    ) -> anyhow::Result<bool> {
+        if peers.is_empty() {
+            return Ok(false);
+        }
+        let doc = self.0.docs.open(id).await?.context("doc missing")?;
         let entries = doc.get_many(Query::all()).await?.collect::<Vec<_>>().await;
         let mut missing = Vec::new();
         for entry in entries {
@@ -562,9 +607,13 @@ impl Folders {
             }
         }
         if missing.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
-        tracing::debug!("fetching {} missing index entries", missing.len());
+        tracing::debug!(
+            "doc {}: fetching {} missing entries",
+            id.fmt_short(),
+            missing.len()
+        );
         let mut fetched = false;
         for hash in missing {
             let download = self.0.downloader.download(hash, peers.clone());
@@ -574,57 +623,52 @@ impl Folders {
                 Err(_) => tracing::debug!("fetching {}: timed out", hash.fmt_short()),
             }
         }
-        if fetched {
-            if let Some(running) = self.0.running.lock().unwrap().get(&id) {
-                running.dirty.store(true, Ordering::Relaxed);
-            }
-        }
-        Ok(())
+        Ok(fetched)
     }
 
     /// Starts the index task, if the folder's root is there, and with
     /// content transfer on, the content task, which stops with it.
     async fn start_index(&self, config: &FolderConfig) -> anyhow::Result<JoinHandle<()>> {
         index::check_root(&config.path)?;
+        let (stats, changed, entries) = self
+            .0
+            .running
+            .lock()
+            .unwrap()
+            .get(&config.id)
+            .map(|r| (r.stats.clone(), r.changed.clone(), r.entries.clone()))
+            .unwrap_or_default();
         let index = FolderIndex::open(
             &self.0.docs,
             &self.0.blobs,
             config.id,
             config.path.clone(),
             self.0.me,
-            self.0.content,
+            entries.clone(),
         )
         .await?;
-        let (stats, changed) = self
-            .0
-            .running
-            .lock()
-            .unwrap()
-            .get(&config.id)
-            .map(|r| (r.stats.clone(), r.changed.clone()))
-            .unwrap_or_default();
         *stats.lock().unwrap() = index.stats();
-        let (content, apply) = if self.0.content {
-            let (tx, rx) = mpsc::channel(1);
-            let content = Content {
-                name: config.name.clone(),
-                folder: config.id,
-                me: self.0.me,
-                docs: self.0.docs.clone(),
-                blobs: self.0.blobs.clone(),
-                downloader: self.0.downloader.clone(),
-                changed,
-                apply: tx,
-                names: self.0.names.clone(),
-            };
-            (Some(content), Some(rx))
-        } else {
-            (None, None)
+        let (tx, rx) = mpsc::channel(APPLY_QUEUE);
+        if let Some(running) = self.0.running.lock().unwrap().get_mut(&config.id) {
+            running.apply = Some(tx.clone());
+        }
+        let content = Content {
+            name: config.name.clone(),
+            folder: config.id,
+            me: self.0.me,
+            docs: self.0.docs.clone(),
+            blobs: self.0.blobs.clone(),
+            client: self.0.client.clone(),
+            root: config.path.clone(),
+            entries,
+            changed,
+            apply: tx,
+            names: self.0.names.clone(),
         };
-        let watch = index::watch(index, config.name.clone(), self.0.debounce, stats, apply);
+        let watch = index::watch(index, config.name.clone(), self.0.debounce, stats, rx);
         Ok(tokio::spawn(async move {
             // Aborted when the index task ends or is aborted.
-            let _content = content.map(|c| AbortOnDropHandle::new(tokio::spawn(c.run())));
+            let _content = AbortOnDropHandle::new(tokio::spawn(content.run()));
             watch.await;
         }))
     }
@@ -845,6 +889,25 @@ impl Folders {
                 }
             }
         }
+    }
+
+    /// What the block server needs to serve folder `id` to `remote`: refuses
+    /// a remote that doesn't keep the folder, or a folder this node doesn't
+    /// keep (the same answer, so as not to say which folders exist), and a
+    /// paused folder.
+    pub(crate) fn serving(&self, id: NamespaceId, remote: EndpointId) -> Result<Serving, Refusal> {
+        let running = self.0.running.lock().unwrap();
+        let Some(running) = running.get(&id).filter(|r| r.peers.contains(&remote)) else {
+            return Err(Refusal::NotKept);
+        };
+        if running.paused() {
+            return Err(Refusal::NoSuchFile);
+        }
+        Ok(Serving {
+            root: running.config.path.clone(),
+            entries: running.entries.clone(),
+            apply: running.apply.clone(),
+        })
     }
 
     /// The folders this node keeps, by name.
