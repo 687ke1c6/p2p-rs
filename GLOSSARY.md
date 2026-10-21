@@ -22,8 +22,11 @@ _Avoid_: User, participant
 A directory kept in sync across the nodes that keep it, known in the group by its name.
 _Avoid_: Share, repo, sync root
 
+**Document/doc**
+The iroh-doc document that is replicated across the group
+
 **Entry**:
-One node's description of one path in a folder: its content, size, modification time and version.
+One members description of one path in a folder: its content, size, modification time and version, stored in the 'folder' iroh-doc document
 _Avoid_: Record (that's membership), file info
 
 **Tombstone**:
@@ -99,3 +102,8 @@ Once every missing block is asked for, an overdue block is asked of another peer
 **Staging file**:
 The file a fetch writes pieces into, at the folder root, until it is complete and placed. A leecher serves its verified pieces from it.
 _Avoid_: Temporary file, partial file
+
+## Processes
+
+**Download ceremony**
+A download is not just sending physical bytes. In this distributed system (like bittorrent), a download is the process by which an interested member discovers peers of the swarm, requesting their bitfields, requesting blocks from peers, building local blocks/pieces, and becoming a leecher. 

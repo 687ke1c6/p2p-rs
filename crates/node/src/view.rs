@@ -354,7 +354,7 @@ pub fn conflict_name(path: &str, candidate: &Candidate, node_label: &str) -> Str
 }
 
 /// Renders every node's raw entries, path by path: content hash (hex, as
-/// `b3sum` prints it) or `deleted`, size, blocks (count × size), modification
+/// `b3sum` prints it) or `deleted`, size, pieces (count × size), modification
 /// time (UTC, to the nanosecond) and version vector. Nodes are named with `label`.
 pub fn render_entries(
     entries: &BTreeMap<String, BTreeMap<EndpointId, FileMeta>>,
@@ -382,13 +382,13 @@ pub fn render_entries(
                 .iter()
                 .map(|(node, n)| format!("{}:{n}", label(*node)))
                 .collect();
-            let blocks = match meta.blocks.len() {
+            let pieces = match meta.pieces.len() {
                 0 => "-".to_string(),
-                n => format!("{n} × {}K", meta.block_size >> 10),
+                n => format!("{n} × {}K", meta.piece_length >> 10),
             };
             let _ = writeln!(
                 out,
-                "  {:width$}  {content:64}  {:>10} B  {blocks:>12}  {}.{:09}  {{{}}}",
+                "  {:width$}  {content:64}  {:>10} B  {pieces:>12}  {}.{:09}  {{{}}}",
                 label(*id),
                 meta.size,
                 utc_stamp(meta.mtime_ns),

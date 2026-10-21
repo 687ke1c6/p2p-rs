@@ -14,8 +14,8 @@
 //! it on other nodes. Nor is anything under a directory that can't be read.
 //!
 //! The index task makes the changes the content task asks for, and re-reads
-//! files the block server asks it to ([`Apply`]): the disk and this node's
-//! entries only ever change in this task. The block server reads the entries
+//! files the peer-wire server asks it to ([`Apply`]): the disk and this node's
+//! entries only ever change in this task. The peer-wire server reads the entries
 //! through a shared handle ([`Entries`]) and serves files straight from disk.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -40,7 +40,7 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::blocks::{self, Hashed};
+use crate::pieces::{self, Hashed};
 use crate::view::Version;
 
 /// The ignore file at a folder's root, in `.gitignore` syntax.
@@ -113,12 +113,12 @@ pub struct FileMeta {
     pub node: EndpointId,
     /// Which edits this version has seen (see `view`).
     pub version: Version,
-    /// The size of each block in `blocks` (see `blocks::block_size`). 0 for
+    /// The size of each piece in `pieces` (see `pieces::piece_length`). 0 for
     /// a tombstone or an empty file.
-    pub block_size: u32,
-    /// BLAKE3 of each block of the contents, in order. Empty for a
+    pub piece_length: u32,
+    /// BLAKE3 of each piece of the contents, in order. Empty for a
     /// tombstone or an empty file.
-    pub blocks: Vec<Hash>,
+    pub pieces: Vec<Hash>,
 }
 
 impl FileMeta {
@@ -136,8 +136,8 @@ impl FileMeta {
             mtime_ns,
             node,
             version,
-            block_size: hashed.block_size,
-            blocks: hashed.blocks,
+            piece_length: hashed.piece_length,
+            pieces: hashed.pieces,
         }
     }
 
@@ -149,8 +149,8 @@ impl FileMeta {
             mtime_ns: unix_now_ns(),
             node,
             version,
-            block_size: 0,
-            blocks: Vec::new(),
+            piece_length: 0,
+            pieces: Vec::new(),
         }
     }
 
@@ -208,7 +208,7 @@ struct Walk {
     unreadable: Vec<String>,
 }
 
-/// A change the content task (or the block server) asks the index task to
+/// A change the content task (or the peer-wire server) asks the index task to
 /// make. `done` gets whether it was made: it isn't if this node's entry is no
 /// longer `expect`, or the disk no longer matches it (a local change not
 /// indexed yet).
@@ -219,7 +219,7 @@ pub(crate) enum Apply {
         path: String,
         expect: Option<FileMeta>,
         meta: FileMeta,
-        /// The fetched file (see `blocks::staging_path`).
+        /// The fetched file (see `pieces::staging_path`).
         temp: PathBuf,
         done: oneshot::Sender<anyhow::Result<bool>>,
     },
@@ -241,7 +241,7 @@ pub(crate) enum Apply {
         done: oneshot::Sender<anyhow::Result<bool>>,
     },
     /// Read the file at `path` again even if its size and modification time
-    /// match its entry: the block server found bytes that don't match it.
+    /// match its entry: the peer-wire server found bytes that don't match it.
     Rehash { path: String },
     /// A rename elsewhere: move this node's file at `from` to `to`, rather
     /// than fetch `to` and delete `from`. `meta` becomes the entry at `to`,
@@ -258,7 +258,7 @@ pub(crate) enum Apply {
 }
 
 /// This node's entries for one folder, by path, tombstones included. The
-/// index task is the only writer; the block server reads them to know what
+/// index task is the only writer; the peer-wire server reads them to know what
 /// it may serve.
 #[derive(Debug, Clone, Default)]
 pub struct Entries(Arc<RwLock<HashMap<String, Arc<FileMeta>>>>);
@@ -446,7 +446,7 @@ impl FolderIndex {
     /// Puts the fetched file `temp` (`meta`'s content) at `path` and makes
     /// `meta` (with the size and modification time the file ends up with)
     /// this node's entry, if the entry is still `expect` and the disk
-    /// matches it. The file is checked against `meta`'s hash and block list
+    /// matches it. The file is checked against `meta`'s hash and piece hashes
     /// and given its modification time before it is moved into place.
     /// Returns whether it placed the file.
     pub async fn place(
@@ -987,7 +987,7 @@ fn remove_empty_parents(root: &Path, rel: &str) {
 }
 
 /// Checks the fetched file at `temp` against `hash`, the entry's size and
-/// its block list, gives it the entry's modification time and moves it to
+/// its piece hashes, gives it the entry's modification time and moves it to
 /// `abs`, if the disk there still matches `expect`. The entry, with the file's final size and
 /// modification time, goes to `journal` first. Returns that size and
 /// modification time, or `None` if the disk changed.
@@ -1001,7 +1001,7 @@ fn finish_place(
 ) -> anyhow::Result<Option<Stat>> {
     let (size, mtime_ns) = (placing.meta.size, placing.meta.mtime_ns);
     let file = File::options().read(true).write(true).open(temp)?;
-    let (got, len) = blocks::hash_reader(size, &file)?;
+    let (got, len) = pieces::hash_reader(size, &file)?;
     if got.content != hash || len != size {
         anyhow::bail!(
             "fetched {} doesn't match: got {} ({len} bytes)",
@@ -1009,11 +1009,11 @@ fn finish_place(
             got.content.fmt_short()
         );
     }
-    // The block list came from another node's entry: it must describe this
+    // The piece hashes came from another node's entry: they must describe this
     // content too.
-    if got.block_size != placing.meta.block_size || got.blocks != placing.meta.blocks {
+    if got.piece_length != placing.meta.piece_length || got.pieces != placing.meta.pieces {
         anyhow::bail!(
-            "{}'s block list doesn't match its content",
+            "{}'s piece hashes don't match its content",
             hash.fmt_short()
         );
     }
@@ -1053,7 +1053,7 @@ fn hash_file(path: &Path) -> io::Result<Option<(Hashed, Stat)>> {
         Ok(file) => file,
         Err(err) => return not_found(err),
     };
-    let (hashed, read) = blocks::hash_reader(before.len(), file)?;
+    let (hashed, read) = pieces::hash_reader(before.len(), file)?;
     let after = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) => return not_found(err),

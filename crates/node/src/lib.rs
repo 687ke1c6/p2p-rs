@@ -1,6 +1,5 @@
 //! Local-first folder sync over iroh. See `plans/sync-plan.md`.
 
-pub mod blocks;
 pub mod content;
 pub mod folder;
 pub mod gate;
@@ -12,7 +11,9 @@ pub mod key;
 pub mod member;
 pub(crate) mod monitor;
 pub mod node;
+pub mod peer_wire;
 pub mod peers;
+pub mod pieces;
 pub mod presence;
 pub mod record;
 pub mod status;

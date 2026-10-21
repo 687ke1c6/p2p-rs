@@ -2,8 +2,8 @@
 
 use iroh::{EndpointId, SecretKey};
 use iroh_blobs::Hash;
-use sync_node::blocks::Hasher;
 use sync_node::index::FileMeta;
+use sync_node::pieces::Hasher;
 use sync_node::view::{
     conflict_name, merge, node_state, render_entries, Candidate, NodeState, Outcome, Version,
 };

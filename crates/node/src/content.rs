@@ -6,11 +6,11 @@
 //! is behind:
 //!
 //! * a file this node is missing or holds an older version of is built
-//!   block by block: from what an earlier try left, then from this node's
+//!   piece by piece: from what an earlier try left, then from this node's
 //!   own files (the old version at that path first, then any other file
-//!   with the same blocks), and the rest fetched over the block protocol
-//!   from the nodes holding it (`blocks::Client`). Every block is checked
-//!   against the block list. Then the file is placed on disk;
+//!   with the same pieces), and the rest fetched over the peer wire
+//!   from the nodes holding it (`peer_wire::Client`). Every piece is checked
+//!   against the piece hashes. Then the file is placed on disk;
 //! * a file that was deleted is deleted here too;
 //! * a delete and a new file with the same content, where this node has
 //!   nothing at the new path, is a rename: the file is moved, not fetched;
@@ -37,9 +37,10 @@ use iroh_docs::protocol::Docs;
 use iroh_docs::NamespaceId;
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 
-use crate::blocks::{self, Client, Source, Staged};
 use crate::index::{self, safe_path, Apply, Entries, FileMeta};
 use crate::member::Names;
+use crate::peer_wire::Client;
+use crate::pieces::{self, Source, Staged};
 use crate::view::{conflict_name, merge, node_state, Candidate, NodeState, Outcome, Version};
 
 /// How often a folder is checked when its doc hasn't changed, so a failed
@@ -67,7 +68,7 @@ pub(crate) struct Content {
     pub me: EndpointId,
     pub docs: Docs,
     pub blobs: FsStore,
-    /// Fetches blocks from other nodes.
+    /// Fetches pieces from other nodes.
     pub client: Client,
     /// The folder root, where fetched files are staged.
     pub root: PathBuf,
@@ -101,7 +102,7 @@ enum Action {
         path: String,
         mine: Option<FileMeta>,
         meta: FileMeta,
-        providers: Vec<EndpointId>,
+        peers: Vec<EndpointId>,
     },
     /// This node's version lost a conflict: keep it as `copy` and fetch the
     /// winner.
@@ -110,7 +111,7 @@ enum Action {
         mine: FileMeta,
         copy: String,
         meta: FileMeta,
-        providers: Vec<EndpointId>,
+        peers: Vec<EndpointId>,
     },
 }
 
@@ -125,7 +126,7 @@ struct Memory {
     waiting: HashMap<String, Instant>,
     /// Fetches that failed, by path and version, and when to try again:
     /// not on every change to the folder, which would ask a node that sent
-    /// bad blocks again and again.
+    /// bad pieces again and again.
     retry_at: HashMap<String, Instant>,
 }
 
@@ -210,7 +211,7 @@ impl Content {
             .filter_map(|action| match action {
                 Action::Fetch { path, meta, .. } | Action::Resolve { path, meta, .. } => {
                     let content = meta.content?;
-                    Some(blocks::staging_path(&self.root, path, content))
+                    Some(pieces::staging_path(&self.root, path, content))
                 }
                 _ => None,
             })
@@ -220,7 +221,7 @@ impl Content {
             let mut removed = Vec::new();
             for entry in std::fs::read_dir(&root)?.flatten() {
                 let name = entry.file_name();
-                let staging = name.to_str().is_some_and(blocks::is_staging_name);
+                let staging = name.to_str().is_some_and(pieces::is_staging_name);
                 let path = entry.path();
                 let old = entry
                     .metadata()
@@ -266,12 +267,12 @@ impl Content {
             let mine = per_node.get(&self.me).cloned();
             match (&outcome, node_state(mine.as_ref(), &outcome)) {
                 (Outcome::File(c), NodeState::Missing | NodeState::Outdated) => {
-                    let (meta, providers) = self.take(mine.as_ref(), &metas, c);
+                    let (meta, peers) = self.take(mine.as_ref(), &metas, c);
                     fetches.push(Action::Fetch {
                         path,
                         mine,
                         meta,
-                        providers,
+                        peers,
                     });
                 }
                 (Outcome::Deleted, NodeState::WillDelete) => {
@@ -293,7 +294,7 @@ impl Content {
                         // which arrive here as new files.
                         continue;
                     }
-                    let (meta, providers) = self.take(mine.as_ref(), &metas, winner);
+                    let (meta, peers) = self.take(mine.as_ref(), &metas, winner);
                     let lost = others.iter().find(|o| Some(o.content) == held);
                     match (mine, lost) {
                         (Some(mine), Some(lost)) => {
@@ -305,14 +306,14 @@ impl Content {
                                 path,
                                 mine,
                                 meta,
-                                providers,
+                                peers,
                             });
                         }
                         (mine, _) => fetches.push(Action::Fetch {
                             path,
                             mine,
                             meta,
-                            providers,
+                            peers,
                         }),
                     }
                 }
@@ -328,7 +329,7 @@ impl Content {
                 path: to,
                 mine: to_mine,
                 meta,
-                providers,
+                peers,
             } = fetch
             else {
                 unreachable!("only fetches");
@@ -359,7 +360,7 @@ impl Content {
                     path: to,
                     mine: to_mine,
                     meta,
-                    providers,
+                    peers,
                 }),
             }
         }
@@ -373,7 +374,7 @@ impl Content {
 
     /// The entry this node writes when it takes candidate `c` for a path:
     /// its version has seen this node's own entry and every entry holding
-    /// `c`'s content, and its block list is theirs (the content's). Also
+    /// `c`'s content, and its piece hashes are theirs (the content's). Also
     /// returns the other nodes holding that content.
     fn take(
         &self,
@@ -382,13 +383,13 @@ impl Content {
         c: &Candidate,
     ) -> (FileMeta, Vec<EndpointId>) {
         let mut version = mine.map(|m| m.version.clone()).unwrap_or_default();
-        let mut providers = Vec::new();
-        let mut blocks = (0, Vec::new());
+        let mut peers = Vec::new();
+        let mut pieces = (0, Vec::new());
         for m in metas.iter().filter(|m| m.content == Some(c.content)) {
             version.merge(&m.version);
-            blocks = (m.block_size, m.blocks.clone());
+            pieces = (m.piece_length, m.pieces.clone());
             if m.node != self.me {
-                providers.push(m.node);
+                peers.push(m.node);
             }
         }
         let meta = FileMeta {
@@ -397,10 +398,10 @@ impl Content {
             mtime_ns: c.mtime_ns,
             node: self.me,
             version,
-            block_size: blocks.0,
-            blocks: blocks.1,
+            piece_length: pieces.0,
+            pieces: pieces.1,
         };
-        (meta, providers)
+        (meta, peers)
     }
 
     /// Carries out one action. Returns `false` once the index task is gone.
@@ -446,9 +447,9 @@ impl Content {
                 path,
                 mine,
                 meta,
-                providers,
+                peers,
             } => {
-                let Some(temp) = self.fetch(&path, &meta, providers, memory).await? else {
+                let Some(temp) = self.fetch(&path, &meta, peers, memory).await? else {
                     return Ok(true);
                 };
                 let what = format!("writing {path}");
@@ -466,9 +467,9 @@ impl Content {
                 mine,
                 copy,
                 meta,
-                providers,
+                peers,
             } => {
-                let Some(temp) = self.fetch(&path, &meta, providers, memory).await? else {
+                let Some(temp) = self.fetch(&path, &meta, peers, memory).await? else {
                     return Ok(true);
                 };
                 let what = format!(
@@ -503,19 +504,19 @@ impl Content {
     }
 
     /// Gets version `meta` of `path` into its staging file (see
-    /// `blocks::staging_path`): the blocks this node already holds are
-    /// copied from its own files, the rest fetched from `providers`. Returns
+    /// `pieces::staging_path`): the pieces this node already holds are
+    /// copied from its own files, the rest fetched from `peers`. Returns
     /// the file once it is complete; the index task checks it before placing
     /// it.
     async fn fetch(
         &self,
         path: &str,
         meta: &FileMeta,
-        providers: Vec<EndpointId>,
+        peers: Vec<EndpointId>,
         memory: &mut Memory,
     ) -> anyhow::Result<Option<PathBuf>> {
         let content = meta.content.expect("fetching a file with content");
-        let temp = blocks::staging_path(&self.root, path, content);
+        let temp = pieces::staging_path(&self.root, path, content);
         let key = format!("fetching {path} {content}");
         let waiting = memory
             .retry_at
@@ -537,13 +538,13 @@ impl Content {
                     .map(|()| true)
                     .map_err(anyhow::Error::from)
             }
-            Ok(_) if providers.is_empty() => {
+            Ok(_) if peers.is_empty() => {
                 // Nobody to ask: try again later, quietly.
                 memory.retry_at.insert(key, Instant::now() + RETRY);
                 return Ok(None);
             }
             Ok(staged) => {
-                let from: Vec<String> = providers.iter().map(|p| self.names.display(*p)).collect();
+                let from: Vec<String> = peers.iter().map(|p| self.names.display(*p)).collect();
                 let copied = match staged.copied {
                     0 => String::new(),
                     n => format!("; {} copied locally", crate::peers::bytes(n)),
@@ -554,7 +555,7 @@ impl Content {
                     crate::peers::bytes(staged.to_fetch),
                     from.join(", ")
                 );
-                self.fetch_from(path, meta, providers.clone(), staged).await
+                self.fetch_from(path, meta, peers.clone(), staged).await
             }
         };
         let err = match done {
@@ -574,18 +575,18 @@ impl Content {
         Ok(None)
     }
 
-    /// Fetches what `staged` lacks from `providers`, and from nodes that come
+    /// Fetches what `staged` lacks from `peers`, and from nodes that come
     /// to hold version `meta` of `path` meanwhile: the folder's doc is
-    /// watched during the fetch, and new providers join it.
+    /// watched during the fetch, and new peers join it.
     async fn fetch_from(
         &self,
         path: &str,
         meta: &FileMeta,
-        providers: Vec<EndpointId>,
+        peers: Vec<EndpointId>,
         staged: Staged,
     ) -> anyhow::Result<bool> {
         let content = meta.content.expect("fetching a file with content");
-        let (offer, offered) = watch::channel(providers);
+        let (offer, offered) = watch::channel(peers);
         // Whether the watch took a wake meant for `run`.
         let woken = AtomicBool::new(false);
         let watch = async {
@@ -632,16 +633,16 @@ impl Content {
         fetched
     }
 
-    /// This node's files that blocks of version `meta` of `path` can be
+    /// This node's files that pieces of version `meta` of `path` can be
     /// copied from: the old version at `path` first, then every other file
-    /// sharing a block with it.
+    /// sharing a piece with it.
     fn sources(&self, path: &str, meta: &FileMeta) -> Vec<Source> {
-        let wanted: HashSet<Hash> = meta.blocks.iter().copied().collect();
+        let wanted: HashSet<Hash> = meta.pieces.iter().copied().collect();
         if wanted.is_empty() {
             return Vec::new();
         }
         self.entries.with(|entries| {
-            let shares = |m: &FileMeta| m.blocks.iter().any(|h| wanted.contains(h));
+            let shares = |m: &FileMeta| m.pieces.iter().any(|h| wanted.contains(h));
             let old = entries.get_key_value(path).filter(|(_, m)| shares(m));
             let others = entries.iter().filter(|(p, m)| *p != path && shares(m));
             old.into_iter()

@@ -23,7 +23,6 @@ use n0_future::StreamExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use crate::blocks::{self, BlocksProtocol};
 use crate::folder::{FolderState, Folders};
 use crate::gate::{Gate, GateHooks, MembersProtocol, JOIN_ALPN, MEMBERS_ALPN};
 use crate::group::{Group, GroupError};
@@ -32,6 +31,7 @@ use crate::invite::{self, InviteTicket};
 use crate::join::{self, JoinProtocol, JoinReply, Ticket};
 use crate::member::{self, Names};
 use crate::monitor::Monitor;
+use crate::peer_wire::{self, PeerWireProtocol};
 use crate::peers::{PeerSnapshot, Peers};
 use crate::presence::{View, PRESENCE_INTERVAL};
 use crate::record::{validate_chain, GroupId, Record, SignedRecord, MEMBERS_PREFIX};
@@ -169,7 +169,7 @@ impl Node {
         );
         let router = Router::builder(endpoint)
             .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
-            .accept(blocks::ALPN, BlocksProtocol::new(folders.clone()))
+            .accept(peer_wire::ALPN, PeerWireProtocol::new(folders.clone()))
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(iroh_docs::ALPN, docs.clone())
             .accept(MEMBERS_ALPN, MembersProtocol(gate.clone()))
@@ -317,7 +317,7 @@ impl Node {
     }
 
     /// Bytes of file data this node has fetched from each node since it
-    /// started: verified blocks only, each counted once. Unlike the traffic
+    /// started: verified pieces only, each counted once. Unlike the traffic
     /// in [`peers`](Self::peers), no protocol overhead or other traffic.
     pub fn fetched(&self) -> HashMap<EndpointId, u64> {
         self.folders.fetched()

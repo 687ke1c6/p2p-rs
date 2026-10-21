@@ -39,10 +39,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
-use crate::blocks::{Client, Refusal};
 use crate::content::Content;
 use crate::index::{self, Apply, Entries, FileMeta, FolderIndex, IndexStats};
 use crate::member::{check_name, NameError, Names};
+use crate::peer_wire::{Client, Refusal};
 use crate::record::{unix_now, GroupId};
 use crate::view::FolderView;
 
@@ -226,7 +226,7 @@ pub(crate) async fn folder_nodes(
     Ok(out)
 }
 
-/// A folder the block server serves from.
+/// A folder the peer-wire server serves from.
 #[derive(Debug, Clone)]
 pub(crate) struct Serving {
     pub root: PathBuf,
@@ -311,7 +311,7 @@ struct Inner {
     me: EndpointId,
     /// Fetches index metadata docs failed to fetch.
     downloader: Downloader,
-    /// Fetches file contents over the block protocol.
+    /// Fetches file contents over the peer wire.
     client: Client,
     debounce: Duration,
     /// Members' names, for naming conflict copies.
@@ -354,7 +354,7 @@ impl Running {
 }
 
 impl Folders {
-    /// Bytes of file data fetched from each provider (see
+    /// Bytes of file data fetched from each peer (see
     /// [`Client::fetched`]).
     pub(crate) fn fetched(&self) -> HashMap<EndpointId, u64> {
         self.0.client.fetched()
@@ -891,7 +891,7 @@ impl Folders {
         }
     }
 
-    /// What the block server needs to serve folder `id` to `remote`: refuses
+    /// What the peer-wire server needs to serve folder `id` to `remote`: refuses
     /// a remote that doesn't keep the folder, or a folder this node doesn't
     /// keep (the same answer, so as not to say which folders exist), and a
     /// paused folder.

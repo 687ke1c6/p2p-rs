@@ -47,7 +47,7 @@ Not recommended: discard the work (loses the 80% that stays), or keep it uncommi
 #### Design
 
 * **ALPN:** `/sync-node/peer-wire/0`. Gated and tracked like the others. `/sync-node/blocks/0` is removed.
-* **Connections:** one per pair of nodes (the existing `Client` connection cache). **One bidirectional QUIC stream per swarm**: BitTorrent has one TCP connection per torrent; a QUIC stream is the same thing at a lower cost. The node that wants pieces opens the stream.
+* **Connections:** one peer-wire connection per pair of nodes (ALPN `/sync-node/peer-wire/0`, kept in the `Client` connection cache, dialled when not there). It is separate from the gossip, docs and blobs connections: a QUIC connection has one ALPN. **One bidirectional QUIC stream per swarm** on it: BitTorrent has one TCP connection per torrent; a QUIC stream is the same thing at a lower cost. The node that wants pieces opens the stream.
 * **Handshake** (first message on the stream, then the answer): `{ folder, path, content }`. The swarm's id is the content hash with the folder and path, as an info hash. The other end answers with its bitfield (`HaveAll` for a seeder, as BEP 6), or rejects (`NotKept`, `NoSuchFile`) and closes the stream.
 * **Messages after it** (both ways, framed as now): `Bitfield`, `HaveAll`, `HaveNone`, `Have(piece)`, `Interested`, `NotInterested`, `Choke`, `Unchoke`, `Request { piece, begin, length }`, `Piece { piece, begin }` + bytes, `Cancel { piece, begin, length }`, `Reject { piece, begin, length, why }` (BEP 6 fast extension: a request is answered, never dropped). `why`: `Choked`, `Changed`, `NotHave`, `Policy` (sync-plan step 8).
 * **Block:** 16 KiB (`BLOCK_LENGTH`); the last block of a piece may be short. A requested block of more than 128 KiB is rejected.
@@ -56,22 +56,25 @@ Not recommended: discard the work (loses the 80% that stays), or keep it uncommi
 * **Request queue:** per peer, sized from the speed measured to it: `rate × 2 s / BLOCK_LENGTH`, at least 4, at most 250 (the libtorrent rule). A peer with no block for 60 s is snubbed: queue of 1 until it sends.
 * **Choker** (per node, over all swarms): every 10 s, unchoke the 4 interested peers this node uploads to fastest; every 30 s, move the optimistic unchoke to another interested peer. In a group of 2–4 nodes every interested peer is unchoked. No tit-for-tat.
 * **Swarm membership:** the content task starts a swarm for a fetch and opens a stream to each online node that keeps the folder. A node fetching the same version answers with its bitfield and becomes a peer. A node that holds the version but whose entry hasn't synced yet is found on the next try.
+* **Relays:** allowed by default. `--direct-only` (env `SYNC_NODE_DIRECT_ONLY`, `Config::direct_only`), per node, for testing: no requests to a peer whose selected path is a relay, `Reject(Policy)` for a request that arrives over one, and a peer's open requests go back to the picker when its path moves to a relay. Content only; the full relay policy (per peer, folder index too) stays in sync-plan step 8. See [expectations.md](expectations.md).
+* **Superseded version:** when a new version of a path wins, the old swarm stops and its staging file is removed at once. The new swarm starts fresh; old staging pieces are not reused.
 * **Leaving:** a leecher that completes the piece set sends `Have` for the last piece, places the file, and stays as a seeder (now served from the placed file). Each side closes a stream when neither is interested.
 
 #### Step 0: Decision & Docs
 
 * [x] ADR 0002 accepted; glossary in BitTorrent terms; this plan (2026-10-20).
-* [ ] The developer reviews the docs and commits the block work (see Git above).
+* [x] The developer reviews the docs and commits the block work (`93d8f91`, on `main`; review of the docs 2026-10-21, with [expectations.md](expectations.md)).
 * **Done when:** the docs are accepted and the block work is committed.
 
 #### Step 1: Rename to BitTorrent Terms
 
 No change of behaviour.
 
-* [ ] `blocks.rs` → `pieces.rs` (piece length, hashing, staging, on-disk reads, local copy) and `peer_wire.rs` (wire, server, client), split along the "Fit" table.
-* [ ] Renames: `block_size` → `piece_length`, `FileMeta::{block_size, blocks}` → `{piece_length, pieces}`, `Hashed::blocks` → `pieces`, `MIN/MAX_BLOCK_SIZE` → `MIN/MAX_PIECE_LENGTH`, `MAX_BLOCKS` → `MAX_PIECES`, `read_block` → `read_piece`, `Provider` → `Peer`, provider → peer in names, logs, comments and test names. `folder show --entries` prints pieces.
-* [ ] Tests: `tests/blocks.rs` → `tests/pieces.rs`, `tests/block_protocol.rs` → `tests/peer_wire.rs`.
-* [ ] Check that the index encoding is unchanged: an index written before the rename reads after it.
+* [x] `blocks.rs` → `pieces.rs` (piece length, hashing, staging, on-disk reads, local copy) and `peer_wire.rs` (wire, server, client), split along the "Fit" table.
+* [x] Renames: `block_size` → `piece_length`, `FileMeta::{block_size, blocks}` → `{piece_length, pieces}`, `Hashed::blocks` → `pieces`, `MIN/MAX_BLOCK_SIZE` → `MIN/MAX_PIECE_LENGTH`, `MAX_BLOCKS` → `MAX_PIECES`, `read_block` → `read_piece`, `Provider` → `Peer`, provider → peer in names, logs, comments and test names. `folder show --entries` prints pieces.
+* [x] Tests: `tests/blocks.rs` → `tests/pieces.rs`, `tests/block_protocol.rs` → `tests/peer_wire.rs`.
+* [x] Check that the index encoding is unchanged: an index written before the rename reads after it. `the_entry_encoding_is_unchanged` (`tests/pieces.rs`) holds an entry's bytes captured before the rename.
+* Done 2026-10-21. Kept: the ALPN value `/sync-node/blocks/0` (a new value is a change of behaviour; step 4 removes it). Also renamed: `BlockRequest`/`BlockResponse` → `PieceRequest`/`PieceResponse`, `BlocksProtocol` → `PeerWireProtocol`, `request_block`/`fetch_block` → `request_piece`/`fetch_piece`, `BLOCK_TIMEOUT` → `PIECE_TIMEOUT`, "block server" → "peer-wire server".
 * **Done when:** `just check` passes and no "block" in the code means a piece.
 
 #### Step 2: Doc Sync Retry (index fault)
@@ -92,8 +95,10 @@ Not BitTorrent, but step 7's load test can't pass without it.
 
 * [ ] Piece picker (pure bookkeeping, tested on its own like `Schedule`): partial first, rarest first, one peer per piece, endgame with `Cancel`, a peer's pieces back to the pool when it is dropped.
 * [ ] Download loop per swarm: handshake with each seeder, `Interested`, requests up to a fixed queue of 16 per peer, write each verified piece to the staging file.
+* [ ] `--direct-only` / `SYNC_NODE_DIRECT_ONLY` (`Config::direct_only`, off by default): the download loop skips relay-only peers, the server answers `Reject(Policy)` over a relay, and a path change to a relay returns that peer's requests to the picker.
+* [ ] A superseded version stops its swarm and removes its staging file at once.
 * [ ] The content task fetches with it. Remove `/sync-node/blocks/0`, `Client::fetch_file`, `Schedule`, `WINDOW`, `BUSY_*`, `MAX_SERVING`, `Content::fetch_from`'s doc watch.
-* [ ] Tests: all of `tests/content.rs` passes. Picker tests replace the `Schedule` tests.
+* [ ] Tests: all of `tests/content.rs` passes. Picker tests replace the `Schedule` tests. A superseded version leaves no staging file. Direct only: on `Network::Local` every path is direct, so a test checks that fetches still pass with it on; the relay case is checked by the developer (block outbound UDP on one side, as sync-plan step 8).
 * **Done when:** two and three nodes converge over the peer wire only, and a bad piece's sender is dropped.
 
 #### Step 5: Leechers Serve

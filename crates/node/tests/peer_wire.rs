@@ -1,4 +1,4 @@
-//! Serving blocks: a node serves exactly the blocks its index describes, to
+//! Serving pieces: a node serves exactly the pieces its index describes, to
 //! members that keep the folder, and refuses everything else.
 
 use std::fs;
@@ -11,15 +11,16 @@ use iroh::endpoint::Connection;
 use iroh::SecretKey;
 use iroh_blobs::Hash;
 use iroh_docs::NamespaceId;
-use sync_node::blocks::{self, request_block, BlockRequest, Refusal, MIN_BLOCK_SIZE};
 use sync_node::index::FileMeta;
+use sync_node::peer_wire::{self, request_piece, PieceRequest, Refusal};
+use sync_node::pieces::MIN_PIECE_LENGTH;
 use sync_node::{Config, Network, Node};
 
 const INTERVAL: Duration = Duration::from_millis(200);
 const TIMEOUT: Duration = Duration::from_secs(20);
 const HOUR: Duration = Duration::from_secs(3600);
 
-/// A node with content transfer off: only the block server runs.
+/// A node with content transfer off: only the peer-wire server runs.
 async fn spawn(dir: &Path, book: &MemoryLookup) -> Node {
     let config = Config {
         network: Network::Local,
@@ -52,8 +53,8 @@ async fn entry(node: &Node, id: NamespaceId, path: &str) -> Option<FileMeta> {
     node.folder_index(id).await.unwrap().remove(path)
 }
 
-fn request(id: NamespaceId, path: &str, content: Hash, index: u32) -> BlockRequest {
-    BlockRequest {
+fn request(id: NamespaceId, path: &str, content: Hash, index: u32) -> PieceRequest {
+    PieceRequest {
         folder: id,
         path: path.to_string(),
         content,
@@ -61,8 +62,8 @@ fn request(id: NamespaceId, path: &str, content: Hash, index: u32) -> BlockReque
     }
 }
 
-async fn ask(conn: &Connection, request: &BlockRequest) -> Result<Vec<u8>, Refusal> {
-    request_block(conn, request).await.unwrap()
+async fn ask(conn: &Connection, request: &PieceRequest) -> Result<Vec<u8>, Refusal> {
+    request_piece(conn, request).await.unwrap()
 }
 
 #[tokio::test]
@@ -77,8 +78,8 @@ async fn a_node_serves_what_its_index_describes() {
     b.join(&a.create_invite(HOUR, None).unwrap()).await.unwrap();
     let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (ra, rb) = (pa.path(), pb.path());
-    // Two full blocks and a short one.
-    let content = data(2 * MIN_BLOCK_SIZE as usize + 1000);
+    // Two full pieces and a short one.
+    let content = data(2 * MIN_PIECE_LENGTH as usize + 1000);
     fs::write(ra.join("data.bin"), &content).unwrap();
     let id = a.add_folder("docs", ra).await.unwrap();
     eventually("a to index data.bin", || async {
@@ -87,7 +88,7 @@ async fn a_node_serves_what_its_index_describes() {
     .await;
     let meta = entry(&a, id, "data.bin").await.unwrap();
     let hash = meta.content.unwrap();
-    let conn = b.endpoint().connect(a.id(), blocks::ALPN).await.unwrap();
+    let conn = b.endpoint().connect(a.id(), peer_wire::ALPN).await.unwrap();
 
     // b is a member, but doesn't keep the folder yet.
     let wanted = request(id, "data.bin", hash, 0);
@@ -106,14 +107,14 @@ async fn a_node_serves_what_its_index_describes() {
     })
     .await;
 
-    // Every block, the short last one too, as the block list says.
-    let block = MIN_BLOCK_SIZE as usize;
-    for (i, expected) in content.chunks(block).enumerate() {
+    // Every piece, the short last one too, as the piece hashes say.
+    let piece = MIN_PIECE_LENGTH as usize;
+    for (i, expected) in content.chunks(piece).enumerate() {
         let got = ask(&conn, &request(id, "data.bin", hash, i as u32))
             .await
             .unwrap();
         assert_eq!(got, expected);
-        assert_eq!(Hash::new(&got), meta.blocks[i]);
+        assert_eq!(Hash::new(&got), meta.pieces[i]);
     }
 
     // Nothing the index doesn't describe.
@@ -143,7 +144,7 @@ async fn a_node_serves_what_its_index_describes() {
     send.write_all(b"not a request").await.unwrap();
     let _ = send.finish();
     assert!(recv.read_to_end(1 << 20).await.is_err());
-    assert_eq!(ask(&conn, &wanted).await.unwrap(), content[..block]);
+    assert_eq!(ask(&conn, &wanted).await.unwrap(), content[..piece]);
 
     // Different bytes with the same size and modification time: the
     // watcher sees nothing to re-read, but the server notices, refuses, and
@@ -171,7 +172,7 @@ async fn a_node_serves_what_its_index_describes() {
     })
     .await;
     let new = request(id, "data.bin", Hash::new(&edited), 0);
-    assert_eq!(ask(&conn, &new).await.unwrap(), edited[..block]);
+    assert_eq!(ask(&conn, &new).await.unwrap(), edited[..piece]);
 
     // A file replaced by a symlink is no longer served, even with the same
     // entry.
@@ -205,11 +206,11 @@ async fn a_non_member_cant_connect() {
         spawn(dirs[1].path(), &book).await,
     );
     a.create_group().await.unwrap();
-    let connected = outsider.endpoint().connect(a.id(), blocks::ALPN).await;
+    let connected = outsider.endpoint().connect(a.id(), peer_wire::ALPN).await;
     if let Ok(conn) = connected {
         // Accepted at first by QUIC, then closed by the gate.
         let request = request(NamespaceId::from(&[0u8; 32]), "x", Hash::new(b""), 0);
-        assert!(request_block(&conn, &request).await.is_err());
+        assert!(request_piece(&conn, &request).await.is_err());
     }
     a.shutdown().await.unwrap();
     outsider.shutdown().await.unwrap();

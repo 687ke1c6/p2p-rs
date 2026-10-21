@@ -1,21 +1,21 @@
-# Progress Report (2026-10-20)
+# Progress Report (2026-10-21)
 
-Handoff for the next session. Read this first, then [plan.md](plan.md).
+Handoff for the next session. Read this first, then [plan.md](plan.md) and [expectations.md](expectations.md).
 
 ## State
 
-* Nothing after `123bff9` is committed. The plan recommends that the developer commits the block work before step 1 (plan, "Git").
-* ADR 0002 accepted, glossary in BitTorrent terms, this plan written. **Next: step 0, the developer reviews the docs and commits.** Then step 1 (the rename).
-* `just check` passes. `just stress` runs the load tests in `tests/starved.rs`.
+* Block work committed in `93d8f91` (on `main`). Everything below is uncommitted.
+* Step 0 done: the developer reviewed the docs and wrote [expectations.md](expectations.md) (the download ceremony in BitTorrent terms; reviewed and corrected 2026-10-21).
+* Step 1 done (uncommitted): `blocks.rs` split into `pieces.rs` and `peer_wire.rs`, all renames, tests renamed, entry encoding fixture `the_entry_encoding_is_unchanged`. `just check` passes. **Next: the developer commits step 1 (with the doc changes, or apart); then step 2.**
+* `just stress` runs the load tests in `tests/starved.rs`.
 
-## Done in the last block-plan session (uncommitted, kept)
+## Decisions 2026-10-21
 
-* Step 4: local block copy (`blocks::Staged`), several providers at once, endgame for overdue requests only (`blocks::Schedule`), new providers join a running fetch (`Content::fetch_from`).
-* `Node::fetched()`: verified file bytes per provider. Content tests assert exact amounts with it.
-* `peers::PathTotals`: traffic totals never go down (they dipped while a closed path's event was pending).
-* **Membership fix:** iroh-docs doesn't retry a failed content download, so a member or folder record whose blob didn't arrive stayed unreadable for good. The monitor now calls `Folders::fetch_missing` for the membership doc each presence interval, from the members and the group's chain. Regression test: `a_starved_node_reads_every_record` (`just stress`).
-* Step 5: `--with-content` and `Config::content` removed; stale staging files removed by the content pass (unwanted and unwritten for 24 h); sync plan updated.
-* Block plan step 5 item 4 (the Pi check of large files and disk use) was not done. It moved to step 8 of this plan.
+* Choking is upload only; no download-side choking (that is tit-for-tat).
+* Leechers are not written to the doc. They are found by opening a stream to every online node that keeps the folder.
+* A bitfield is sent once, at the handshake; then `Have`.
+* A superseded version: the old swarm stops and its staging file is removed at once; no reuse of its pieces (plan step 4).
+* Relays allowed by default. `--direct-only` / `SYNC_NODE_DIRECT_ONLY` (`Config::direct_only`) per node, for testing (plan step 4). The full relay policy stays in sync-plan step 8.
 
 ## Load-test baseline (block protocol, 2026-10-20)
 
@@ -28,3 +28,4 @@ Handoff for the next session. Read this first, then [plan.md](plan.md).
 
 * Short replies when asked; ASD-STE100 in chat (CLAUDE.md); never touch the git index; never run the armv7 build.
 * BitTorrent's design is the chosen direction (2026-10-20), not only a fix for speed. Follow its tried-and-tested choices; leave out only what a trusted group doesn't need (tit-for-tat).
+* Wants to review expectations before more implementation; write down how a thing should work before building it.

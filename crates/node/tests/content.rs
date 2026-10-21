@@ -10,9 +10,9 @@ use iroh::address_lookup::memory::MemoryLookup;
 use iroh::SecretKey;
 use iroh_blobs::Hash;
 use iroh_docs::NamespaceId;
-use sync_node::blocks::{staging_path, Hasher, MIN_BLOCK_SIZE};
 use sync_node::content::{RENAME_GRACE, STALE_STAGING};
 use sync_node::index::FileMeta;
+use sync_node::pieces::{staging_path, Hasher, MIN_PIECE_LENGTH};
 use sync_node::view::Version;
 use sync_node::{Config, Network, Node};
 
@@ -100,7 +100,7 @@ fn conflict_copies(tree: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// The file data `node` has fetched from `peer`: verified blocks, each
+/// The file data `node` has fetched from `peer`: verified pieces, each
 /// counted once.
 fn fetched(node: &Node, peer: &Node) -> u64 {
     node.fetched().get(&peer.id()).copied().unwrap_or(0)
@@ -272,7 +272,7 @@ async fn unsafe_paths_are_refused() {
         .await
         .unwrap();
     }
-    // A safe path whose block list doesn't describe its content.
+    // A safe path whose piece hashes don't describe its content.
     let mut hasher = Hasher::new(4);
     hasher.update(b"evil");
     let mut liar = FileMeta::file(
@@ -282,7 +282,7 @@ async fn unsafe_paths_are_refused() {
         a.id(),
         Version::default().bumped(a.id()),
     );
-    liar.blocks = vec![Hash::new(b"something else")];
+    liar.pieces = vec![Hash::new(b"something else")];
     doc.set_bytes(
         author,
         b"liar.txt".to_vec(),
@@ -369,7 +369,7 @@ fn big_data() -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn an_append_fetches_only_the_new_blocks() {
+async fn an_append_fetches_only_the_new_pieces() {
     let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
     let book = MemoryLookup::new();
     let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -386,7 +386,7 @@ async fn an_append_fetches_only_the_new_blocks() {
         read(rb, "big.bin").is_some_and(|got| got == data)
     })
     .await;
-    // The appended blocks only.
+    // The appended pieces only.
     assert_eq!(fetched(b, a) - before, TAIL as u64);
 
     for node in nodes {
@@ -395,7 +395,7 @@ async fn an_append_fetches_only_the_new_blocks() {
 }
 
 #[tokio::test]
-async fn an_edit_in_the_middle_fetches_one_block() {
+async fn an_edit_in_the_middle_fetches_one_piece() {
     let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
     let book = MemoryLookup::new();
     let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -411,7 +411,7 @@ async fn an_edit_in_the_middle_fetches_one_block() {
         read(rb, "big.bin").is_some_and(|got| got == data)
     })
     .await;
-    assert_eq!(fetched(b, a) - before, u64::from(MIN_BLOCK_SIZE));
+    assert_eq!(fetched(b, a) - before, u64::from(MIN_PIECE_LENGTH));
 
     for node in nodes {
         node.shutdown().await.unwrap();
@@ -419,7 +419,7 @@ async fn an_edit_in_the_middle_fetches_one_block() {
 }
 
 #[tokio::test]
-async fn blocks_are_copied_from_other_files() {
+async fn pieces_are_copied_from_other_files() {
     let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
     let book = MemoryLookup::new();
     let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -668,9 +668,9 @@ async fn a_renamed_file_reaches_a_new_node() {
     }
 }
 
-/// A provider that can't send hands the rest of the file over to the next.
+/// A peer that can't send hands the rest of the file over to the next.
 #[tokio::test]
-async fn a_failing_provider_hands_over() {
+async fn a_failing_peer_hands_over() {
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     let book = MemoryLookup::new();
     let nodes = group(&dirs, &book).await;
@@ -687,7 +687,7 @@ async fn a_failing_provider_hands_over() {
         v.path("shared.bin").is_some_and(|p| p.in_sync())
     })
     .await;
-    // Providers are tried in node ID order: break the first one, which can
+    // Peers are tried in node ID order: break the first one, which can
     // then no longer read its copy (its index doesn't notice: the size and
     // time are unchanged).
     let (first, second) = if a.id() < b.id() { (0, 1) } else { (1, 0) };
@@ -709,15 +709,15 @@ async fn a_failing_provider_hands_over() {
     }
 }
 
-/// Bytes that don't match the block list are never written, and the node
+/// Bytes that don't match the piece hashes are never written, and the node
 /// that sent them is dropped rather than asked for the whole file.
 #[tokio::test]
-async fn providers_share_the_load() {
+async fn peers_share_the_load() {
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     let book = MemoryLookup::new();
     let nodes = group(&dirs, &book).await;
     let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    // Several files: a fetch uses the providers c knows when it starts, and
+    // Several files: a fetch uses the peers c knows when it starts, and
     // c may learn of b's copy only during the first one.
     const FILES: usize = 4;
     const SIZE: usize = 4 << 20;
@@ -749,8 +749,8 @@ async fn providers_share_the_load() {
             .all(|(name, data)| read(roots[2].path(), name).is_some_and(|got| got == *data))
     })
     .await;
-    // Both sent a part (under load, c may learn of one provider only after
-    // most of the data has arrived), and together each block once.
+    // Both sent a part (under load, c may learn of one peer only after
+    // most of the data has arrived), and together each piece once.
     let total = (FILES * SIZE) as u64;
     let (from_a, from_b) = (fetched(c, a), fetched(c, b));
     assert!(
@@ -765,7 +765,7 @@ async fn providers_share_the_load() {
 }
 
 #[tokio::test]
-async fn a_new_provider_joins_a_running_fetch() {
+async fn a_new_peer_joins_a_running_fetch() {
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     let book = MemoryLookup::new();
     let nodes = group(&dirs, &book).await;
@@ -809,7 +809,7 @@ async fn a_new_provider_joins_a_running_fetch() {
 }
 
 #[tokio::test]
-async fn blocks_that_dont_match_are_refused() {
+async fn pieces_that_dont_match_are_refused() {
     let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
     let book = MemoryLookup::new();
     let nodes = group(&dirs, &book).await;
@@ -824,7 +824,7 @@ async fn blocks_that_dont_match_are_refused() {
         a.folder_index(id).await.unwrap().contains_key("real.bin")
     })
     .await;
-    // a's doc now tells other nodes a block list that doesn't describe the
+    // a's doc now tells other nodes piece hashes that don't describe the
     // file; a's own index (what it serves by) still has the true one.
     let mut lie = a
         .folder_index(id)
@@ -832,8 +832,8 @@ async fn blocks_that_dont_match_are_refused() {
         .unwrap()
         .remove("real.bin")
         .unwrap();
-    for block in lie.blocks.iter_mut() {
-        *block = Hash::new(block.as_bytes());
+    for piece in lie.pieces.iter_mut() {
+        *piece = Hash::new(piece.as_bytes());
     }
     let doc = a.docs().open(id).await.unwrap().unwrap();
     let author = a.docs().author_default().await.unwrap();
@@ -852,7 +852,7 @@ async fn blocks_that_dont_match_are_refused() {
     assert!(read(&rb, "real.bin").is_none());
     // Nothing that failed the check reached the staging file.
     assert!(fs::read(&staged).unwrap().iter().all(|byte| *byte == 0));
-    // Nothing counted as fetched, and one window of blocks crossed the
+    // Nothing counted as fetched, and one window of pieces crossed the
     // wire, not the whole file.
     assert_eq!(fetched(b, a), 0);
     let received = received(b, a);
