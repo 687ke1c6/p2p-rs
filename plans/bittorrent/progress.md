@@ -11,8 +11,9 @@ Handoff for the next session. Read this first, then [plan.md](plan.md) and [expe
 * Steps 1 and 2 committed (`658a2f4`, `9a211f3`).
 * Step 3 done, committed (`ae38050`).
 * Step 4 done, committed (`450e8fb`).
-* Step 5 done (uncommitted): leechers serve (`peer_wire::Swarms`), lost staging pieces fetched again, `NotHave` no longer drops a peer. `just check` passes twice (85 tests). Not load-tested yet (step 7).
-* **Next: step 6** (choker and request queues).
+* Step 5 done, committed.
+* Step 6 done (uncommitted): `choker.rs`, choking per peer node, request queues from rate, snubbing; step 5's test limit changed (developer's decision, plan step 6). `just check` passes twice (91 tests).
+* **Next: step 7** (load).
 * `just stress` runs the load tests in `tests/starved.rs`. Each run takes about 2 min and varies a lot (0 to 8 stuck of 8); judge on 5 runs, never on one.
 
 ## Decisions 2026-10-21

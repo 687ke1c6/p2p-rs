@@ -139,15 +139,22 @@ Not BitTorrent, but step 7's load test can't pass without it.
 
 #### Step 6: Choker & Request Queues
 
-* [ ] Speed per peer, both ways. Request queue from the measured rate; snubbing.
-* [ ] Choker: 4 upload slots + 1 optimistic unchoke, 10 s and 30 s rounds, over all swarms. `Reject(Choked)` for requests that arrive while choked.
-* [ ] Tests (choker as bookkeeping, tested on its own): the fastest interested peers are unchoked; the optimistic unchoke rotates; a peer that only downloads is never choked for that alone; a snubbed peer gets one request at a time.
+* [x] Speed per peer, both ways. Request queue from the measured rate; snubbing.
+* [x] Choker: 4 upload slots + 1 optimistic unchoke, 10 s and 30 s rounds, over all swarms. `Reject(Choked)` for requests that arrive while choked.
+* [x] Tests (choker as bookkeeping, tested on its own): the fastest interested peers are unchoked; the optimistic unchoke rotates; a peer that only downloads is never choked for that alone; a snubbed peer gets one request at a time.
 * **Done when:** with more interested peers than slots, the slots go to the fastest, and every peer is sometimes unchoked.
+* Done 2026-10-21. As built:
+  * `choker.rs`: `Choker` (bookkeeping: the `SLOTS` fastest by this node's upload rate, plus the optimistic unchoke, which on each rotation moves to the choked interested peer that had it least recently, so every peer is unchoked in turn), `Rate` (bytes/s over 5 s), `queue_length` (`rate × 2 s / BLOCK_LENGTH`, 4 to 250; 1 when snubbed). Tested in `tests/choker.rs` (6 tests).
+  * The choker's unit is a peer **node**, over all its swarm streams. A stream is unchoked while it is interested and the choker has its node unchoked. Rounds every `ROUND` (10 s), rotation every `ROTATE_EVERY` (3) rounds; also a round at once when a stream's interest changes, so a small group never waits 10 s for its first unchoke.
+  * Downloads: the queue per peer from the rate measured from it; snubbed after `SNUB_AFTER` (60 s) with requests open and no block.
+  * Not tested with more than 5 real nodes (only the `Choker` alone): see step 7.
+* **Decided 2026-10-21 (developer): the libtorrent queue rule stays, and step 5's test limit changes.** On one machine the author's upload has no limit; with queues of up to 250 blocks, b and c start the same pieces from a before either can announce them (rarest first only sees verified pieces). `leechers_share_a_new_file` went from a uploading 1.07–1.12 × (fixed queue of 16) to 1.47–1.55 ×, b and c getting 17–27 % from each other. Its limits are now: a < 1.75 ×, each leecher ≥ 10 % from the other. The real ratio is measured on the Pi (step 8). Not chosen: BEP 16 super-seeding (a possible later step if the Pi shows the author uploads too much); a lower `MAX_QUEUE` (no basis, slower downloads).
 
 #### Step 7: Load
 
 * [ ] `just stress`: `a_starved_node_fetches_every_file` and `a_starved_node_reads_every_record` pass 5 runs in a row.
 * [ ] Compare with the block-protocol baseline (0, 2, 2, 2 of 8 stuck, 2026-10-20).
+* [ ] The choker with more interested nodes than slots, on real nodes: a seeds a large file to 6 others at once; at most 5 are unchoked at a time, and each is unchoked at some time.
 * [ ] Split each stuck fetch by its cause with the probe in `tests/starved.rs` (`Stuck::timeline`, `view_after`): doc layer (listing, sync, metadata blob) or peer wire. If the doc layer still causes stuck fetches, the developer decides on ADR 0003 (own index exchange for folder docs, Syncthing-style; folder index first, membership after, as its own plan).
 * [ ] Constants that are guesses (block length, queue limits, slots, rounds, timeouts) are written in the notes with what the load tests showed.
 * **Done when:** no fetch is stuck under load.
@@ -156,5 +163,6 @@ Not BitTorrent, but step 7's load test can't pass without it.
 
 * [ ] Spec: `plans/bittorrent/spec.md` as built (wire, picker, choker, failure cases).
 * [ ] Sync plan: points step 8 at the per-request `Reject(Policy)`.
+* [ ] On the Pi and the dev container (real bandwidth): how much of a new file its author uploads when two nodes fetch it at once (step 6's decision; one machine showed up to 1.55 ×).
 * [ ] armv7 and CLI (includes the old block plan step 5 item 4): the developer rebuilds, syncs a folder with some large files between the Pi and the dev container, and checks disk use on the Pi.
 * **Done when:** the sync plan can resume at step 8.

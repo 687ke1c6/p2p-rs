@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
+use crate::choker::{queue_length, Choker, Rate, ROTATE_EVERY, ROUND, SNUB_AFTER};
 use crate::folder::{Folders, Serving};
 use crate::index::{safe_path, Apply, FileMeta};
 use crate::picker::{Complete, Holds, Picker};
@@ -291,6 +292,9 @@ pub struct PeerWireProtocol {
     folders: Folders,
     /// This node's running downloads, to serve as a leecher.
     swarms: Swarms,
+    uploads: Uploads,
+    /// The choker's rounds, stopped with the last clone.
+    _rounds: Arc<AbortOnDropHandle<()>>,
     /// `--direct-only`: requests that arrive over a relay are rejected
     /// with `Policy`.
     direct_only: bool,
@@ -304,8 +308,11 @@ struct Verified {
 
 impl PeerWireProtocol {
     pub(crate) fn new(folders: Folders, direct_only: bool) -> Self {
+        let uploads = Uploads::default();
         Self {
             swarms: folders.swarms(),
+            _rounds: Arc::new(uploads.run()),
+            uploads,
             folders,
             direct_only,
         }
@@ -383,10 +390,27 @@ impl PeerWireProtocol {
         // Messages, read on their own task so `Have` can go out meanwhile.
         let (messages, mut incoming) = mpsc::channel(16);
         let _reader = AbortOnDropHandle::new(tokio::spawn(read_all(recv, messages)));
+        // The stream is unchoked while it is interested and the choker has
+        // its node unchoked (for this or another of its swarms).
+        let (mut upload, mut unchoked) = self.uploads.join(remote);
         let mut choked = true;
         let mut verified: Option<Verified> = None;
         loop {
+            let want = upload.interested && *unchoked.borrow_and_update();
+            if want == choked {
+                choked = !want;
+                let say = if want {
+                    Message::Unchoke
+                } else {
+                    Message::Choke
+                };
+                send.send(&say).await?;
+            }
             let msg = tokio::select! {
+                changed = unchoked.changed() => {
+                    changed?;
+                    continue;
+                }
                 msg = incoming.recv() => match msg {
                     Some(msg) => msg?.0,
                     None => break,
@@ -408,10 +432,8 @@ impl PeerWireProtocol {
                 }
             };
             match msg {
-                Message::Interested if choked => {
-                    choked = false;
-                    send.send(&Message::Unchoke).await?;
-                }
+                Message::Interested => upload.interested(true),
+                Message::NotInterested => upload.interested(false),
                 Message::Request(block) => {
                     let relayed = self.direct_only
                         && !conn.upgrade().is_some_and(|c| crate::peers::is_direct(&c));
@@ -419,7 +441,10 @@ impl PeerWireProtocol {
                         .block(&folder, handshake, block, choked, relayed, &mut verified)
                         .await;
                     match answer {
-                        Ok(data) => send.send_piece(block, data).await?,
+                        Ok(data) => {
+                            send.send_piece(block, data).await?;
+                            upload.sent(block.length);
+                        }
                         Err(why) => {
                             tracing::debug!(
                                 "{}: rejected {block:?} of {}: {why}",
@@ -433,9 +458,7 @@ impl PeerWireProtocol {
                 // The other end's own pieces and choking matter to its
                 // server, on the stream it opened, not here. Requests are
                 // answered in order, so a cancel always comes too late.
-                Message::Interested
-                | Message::NotInterested
-                | Message::Bitfield(_)
+                Message::Bitfield(_)
                 | Message::HaveAll
                 | Message::HaveNone
                 | Message::Have(_)
@@ -563,6 +586,137 @@ impl PeerWireProtocol {
         }
         let data = &verified.as_ref().expect("verified above").data;
         Ok(&data[block.begin as usize..end as usize])
+    }
+}
+
+/// This node's uploads, per peer node over all its swarms: what the
+/// [`Choker`] decides on, every [`ROUND`] and whenever a peer's interest
+/// changes.
+#[derive(Debug, Clone, Default)]
+struct Uploads(Arc<Mutex<UploadState>>);
+
+#[derive(Debug, Default)]
+struct UploadState {
+    peers: HashMap<EndpointId, Uploading>,
+    choker: Choker<EndpointId>,
+    rounds: u32,
+}
+
+#[derive(Debug)]
+struct Uploading {
+    /// Its swarm streams to this node's server, and how many are interested.
+    streams: usize,
+    interested: usize,
+    /// What this node uploads to it.
+    rate: Rate,
+    /// Whether it is unchoked: every stream follows it.
+    unchoked: watch::Sender<bool>,
+}
+
+/// One swarm stream in [`Uploads`], until dropped.
+struct UploadStream {
+    uploads: Uploads,
+    remote: EndpointId,
+    interested: bool,
+}
+
+impl Uploads {
+    /// A new stream from `remote`, choked until the choker says otherwise:
+    /// whether `remote` is unchoked, to follow.
+    fn join(&self, remote: EndpointId) -> (UploadStream, watch::Receiver<bool>) {
+        let mut state = self.0.lock().unwrap();
+        let peer = state.peers.entry(remote).or_insert_with(|| Uploading {
+            streams: 0,
+            interested: 0,
+            rate: Rate::default(),
+            unchoked: watch::channel(false).0,
+        });
+        peer.streams += 1;
+        let unchoked = peer.unchoked.subscribe();
+        let stream = UploadStream {
+            uploads: self.clone(),
+            remote,
+            interested: false,
+        };
+        (stream, unchoked)
+    }
+
+    /// Runs a choker round: on the [`ROUND`] timer (`timer`), which also
+    /// rotates the optimistic unchoke every [`ROTATE_EVERY`] rounds, or
+    /// because a peer's interest changed.
+    fn round(&self, timer: bool) {
+        let mut guard = self.0.lock().unwrap();
+        let state = &mut *guard;
+        let rotate = timer && {
+            state.rounds += 1;
+            state.rounds.is_multiple_of(ROTATE_EVERY)
+        };
+        let now = Instant::now();
+        let interested: Vec<(EndpointId, f64)> = state
+            .peers
+            .iter_mut()
+            .filter(|(_, p)| p.interested > 0)
+            .map(|(id, p)| (*id, p.rate.per_second(now)))
+            .collect();
+        let unchoked = state.choker.round(&interested, rotate);
+        for (id, peer) in &state.peers {
+            let now = unchoked.contains(id);
+            peer.unchoked
+                .send_if_modified(|was| std::mem::replace(was, now) != now);
+        }
+    }
+
+    /// Runs choker rounds every [`ROUND`], until dropped.
+    fn run(&self) -> AbortOnDropHandle<()> {
+        let uploads = self.clone();
+        AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut every = tokio::time::interval(ROUND);
+            every.tick().await;
+            loop {
+                every.tick().await;
+                uploads.round(true);
+            }
+        }))
+    }
+}
+
+impl UploadStream {
+    fn interested(&mut self, interested: bool) {
+        if self.interested == interested {
+            return;
+        }
+        self.interested = interested;
+        {
+            let mut state = self.uploads.0.lock().unwrap();
+            if let Some(peer) = state.peers.get_mut(&self.remote) {
+                if interested {
+                    peer.interested += 1;
+                } else {
+                    peer.interested -= 1;
+                }
+            }
+        }
+        self.uploads.round(false);
+    }
+
+    fn sent(&self, bytes: u32) {
+        let mut state = self.uploads.0.lock().unwrap();
+        if let Some(peer) = state.peers.get_mut(&self.remote) {
+            peer.rate.add(u64::from(bytes), Instant::now());
+        }
+    }
+}
+
+impl Drop for UploadStream {
+    fn drop(&mut self) {
+        self.interested(false);
+        let mut state = self.uploads.0.lock().unwrap();
+        if let Some(peer) = state.peers.get_mut(&self.remote) {
+            peer.streams -= 1;
+            if peer.streams == 0 {
+                state.peers.remove(&self.remote);
+            }
+        }
     }
 }
 
@@ -710,10 +864,6 @@ pub fn holds(msg: &Message, count: u32) -> Option<Holds> {
     }
 }
 
-/// Requests a node keeps open to one peer (the plan's fixed queue until
-/// step 6 sizes it from the peer's speed).
-pub const QUEUE: usize = 16;
-
 /// How often a download asks the nodes it isn't connected to again: a
 /// node that got the version since (its entry hadn't synced), or came back,
 /// joins the swarm.
@@ -758,6 +908,10 @@ enum State {
         peer: usize,
         unchoked: bool,
         interested: bool,
+        /// What it sends this node, which sizes its request queue.
+        rate: Rate,
+        /// When it last sent a block, or was unchoked: for snubbing.
+        last_block: Instant,
     },
 }
 
@@ -805,7 +959,8 @@ impl Client {
     /// Downloads what `staged` lacks of version `meta` of `path` in `folder`:
     /// joins the swarm with every node `peers` names, says it is interested
     /// in those that have pieces it lacks, and once unchoked asks for blocks
-    /// as the [`Picker`] hands them out, up to [`QUEUE`] at a time. Each
+    /// as the [`Picker`] hands them out, as many at a time as
+    /// [`queue_length`] says for the speed measured from that peer. Each
     /// piece is checked against its hash before it is written to the
     /// staging file. A peer that sends a piece that doesn't match, or
     /// rejects a request because it no longer has the file, is dropped for
@@ -925,15 +1080,19 @@ impl Client {
         Ok(true)
     }
 
-    /// Asks every unchoked peer in the swarm for blocks, up to [`QUEUE`]
-    /// open each.
+    /// Asks every unchoked peer in the swarm for blocks, up to its
+    /// [`queue_length`] open: one if it has sent nothing for [`SNUB_AFTER`]
+    /// with requests open (snubbed).
     async fn request(&self, remotes: &mut [Remote], picker: &mut Picker) {
+        let now = Instant::now();
         for remote in remotes.iter_mut() {
             let State::In {
                 conn,
                 send,
                 peer,
                 unchoked: true,
+                rate,
+                last_block,
                 ..
             } = &mut remote.state
             else {
@@ -942,8 +1101,10 @@ impl Client {
             if self.direct_only && !crate::peers::is_direct(conn) {
                 continue;
             }
+            let snubbed = picker.open(*peer) > 0 && now - *last_block > SNUB_AFTER;
+            let queue = queue_length(rate.per_second(now), snubbed);
             let mut failed = false;
-            while picker.open(*peer) < QUEUE {
+            while picker.open(*peer) < queue {
                 let Some(block) = picker.next(*peer, Instant::now()) else {
                     break;
                 };
@@ -1025,6 +1186,8 @@ impl Client {
             peer,
             unchoked: false,
             interested,
+            rate: Rate::default(),
+            last_block: Instant::now(),
         };
     }
 
@@ -1049,6 +1212,8 @@ impl Client {
             peer,
             unchoked,
             interested,
+            rate,
+            last_block,
             ..
         } = &mut remotes[i].state
         else {
@@ -1056,7 +1221,10 @@ impl Client {
         };
         let peer = *peer;
         match msg {
-            Message::Unchoke => *unchoked = true,
+            Message::Unchoke => {
+                *unchoked = true;
+                *last_block = Instant::now();
+            }
             Message::Choke => *unchoked = false,
             Message::Have(piece) => {
                 picker.has(peer, piece);
@@ -1066,7 +1234,10 @@ impl Client {
                 }
             }
             Message::Piece(block) => {
-                let got = picker.received(peer, block, data, Instant::now());
+                let now = Instant::now();
+                rate.add(u64::from(block.length), now);
+                *last_block = now;
+                let got = picker.received(peer, block, data, now);
                 for other in got.cancel {
                     let owner = remotes
                         .iter_mut()

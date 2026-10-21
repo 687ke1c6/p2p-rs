@@ -965,8 +965,11 @@ async fn direct_only_nodes_converge() {
     }
 }
 
-/// A new file reaches two nodes at once while its author uploads it about
-/// once: the leechers serve each other the pieces they have verified.
+/// A new file reaches two nodes at once, the leechers serving each other the
+/// pieces they have verified. On one machine the author's upload has no
+/// limit, so the leechers' deep request queues (`choker::queue_length`)
+/// take more from it than on a real link: here it uploads up to about 1.5 ×
+/// the file. The real ratio is measured on the Pi (BitTorrent plan step 8).
 #[tokio::test]
 async fn leechers_share_a_new_file() {
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
@@ -991,11 +994,11 @@ async fn leechers_share_a_new_file() {
     let from_a = fetched(b, a) + fetched(c, a);
     let (b_from_c, c_from_b) = (fetched(b, c), fetched(c, b));
     assert!(
-        from_a < SIZE as u64 * 3 / 2,
+        from_a < SIZE as u64 * 7 / 4,
         "a uploaded {from_a} bytes; b got {b_from_c} from c, c {c_from_b} from b"
     );
     assert!(
-        b_from_c > 0 && c_from_b > 0,
+        b_from_c > SIZE as u64 / 10 && c_from_b > SIZE as u64 / 10,
         "b got {b_from_c} bytes from c, c {c_from_b} from b"
     );
     assert_eq!(from_a + b_from_c + c_from_b, 2 * SIZE as u64);
