@@ -179,6 +179,35 @@ impl Picker {
         }
     }
 
+    /// Peer `p` doesn't have `piece` (it rejected a request with
+    /// `NotHave`): it isn't asked for it again.
+    pub fn lacks(&mut self, p: usize, piece: u32) {
+        let count = self.pieces.len();
+        let peer = &mut self.peers[p];
+        if peer.holds == Holds::All {
+            peer.holds = Holds::These(vec![true; count]);
+        }
+        if let Holds::These(have) = &mut peer.holds {
+            if let Some(flag) = have.get_mut(piece as usize) {
+                *flag = false;
+            }
+        }
+        // Another peer finishes it.
+        if let Some(Piece::Active(a)) = self.pieces.get_mut(piece as usize) {
+            if a.owner == Some(p) {
+                a.owner = None;
+            }
+        }
+    }
+
+    /// A piece this node had no longer matches its hash on disk: it is
+    /// fetched again.
+    pub fn lost(&mut self, piece: u32) {
+        if let Some(slot @ Piece::Have) = self.pieces.get_mut(piece as usize) {
+            *slot = Piece::Missing;
+        }
+    }
+
     /// Requests open to peer `p`.
     pub fn open(&self, p: usize) -> usize {
         self.peers[p].open

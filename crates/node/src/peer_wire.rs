@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,15 +26,16 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointId};
 use iroh_blobs::Hash;
 use iroh_docs::NamespaceId;
+use n0_future::task::AbortOnDropHandle;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::folder::{Folders, Serving};
 use crate::index::{safe_path, Apply, FileMeta};
 use crate::picker::{Complete, Holds, Picker};
-use crate::pieces::{read_piece, span, Staged};
+use crate::pieces::{read_piece, read_staged, span, Staged};
 
 /// Largest message (any but a `Piece`'s bytes) accepted.
 pub const MAX_HEADER: u32 = 8 << 10;
@@ -287,6 +289,8 @@ impl WireRecv {
 #[derive(Debug, Clone)]
 pub struct PeerWireProtocol {
     folders: Folders,
+    /// This node's running downloads, to serve as a leecher.
+    swarms: Swarms,
     /// `--direct-only`: requests that arrive over a relay are rejected
     /// with `Policy`.
     direct_only: bool,
@@ -301,6 +305,7 @@ struct Verified {
 impl PeerWireProtocol {
     pub(crate) fn new(folders: Folders, direct_only: bool) -> Self {
         Self {
+            swarms: folders.swarms(),
             folders,
             direct_only,
         }
@@ -334,13 +339,14 @@ impl PeerWireProtocol {
                 return;
             }
         };
-        if let Err(err) = self.serve(remote, &conn, &handshake, &mut wire).await {
+        let (mut send, recv) = wire.split();
+        if let Err(err) = self.serve(remote, &conn, &handshake, &mut send, recv).await {
             tracing::debug!(
                 "{}: swarm for {}: {err:#}",
                 remote.fmt_short(),
                 handshake.path
             );
-            wire.reset();
+            send.reset();
         }
     }
 
@@ -349,24 +355,62 @@ impl PeerWireProtocol {
         remote: EndpointId,
         conn: &WeakConnectionHandle,
         handshake: &Handshake,
-        wire: &mut Wire,
+        send: &mut WireSend,
+        recv: WireRecv,
     ) -> anyhow::Result<()> {
-        let folder = match self.join(remote, handshake) {
-            Ok(folder) => folder,
+        let (folder, leeching) = match self.join(remote, handshake) {
+            Ok(joined) => joined,
             Err(refusal) => {
-                wire.send(&Message::Refused(refusal)).await?;
-                wire.finish()?;
+                send.send(&Message::Refused(refusal)).await?;
+                send.finish()?;
                 return Ok(());
             }
         };
-        wire.send(&Message::HaveAll).await?;
+        // A leecher sends its bitfield, then `Have` for each piece its
+        // download verifies, as long as the download runs.
+        let mut haves = leeching.as_ref().map(|l| l.have.subscribe());
+        let mut sent = match &mut haves {
+            Some(haves) => {
+                let have = haves.borrow_and_update().clone();
+                send.send(&bitfield_message(&have)).await?;
+                have
+            }
+            None => {
+                send.send(&Message::HaveAll).await?;
+                Vec::new()
+            }
+        };
+        // Messages, read on their own task so `Have` can go out meanwhile.
+        let (messages, mut incoming) = mpsc::channel(16);
+        let _reader = AbortOnDropHandle::new(tokio::spawn(read_all(recv, messages)));
         let mut choked = true;
         let mut verified: Option<Verified> = None;
-        while let Some((msg, _)) = wire.recv().await? {
+        loop {
+            let msg = tokio::select! {
+                msg = incoming.recv() => match msg {
+                    Some(msg) => msg?.0,
+                    None => break,
+                },
+                changed = changed(&mut haves) => {
+                    match changed {
+                        Some(have) => {
+                            for (i, now) in have.iter().enumerate() {
+                                if *now && !sent[i] {
+                                    sent[i] = true;
+                                    send.send(&Message::Have(i as u32)).await?;
+                                }
+                            }
+                        }
+                        // The download ended: placed, or given up.
+                        None => haves = None,
+                    }
+                    continue;
+                }
+            };
             match msg {
                 Message::Interested if choked => {
                     choked = false;
-                    wire.send(&Message::Unchoke).await?;
+                    send.send(&Message::Unchoke).await?;
                 }
                 Message::Request(block) => {
                     let relayed = self.direct_only
@@ -375,20 +419,20 @@ impl PeerWireProtocol {
                         .block(&folder, handshake, block, choked, relayed, &mut verified)
                         .await;
                     match answer {
-                        Ok(data) => wire.send_piece(block, data).await?,
+                        Ok(data) => send.send_piece(block, data).await?,
                         Err(why) => {
                             tracing::debug!(
                                 "{}: rejected {block:?} of {}: {why}",
                                 remote.fmt_short(),
                                 handshake.path
                             );
-                            wire.send(&Message::Reject(block, why)).await?;
+                            send.send(&Message::Reject(block, why)).await?;
                         }
                     }
                 }
-                // A seeder downloads nothing: the peer's pieces and choking
-                // don't matter. Requests are answered in order, so a cancel
-                // always comes too late.
+                // The other end's own pieces and choking matter to its
+                // server, on the stream it opened, not here. Requests are
+                // answered in order, so a cancel always comes too late.
                 Message::Interested
                 | Message::NotInterested
                 | Message::Bitfield(_)
@@ -404,27 +448,36 @@ impl PeerWireProtocol {
                 }
             }
         }
-        wire.finish()?;
+        send.finish()?;
         Ok(())
     }
 
     /// The folder to serve the swarm `handshake` names from, if this node
-    /// seeds it to `remote`.
-    fn join(&self, remote: EndpointId, handshake: &Handshake) -> Result<Serving, Refusal> {
+    /// is in it for `remote`: a seeder (its entry has the version), or a
+    /// leecher (it is downloading it).
+    fn join(
+        &self,
+        remote: EndpointId,
+        handshake: &Handshake,
+    ) -> Result<(Serving, Option<Arc<Leeching>>), Refusal> {
         let folder = self.folders.serving(handshake.folder, remote)?;
         if !safe_path(&handshake.path) {
             return Err(Refusal::NoSuchFile);
         }
-        folder
+        let seeding = folder
             .entries
             .get(&handshake.path)
-            .filter(|e| e.content == Some(handshake.content))
-            .ok_or(Refusal::NoSuchFile)?;
-        Ok(folder)
+            .is_some_and(|e| e.content == Some(handshake.content));
+        if seeding {
+            return Ok((folder, None));
+        }
+        let leeching = self.swarms.get(handshake).ok_or(Refusal::NoSuchFile)?;
+        Ok((folder, Some(leeching)))
     }
 
     /// The bytes of `block`, from the verified piece if it is that one's,
-    /// else read from disk and checked; or why not.
+    /// else read from disk (the file if this node seeds the version now,
+    /// else its staging file) and checked; or why not.
     async fn block<'a>(
         &self,
         folder: &Serving,
@@ -434,21 +487,35 @@ impl PeerWireProtocol {
         relayed: bool,
         verified: &'a mut Option<Verified>,
     ) -> Result<&'a [u8], Why> {
-        // The entry now: the file may have changed since the handshake.
+        // Where the version is now: a leecher's download may have finished
+        // since the handshake, a seeder's file changed.
         let entry = folder
             .entries
             .get(&handshake.path)
-            .filter(|e| e.content == Some(handshake.content))
-            .ok_or(Why::Changed)?;
-        if block.piece as usize >= entry.pieces.len() {
+            .filter(|e| e.content == Some(handshake.content));
+        let leeching = match entry {
+            Some(_) => None,
+            None => Some(self.swarms.get(handshake).ok_or(Why::NotHave)?),
+        };
+        let meta: &FileMeta = match (&entry, &leeching) {
+            (Some(entry), _) => entry,
+            (None, Some(leeching)) => &leeching.meta,
+            (None, None) => unreachable!("one of the two"),
+        };
+        if block.piece as usize >= meta.pieces.len() {
             return Err(Why::Invalid);
         }
         let end = u64::from(block.begin) + u64::from(block.length);
         if block.length == 0
             || block.length > MAX_BLOCK_LENGTH
-            || end > span(&entry, block.piece).1 as u64
+            || end > span(meta, block.piece).1 as u64
         {
             return Err(Why::Invalid);
+        }
+        if let Some(leeching) = &leeching {
+            if !leeching.have.borrow()[block.piece as usize] {
+                return Err(Why::NotHave);
+            }
         }
         if relayed {
             return Err(Why::Policy);
@@ -458,22 +525,127 @@ impl PeerWireProtocol {
         }
         if verified.as_ref().is_none_or(|v| v.piece != block.piece) {
             *verified = None;
-            let (root, path, piece) = (folder.root.clone(), handshake.path.clone(), block.piece);
-            let read =
-                tokio::task::spawn_blocking(move || read_piece(&root, &path, &entry, piece)).await;
+            let piece = block.piece;
+            let read = match (entry, &leeching) {
+                (Some(entry), _) => {
+                    let (root, path) = (folder.root.clone(), handshake.path.clone());
+                    tokio::task::spawn_blocking(move || read_piece(&root, &path, &entry, piece))
+                        .await
+                }
+                (None, Some(leeching)) => {
+                    let leeching = leeching.clone();
+                    tokio::task::spawn_blocking(move || {
+                        read_staged(&leeching.file, &leeching.meta, piece)
+                    })
+                    .await
+                }
+                (None, None) => unreachable!("one of the two"),
+            };
             match read {
                 Ok(Ok(Some(data))) => *verified = Some(Verified { piece, data }),
                 other => {
                     if let Ok(Err(err)) = &other {
                         tracing::debug!("reading piece {piece} of {}: {err}", handshake.path);
                     }
-                    rehash(folder, &handshake.path);
-                    return Err(Why::Changed);
+                    let Some(leeching) = leeching else {
+                        rehash(folder, &handshake.path);
+                        return Err(Why::Changed);
+                    };
+                    // The staging file no longer has it: the download
+                    // fetches it again.
+                    leeching
+                        .have
+                        .send_modify(|have| have[piece as usize] = false);
+                    let _ = leeching.lost.send(piece);
+                    return Err(Why::NotHave);
                 }
             }
         }
         let data = &verified.as_ref().expect("verified above").data;
         Ok(&data[block.begin as usize..end as usize])
+    }
+}
+
+/// The next value of `haves`, once it changes; `None` once its sender is
+/// gone. Never, without `haves`.
+async fn changed(haves: &mut Option<watch::Receiver<Vec<bool>>>) -> Option<Vec<bool>> {
+    let haves = match haves {
+        Some(haves) => haves,
+        None => std::future::pending().await,
+    };
+    haves.changed().await.ok()?;
+    Some(haves.borrow_and_update().clone())
+}
+
+/// Reads every message on `recv` into `messages`, until the stream ends (a
+/// last `Ok(None)` is not sent: the channel closes) or fails.
+async fn read_all(mut recv: WireRecv, messages: mpsc::Sender<anyhow::Result<(Message, Vec<u8>)>>) {
+    loop {
+        let got = match recv.recv().await {
+            Ok(Some(got)) => Ok(got),
+            Ok(None) => return,
+            Err(err) => Err(err),
+        };
+        let failed = got.is_err();
+        if messages.send(got).await.is_err() || failed {
+            return;
+        }
+    }
+}
+
+/// The swarms this node is downloading, so its server can serve the
+/// pieces they have verified from their staging files: a leecher serves.
+#[derive(Debug, Clone, Default)]
+pub struct Swarms(Arc<Mutex<HashMap<SwarmKey, Arc<Leeching>>>>);
+
+/// A swarm: folder, path and version, as a [`Handshake`] names it.
+type SwarmKey = (NamespaceId, String, Hash);
+
+/// One running download, as its swarm's server sees it.
+#[derive(Debug)]
+struct Leeching {
+    meta: FileMeta,
+    staging: PathBuf,
+    file: Arc<std::fs::File>,
+    /// The pieces verified so far; servers follow it to send `Have`.
+    have: watch::Sender<Vec<bool>>,
+    /// Pieces a server found no longer match in the staging file.
+    lost: mpsc::UnboundedSender<u32>,
+}
+
+/// Keeps a download in [`Swarms`] until dropped.
+struct Registered {
+    swarms: Swarms,
+    key: SwarmKey,
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        self.swarms.0.lock().unwrap().remove(&self.key);
+    }
+}
+
+impl Swarms {
+    fn register(&self, handshake: &Handshake, leeching: Leeching) -> Registered {
+        let key = (handshake.folder, handshake.path.clone(), handshake.content);
+        self.0
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::new(leeching));
+        Registered {
+            swarms: self.clone(),
+            key,
+        }
+    }
+
+    fn get(&self, handshake: &Handshake) -> Option<Arc<Leeching>> {
+        let key = (handshake.folder, handshake.path.clone(), handshake.content);
+        self.0.lock().unwrap().get(&key).cloned()
+    }
+
+    /// Whether a running download fetches into the staging file `path`.
+    pub(crate) fn uses(&self, path: &Path) -> bool {
+        self.0.lock().unwrap().values().any(|l| l.staging == path)
     }
 }
 
@@ -561,6 +733,8 @@ pub struct Client {
     conns: Arc<Mutex<HashMap<EndpointId, Connection>>>,
     /// Bytes of verified pieces written, per peer.
     fetched: Arc<Mutex<HashMap<EndpointId, u64>>>,
+    /// The downloads running, for the server.
+    swarms: Swarms,
 }
 
 /// One node a download asks.
@@ -599,7 +773,13 @@ impl Client {
             direct_only,
             conns: Arc::default(),
             fetched: Arc::default(),
+            swarms: Swarms::default(),
         }
+    }
+
+    /// The downloads running, which the server serves from as a leecher.
+    pub(crate) fn swarms(&self) -> Swarms {
+        self.swarms.clone()
     }
 
     /// Bytes of file data fetched from each peer since this node started:
@@ -648,6 +828,20 @@ impl Client {
             content,
         };
         let mut picker = Picker::new(meta.piece_length, meta.size, staged.missing.drain(..));
+        // In the swarm as a leecher from the start: the server serves the
+        // pieces verified so far, and those to come.
+        let (have, _) = watch::channel(picker.have());
+        let (lost, mut lost_pieces) = mpsc::unbounded_channel();
+        let _registered = self.swarms.register(
+            &handshake,
+            Leeching {
+                meta: meta.clone(),
+                staging: staged.path.clone(),
+                file: staged.file.clone(),
+                have: have.clone(),
+                lost,
+            },
+        );
         let (events, mut received) = mpsc::unbounded_channel::<(usize, u64, Event)>();
         // Joins and readers: stopped with the download.
         let mut tasks = JoinSet::new();
@@ -704,7 +898,7 @@ impl Client {
                             self.joined(i, joined, &mut remotes, &mut picker, &mut ids, &events, &mut tasks).await;
                         }
                         Event::Received(Ok(Some((msg, data)))) => {
-                            self.on_message(i, msg, &data, &mut remotes, &mut picker, &ids, meta, &staged, path).await?;
+                            self.on_message(i, msg, &data, &mut remotes, &mut picker, &ids, meta, &staged, &have, path).await?;
                         }
                         Event::Received(ended) => {
                             if let Err(err) = ended {
@@ -713,6 +907,10 @@ impl Client {
                             leave(&mut remotes[i], &mut picker, false);
                         }
                     }
+                }
+                Some(piece) = lost_pieces.recv() => {
+                    tracing::debug!("{path}: piece {piece} no longer matches in the staging file");
+                    picker.lost(piece);
                 }
                 () = tokio::time::sleep_until(wake.unwrap_or(now).into()), if wake.is_some() => {}
             }
@@ -842,6 +1040,7 @@ impl Client {
         ids: &[EndpointId],
         meta: &FileMeta,
         staged: &Staged,
+        have: &watch::Sender<Vec<bool>>,
         path: &str,
     ) -> anyhow::Result<()> {
         let id = remotes[i].id;
@@ -881,7 +1080,7 @@ impl Client {
                     }
                 }
                 if let Some(complete) = got.complete {
-                    self.check(complete, remotes, picker, ids, meta, staged, path)
+                    self.check(complete, remotes, picker, ids, meta, staged, have, path)
                         .await?;
                 }
             }
@@ -890,7 +1089,10 @@ impl Client {
                 match why {
                     // Asked again once unchoked, or once the path is direct.
                     Why::Choked | Why::Policy => {}
-                    Why::Changed | Why::NotHave | Why::Invalid => {
+                    // A leecher whose staging file lost the piece, or whose
+                    // download ended: asked for the others.
+                    Why::NotHave => picker.lacks(peer, block.piece),
+                    Why::Changed | Why::Invalid => {
                         tracing::debug!("{}: {path}: rejected {block:?}: {why}", id.fmt_short());
                         leave(&mut remotes[i], picker, true);
                     }
@@ -921,6 +1123,7 @@ impl Client {
         ids: &[EndpointId],
         meta: &FileMeta,
         staged: &Staged,
+        have: &watch::Sender<Vec<bool>>,
         path: &str,
     ) -> anyhow::Result<()> {
         let Complete {
@@ -941,6 +1144,7 @@ impl Client {
         .context("writing the staging file")?;
         if written {
             picker.verified(piece);
+            have.send_modify(|have| have[piece as usize] = true);
             let mut fetched = self.fetched.lock().unwrap();
             for (peer, bytes) in senders {
                 *fetched.entry(ids[peer]).or_default() += u64::from(bytes);

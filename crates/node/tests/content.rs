@@ -964,3 +964,43 @@ async fn direct_only_nodes_converge() {
         node.shutdown().await.unwrap();
     }
 }
+
+/// A new file reaches two nodes at once while its author uploads it about
+/// once: the leechers serve each other the pieces they have verified.
+#[tokio::test]
+async fn leechers_share_a_new_file() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    const SIZE: usize = 32 << 20;
+    let data: Vec<u8> = (0..SIZE).map(|i| (i * 11 + i / 4099) as u8).collect();
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    write(roots[0].path(), "new.bin", &data);
+    let id = add_folder(a, "docs", roots[0].path(), None).await;
+    tokio::join!(
+        add_folder(b, "docs", roots[1].path(), Some(id)),
+        add_folder(c, "docs", roots[2].path(), Some(id)),
+    );
+    eventually("b and c to have the file", || async {
+        [&roots[1], &roots[2]]
+            .iter()
+            .all(|root| read(root.path(), "new.bin").is_some_and(|got| got == data))
+    })
+    .await;
+    let from_a = fetched(b, a) + fetched(c, a);
+    let (b_from_c, c_from_b) = (fetched(b, c), fetched(c, b));
+    assert!(
+        from_a < SIZE as u64 * 3 / 2,
+        "a uploaded {from_a} bytes; b got {b_from_c} from c, c {c_from_b} from b"
+    );
+    assert!(
+        b_from_c > 0 && c_from_b > 0,
+        "b got {b_from_c} bytes from c, c {c_from_b} from b"
+    );
+    assert_eq!(from_a + b_from_c + c_from_b, 2 * SIZE as u64);
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}

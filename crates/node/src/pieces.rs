@@ -179,6 +179,15 @@ pub(crate) fn read_piece(
     Ok(Some(piece))
 }
 
+/// Reads piece `index` of the staging file `file` for version `meta`, if it
+/// hashes to the piece hashes' entry for it. `None` if not. Blocking.
+pub(crate) fn read_staged(file: &File, meta: &FileMeta, index: u32) -> io::Result<Option<Vec<u8>>> {
+    let (offset, len) = span(meta, index);
+    let mut piece = vec![0; len];
+    file.read_exact_at(&mut piece, offset)?;
+    Ok((Hash::new(&piece) == meta.pieces[index as usize]).then_some(piece))
+}
+
 /// The temporary file version `content` of `path` is fetched into: at the
 /// folder root (so nothing is written below it before the index task has
 /// checked the way), named after the path and version, so a fetch that
@@ -202,6 +211,8 @@ pub type Source = (String, Arc<FileMeta>);
 /// still lacks.
 #[derive(Debug)]
 pub struct Staged {
+    /// Where the staging file is (see [`staging_path`]).
+    pub(crate) path: PathBuf,
     pub(crate) file: Arc<File>,
     pub(crate) missing: VecDeque<u32>,
     /// Bytes copied from this node's own files.
@@ -224,6 +235,7 @@ impl Staged {
         let copied = copy_local(&file, meta, root, sources, &mut missing)?;
         let to_fetch = missing.iter().map(|&i| span(meta, i).1 as u64).sum();
         Ok(Self {
+            path: temp.to_path_buf(),
             file: Arc::new(file),
             missing,
             copied,

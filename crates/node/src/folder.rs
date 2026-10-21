@@ -1009,6 +1009,11 @@ impl Folders {
         })
     }
 
+    /// The downloads running, which the peer-wire server serves from.
+    pub(crate) fn swarms(&self) -> crate::peer_wire::Swarms {
+        self.0.client.swarms()
+    }
+
     /// The other nodes that keep folder `id`, as far as this node knows.
     pub(crate) fn folder_peers(&self, id: NamespaceId) -> Vec<EndpointId> {
         self.0

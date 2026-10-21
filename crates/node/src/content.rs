@@ -227,7 +227,7 @@ impl Content {
             .collect();
         let superseded: Vec<PathBuf> = staging.difference(&wanted).cloned().collect();
         staging.retain(|path| wanted.contains(path));
-        let root = self.root.clone();
+        let (root, swarms) = (self.root.clone(), self.client.swarms());
         let removed = tokio::task::spawn_blocking(move || {
             let mut removed = Vec::new();
             for path in superseded {
@@ -244,7 +244,11 @@ impl Content {
                     .metadata()
                     .and_then(|m| m.modified())
                     .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > STALE_STAGING));
-                if staging && old && !wanted.contains(&path) && std::fs::remove_file(&path).is_ok()
+                if staging
+                    && old
+                    && !wanted.contains(&path)
+                    && !swarms.uses(&path)
+                    && std::fs::remove_file(&path).is_ok()
                 {
                     removed.push(path);
                 }

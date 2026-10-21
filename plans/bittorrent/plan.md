@@ -125,10 +125,17 @@ Not BitTorrent, but step 7's load test can't pass without it.
 
 #### Step 5: Leechers Serve
 
-* [ ] A swarm's staging file is registered while the fetch runs; the server serves its verified pieces from it. `Bitfield` at the handshake, `Have` for each verified piece.
-* [ ] Stale staging cleanup skips files of running swarms.
-* [ ] Tests: a writes a 32 MiB file, b and c fetch it at the same time: a uploads less than 1.5 × the file, and b and c each receive pieces from the other. A staging piece that no longer matches is rejected and fetched again.
+* [x] A swarm's staging file is registered while the fetch runs; the server serves its verified pieces from it. `Bitfield` at the handshake, `Have` for each verified piece.
+* [x] Stale staging cleanup skips files of running swarms.
+* [x] Tests: a writes a 32 MiB file, b and c fetch it at the same time: a uploads less than 1.5 × the file, and b and c each receive pieces from the other. A staging piece that no longer matches is rejected and fetched again.
 * **Done when:** a new file reaches several nodes while its author uploads most pieces about once.
+* Done 2026-10-21. Result: in 3 runs of `leechers_share_a_new_file` (32 MiB, b and c at once), a uploaded 1.07–1.12 × the file, and b and c each got 39–50 % of it from the other.
+* As built:
+  * `peer_wire::Swarms`: the downloads running on this node (staging file, verified pieces as a `watch`, a channel back for lost pieces), registered by `Client::download` for as long as it runs. The server answers a handshake for a version its entry doesn't have but a download does with that download's bitfield, then sends `Have` as the download verifies pieces; it serves verified pieces from the staging file, re-checked (`pieces::read_staged`).
+  * **Two streams per pair when both download** (not the design's one per swarm): each downloader opens its own, and pieces and `Have`s go from server to downloader only. Simpler, and each stream has one role; the cost is a second stream.
+  * A staging piece that no longer matches: `Reject(NotHave)`, the piece leaves the bitfield, and the download fetches it again (`Picker::lost`). `NotHave` no longer drops a peer: the picker marks the piece as not held by it (`Picker::lacks`) and asks another peer. A version neither in the entry nor downloading (gone, or between a finished download and its placing) is `NotHave` too; `Changed` is now only for a file that no longer matches its own entry.
+  * Stale staging cleanup skips files a running download uses (`Swarms::uses`).
+  * Tests: `leechers_share_a_new_file` (content), `a_leecher_serves_from_its_staging_file` (peer wire: its seeder stops part way, a verified piece is served, a corrupted one rejected and dropped from the bitfield), picker `lacks`/`lost`.
 
 #### Step 6: Choker & Request Queues
 

@@ -258,3 +258,20 @@ fn bitfields_round_trip() {
     assert_eq!(holds(&Message::Bitfield(vec![0, 0b0100_0000]), 9), None);
     assert_eq!(holds(&Message::Interested, 9), None);
 }
+
+#[test]
+fn a_piece_a_peer_lacks_or_this_node_lost_is_asked_for_elsewhere() {
+    let mut picker = Picker::new(PIECE, 2 * u64::from(PIECE), [0]);
+    let a = picker.add_peer(Holds::All);
+    let t = Instant::now();
+    let first = picker.next(a, t).unwrap();
+    // a rejects with `NotHave`: not asked for piece 0 again, so nothing.
+    picker.rejected(a, first);
+    picker.lacks(a, 0);
+    assert_eq!(picker.next(a, t), None);
+    assert!(!picker.wants(&Holds::These(vec![false, true])));
+    // This node's piece 1 no longer matches on disk: fetched again.
+    picker.lost(1);
+    assert_eq!(picker.have(), [false, false]);
+    assert_eq!(picker.next(a, t).unwrap().piece, 1);
+}

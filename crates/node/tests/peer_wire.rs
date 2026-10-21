@@ -14,9 +14,10 @@ use iroh_blobs::Hash;
 use iroh_docs::NamespaceId;
 use sync_node::index::FileMeta;
 use sync_node::peer_wire::{
-    self, Block, Handshake, Message, Refusal, Why, Wire, BLOCK_LENGTH, MAX_BLOCK_LENGTH,
+    self, holds, Block, Handshake, Message, Refusal, Why, Wire, BLOCK_LENGTH, MAX_BLOCK_LENGTH,
 };
-use sync_node::pieces::MIN_PIECE_LENGTH;
+use sync_node::picker::Holds;
+use sync_node::pieces::{staging_path, MIN_PIECE_LENGTH};
 use sync_node::{Config, Network, Node};
 
 const INTERVAL: Duration = Duration::from_millis(200);
@@ -79,6 +80,22 @@ async fn unchoked(conn: &Connection, handshake: &Handshake) -> Wire {
     wire
 }
 
+/// Joins the swarm as a leecher with nothing, whatever the other end has,
+/// and is unchoked.
+async fn unchoked_by(conn: &Connection, handshake: &Handshake) -> Wire {
+    let (mut wire, answer) = Wire::open(conn, handshake).await.unwrap();
+    assert!(!matches!(answer, Message::Refused(_)), "{answer:?}");
+    wire.send(&Message::HaveNone).await.unwrap();
+    wire.send(&Message::Interested).await.unwrap();
+    loop {
+        match next(&mut wire).await.0 {
+            Message::Unchoke => return wire,
+            Message::Have(_) => continue,
+            other => panic!("not unchoked: {other:?}"),
+        }
+    }
+}
+
 async fn next(wire: &mut Wire) -> (Message, Vec<u8>) {
     tokio::time::timeout(TIMEOUT, wire.recv())
         .await
@@ -87,10 +104,15 @@ async fn next(wire: &mut Wire) -> (Message, Vec<u8>) {
         .expect("stream finished")
 }
 
-/// Requests `block`: its bytes, or why not.
+/// Requests `block`: its bytes, or why not. A leecher's `Have`s meanwhile
+/// are skipped.
 async fn ask(wire: &mut Wire, block: Block) -> Result<Vec<u8>, Why> {
     wire.send(&Message::Request(block)).await.unwrap();
-    match next(wire).await {
+    let mut answer = next(wire).await;
+    while let (Message::Have(_), _) = answer {
+        answer = next(wire).await;
+    }
+    match answer {
         (Message::Piece(got), data) => {
             assert_eq!(got, block);
             Ok(data)
@@ -281,8 +303,9 @@ async fn a_seeder_serves_what_its_index_describes() {
         entry(&a, id, "data.bin").await.unwrap().content == Some(Hash::new(&edited))
     })
     .await;
-    // The old swarm's requests now fail at once: its version is gone.
-    assert_eq!(ask(&mut wire, first).await, Err(Why::Changed));
+    // The old swarm's requests now fail at once: a no longer has its
+    // version (neither in its index nor downloading it).
+    assert_eq!(ask(&mut wire, first).await, Err(Why::NotHave));
     let new = handshake(id, "data.bin", Hash::new(&edited));
     let mut wire = unchoked(&conn, &new).await;
     assert_eq!(
@@ -379,6 +402,104 @@ async fn garbage_closes_the_stream_not_the_connection() {
 
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
+}
+
+/// A leecher serves the pieces its download has verified, from its staging
+/// file; one that no longer matches there is rejected, and no longer in its
+/// bitfield.
+#[tokio::test]
+async fn a_leecher_serves_from_its_staging_file() {
+    let book = MemoryLookup::new();
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (a, b, c) = (
+        spawn(dirs[0].path(), &book).await,
+        spawn(dirs[1].path(), &book).await,
+        spawn(dirs[2].path(), &book).await,
+    );
+    a.create_group().await.unwrap();
+    for node in [&b, &c] {
+        node.join(&a.create_invite(HOUR, None).unwrap())
+            .await
+            .unwrap();
+    }
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let rb = roots[1].path().canonicalize().unwrap();
+    const SIZE: usize = 64 << 20;
+    let content = data(SIZE);
+    fs::write(roots[0].path().join("big.bin"), &content).unwrap();
+    let id = a.add_folder("docs", roots[0].path()).await.unwrap();
+    eventually("a to index big.bin", || async {
+        entry(&a, id, "big.bin").await.is_some()
+    })
+    .await;
+    for (node, root) in [(&b, rb.as_path()), (&c, roots[2].path())] {
+        eventually("the folder to be listed", || async {
+            node.group_folders()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(f, _)| *f == id)
+        })
+        .await;
+        node.add_folder("docs", root).await.unwrap();
+    }
+    let meta = entry(&a, id, "big.bin").await.unwrap();
+    let hash = meta.content.unwrap();
+    // b has part of the file when its only seeder goes.
+    eventually("b to be downloading", || async {
+        b.fetched().get(&a.id()).copied().unwrap_or(0) > 2 << 20
+    })
+    .await;
+    a.shutdown().await.unwrap();
+
+    let swarm = handshake(id, "big.bin", hash);
+    let conn = c.endpoint().connect(b.id(), peer_wire::ALPN).await.unwrap();
+    // b answers as a leecher once it lists c as keeping the folder.
+    let start = Instant::now();
+    let answer_ = loop {
+        let got = answer(&conn, &swarm).await;
+        if matches!(got, Message::Bitfield(_)) {
+            break got;
+        }
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "b never answered as a leecher: {got:?}"
+        );
+        tokio::time::sleep(INTERVAL / 4).await;
+    };
+    let count = meta.pieces.len() as u32;
+    let Some(Holds::These(have)) = holds(&answer_, count) else {
+        panic!("not a bitfield: {answer_:?}");
+    };
+    let held: Vec<u32> = (0..count).filter(|i| have[*i as usize]).collect();
+    assert!(!held.is_empty() && held.len() < count as usize);
+    let (good, bad) = (held[0], held[held.len() - 1]);
+    assert_ne!(good, bad);
+
+    // A verified piece is served, and matches.
+    let mut wire = unchoked_by(&conn, &swarm).await;
+    let got = ask_piece(&mut wire, &meta, good).await;
+    assert_eq!(Hash::new(&got), meta.pieces[good as usize]);
+
+    // A piece that no longer matches in the staging file is rejected.
+    let staging = staging_path(&rb, "big.bin", hash);
+    let file = fs::File::options().write(true).open(&staging).unwrap();
+    let at = u64::from(bad) * u64::from(meta.piece_length);
+    std::os::unix::fs::FileExt::write_all_at(&file, b"not the piece", at).unwrap();
+    let first = Block {
+        piece: bad,
+        begin: 0,
+        length: BLOCK_LENGTH,
+    };
+    assert_eq!(ask(&mut wire, first).await, Err(Why::NotHave));
+    let again = answer(&conn, &swarm).await;
+    let Some(Holds::These(have)) = holds(&again, count) else {
+        panic!("not a bitfield: {again:?}");
+    };
+    assert!(!have[bad as usize] && have[good as usize]);
+
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
 }
 
 #[tokio::test]
