@@ -1007,3 +1007,68 @@ async fn leechers_share_a_new_file() {
         node.shutdown().await.unwrap();
     }
 }
+
+/// With more interested nodes than upload slots, the author's choker
+/// unchokes at most `SLOTS` + 1 at a time, and every one at some time (the
+/// optimistic unchoke rotates; others finish). Seven nodes: a load test.
+#[tokio::test]
+#[ignore = "load test: run with `just stress`"]
+async fn the_choker_shares_slots_among_many_leechers() {
+    const LEECHERS: usize = 6;
+    let dirs: Vec<_> = (0..=LEECHERS)
+        .map(|_| tempfile::tempdir().unwrap())
+        .collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let roots: Vec<_> = (0..=LEECHERS)
+        .map(|_| tempfile::tempdir().unwrap())
+        .collect();
+    const SIZE: usize = 32 << 20;
+    let data: Vec<u8> = (0..SIZE).map(|i| (i * 13 + i / 3089) as u8).collect();
+    let a = &nodes[0];
+    write(roots[0].path(), "big.bin", &data);
+    let id = add_folder(a, "docs", roots[0].path(), None).await;
+    let leechers = &nodes[1..];
+    // One after another: once the first sees the folder listed, the others
+    // add it within moments.
+    for (node, root) in leechers.iter().zip(&roots[1..]) {
+        add_folder(node, "docs", root.path(), Some(id)).await;
+    }
+
+    let slots = sync_node::choker::SLOTS + 1;
+    let (mut most, mut ever) = (0, std::collections::HashSet::new());
+    let start = Instant::now();
+    loop {
+        let unchoked = a.unchoked();
+        assert!(
+            unchoked.len() <= slots,
+            "{} unchoked at once",
+            unchoked.len()
+        );
+        most = most.max(unchoked.len());
+        ever.extend(unchoked);
+        let done = roots[1..]
+            .iter()
+            .all(|root| read(root.path(), "big.bin").is_some_and(|got| got == data));
+        if done {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(180),
+            "the leechers didn't finish"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(most, slots, "the slots were never full");
+    for node in leechers {
+        assert!(
+            ever.contains(&node.id()),
+            "{} was never unchoked",
+            node.id().fmt_short()
+        );
+    }
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}

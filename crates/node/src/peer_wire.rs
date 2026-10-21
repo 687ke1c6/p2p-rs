@@ -307,6 +307,19 @@ struct Verified {
 }
 
 impl PeerWireProtocol {
+    /// The nodes the choker has unchoked now.
+    pub(crate) fn unchoked(&self) -> Vec<EndpointId> {
+        let state = self.uploads.0.lock().unwrap();
+        let mut out: Vec<EndpointId> = state
+            .peers
+            .iter()
+            .filter(|(_, p)| *p.unchoked.borrow())
+            .map(|(id, _)| *id)
+            .collect();
+        out.sort();
+        out
+    }
+
     pub(crate) fn new(folders: Folders, direct_only: bool) -> Self {
         let uploads = Uploads::default();
         Self {

@@ -95,6 +95,8 @@ pub struct Node {
     view: View,
     names: Names,
     folders: Folders,
+    /// The peer-wire server, for its choker's state.
+    wire: PeerWireProtocol,
     monitor: Mutex<Option<JoinHandle<()>>>,
     router: Router,
     blobs: FsStore,
@@ -172,12 +174,10 @@ impl Node {
             config.direct_only,
             names.clone(),
         );
+        let wire = PeerWireProtocol::new(folders.clone(), config.direct_only);
         let router = Router::builder(endpoint)
             .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
-            .accept(
-                peer_wire::ALPN,
-                PeerWireProtocol::new(folders.clone(), config.direct_only),
-            )
+            .accept(peer_wire::ALPN, wire.clone())
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(iroh_docs::ALPN, docs.clone())
             .accept(MEMBERS_ALPN, MembersProtocol(gate.clone()))
@@ -202,6 +202,7 @@ impl Node {
             view: View::new(config.presence_interval),
             names,
             folders,
+            wire,
             config,
             monitor: Mutex::new(None),
             router,
@@ -329,6 +330,12 @@ impl Node {
     /// in [`peers`](Self::peers), no protocol overhead or other traffic.
     pub fn fetched(&self) -> HashMap<EndpointId, u64> {
         self.folders.fetched()
+    }
+
+    /// The nodes this node's choker has unchoked now: it uploads file data
+    /// to them, over all swarms.
+    pub fn unchoked(&self) -> Vec<EndpointId> {
+        self.wire.unchoked()
     }
 
     /// This node's connections and traffic to each node it has connected

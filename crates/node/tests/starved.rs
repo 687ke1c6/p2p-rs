@@ -89,6 +89,9 @@ async fn a_starved_node_reads_every_record() {
 #[derive(Debug)]
 #[allow(dead_code, reason = "read through Debug, in the assertion message")]
 struct Stuck {
+    /// The two nodes, to find them in the log (see `STARVED_LOG`).
+    a: String,
+    b: String,
     listed: bool,
     /// b's merged view has the path: a's entry and its metadata arrived.
     in_view: bool,
@@ -256,6 +259,8 @@ async fn b_fetches_the_file(seed: usize) -> Option<Stuck> {
             })
         });
         stuck = Some(Stuck {
+            a: a.id().fmt_short().to_string(),
+            b: b.id().fmt_short().to_string(),
             listed,
             in_view,
             staged,
@@ -275,6 +280,15 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(90);
 #[tokio::test]
 #[ignore = "load test: run with `just stress`"]
 async fn a_starved_node_fetches_every_file() {
+    // `STARVED_LOG=<file>`: the nodes' debug log, to see why a fetch stalled.
+    if let Some(path) = std::env::var_os("STARVED_LOG") {
+        let file = std::fs::File::create(path).unwrap();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("sync_node::peer_wire=debug,sync_node::content=debug")
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .try_init();
+    }
     tokio::spawn(async {
         loop {
             std::thread::sleep(STALL);

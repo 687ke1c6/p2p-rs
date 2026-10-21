@@ -153,11 +153,19 @@ Not BitTorrent, but step 7's load test can't pass without it.
 #### Step 7: Load
 
 * [ ] `just stress`: `a_starved_node_fetches_every_file` and `a_starved_node_reads_every_record` pass 5 runs in a row.
-* [ ] Compare with the block-protocol baseline (0, 2, 2, 2 of 8 stuck, 2026-10-20).
-* [ ] The choker with more interested nodes than slots, on real nodes: a seeds a large file to 6 others at once; at most 5 are unchoked at a time, and each is unchoked at some time.
-* [ ] Split each stuck fetch by its cause with the probe in `tests/starved.rs` (`Stuck::timeline`, `view_after`): doc layer (listing, sync, metadata blob) or peer wire. If the doc layer still causes stuck fetches, the developer decides on ADR 0003 (own index exchange for folder docs, Syncthing-style; folder index first, membership after, as its own plan).
-* [ ] Constants that are guesses (block length, queue limits, slots, rounds, timeouts) are written in the notes with what the load tests showed.
+* [x] Compare with the block-protocol baseline (0, 2, 2, 2 of 8 stuck, 2026-10-20).
+* [x] The choker with more interested nodes than slots, on real nodes: a seeds a large file to 6 others at once; at most 5 are unchoked at a time, and each is unchoked at some time.
+* [x] Split each stuck fetch by its cause with the probe in `tests/starved.rs` (`Stuck::timeline`, `view_after`): doc layer (listing, sync, metadata blob) or peer wire. If the doc layer still causes stuck fetches, the developer decides on ADR 0003 (own index exchange for folder docs, Syncthing-style; folder index first, membership after, as its own plan).
+* [x] Constants that are guesses (block length, queue limits, slots, rounds, timeouts) are written in the notes with what the load tests showed.
 * **Done when:** no fetch is stuck under load.
+* **Result (2026-10-21): not done. The peer wire never stalled; every stuck fetch lost its time in the doc layer.** Waiting on the developer's decision on ADR 0003 (below).
+  * `a_starved_node_reads_every_record`: passed 10 runs of 10.
+  * `a_starved_node_fetches_every_file`, stuck of 8 per run: first set 0, 0, 0, 8, 0 (the 8: every phase slow, the records test too; likely the editor compiling while Rust files were saved, not proved), second set (no file saved) 4, 1, 4, 3, 3; then 0, 0, 2. Baseline (block protocol): 0, 2, 2, 2, earlier 1, 4, 5, 0, 2, 2, 0. About the same count; the cause changed.
+  * Cause of the 17 stuck fetches in the last 6 runs (probe timelines; `STARVED_LOG=<file>` adds the peer-wire log): in 15, b saw the folder listed late (the membership doc), keeping it 35–84 s into the 90 s budget; in 2, b kept it early but the entry's metadata blob took 16–33 s to reach the view. In all, the download then ran without stopping (0.5–3.4 MiB at 128–165 KiB/s, the runtime blocked 86 % of the time) until the test ended. None had a download that stopped.
+  * The choker with 6 leechers on real nodes (`the_choker_shares_slots_among_many_leechers`, load test): at most 5 unchoked at a time, the slots full, each leecher unchoked at some time.
+  * Constants: block 16 KiB, queue 4–250 (rate × 2 s), `REJOIN` 2 s, `GIVE_UP` 30 s, slots 4 + 1, rounds 10 s / 30 s, `SNUB_AFTER` 60 s. Under load none showed as a cause: no download gave up, none was snubbed into a stall. They stay guesses for real links (step 8, the Pi).
+  * Rule for the load test: don't save Rust files while it runs (the editor compiles them).
+* **Decision for the developer (as planned above): ADR 0003**, an own index exchange for folder docs (Syncthing-style), as its own plan after this one. The evidence: under load the doc layer (membership listing, doc sync, metadata blobs) takes most of a fetch's time, and the peer wire none of its failures.
 
 #### Step 8: Cleanup & Hand-Back
 

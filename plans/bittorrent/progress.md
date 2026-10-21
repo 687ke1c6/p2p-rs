@@ -12,8 +12,9 @@ Handoff for the next session. Read this first, then [plan.md](plan.md) and [expe
 * Step 3 done, committed (`ae38050`).
 * Step 4 done, committed (`450e8fb`).
 * Step 5 done, committed.
-* Step 6 done (uncommitted): `choker.rs`, choking per peer node, request queues from rate, snubbing; step 5's test limit changed (developer's decision, plan step 6). `just check` passes twice (91 tests).
-* **Next: step 7** (load).
+* Step 6 done (uncommitted unless the developer has since committed): `choker.rs`, choking per peer node, request queues from rate, snubbing; step 5's test limit changed (developer's decision, plan step 6).
+* Step 7 measured (uncommitted: `Node::unchoked`, the 6-leecher choker load test, `STARVED_LOG` in `tests/starved.rs`). Not done: stuck fetches remain, all from the doc layer (plan step 7 "Result"). **Waiting on the developer: ADR 0003, yes or no.** Then step 8.
+* Don't save Rust files while `just stress` runs: the editor compiles them and the results change.
 * `just stress` runs the load tests in `tests/starved.rs`. Each run takes about 2 min and varies a lot (0 to 8 stuck of 8); judge on 5 runs, never on one.
 
 ## Decisions 2026-10-21
