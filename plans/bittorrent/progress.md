@@ -13,7 +13,8 @@ Handoff for the next session. Read this first, then [plan.md](plan.md) and [expe
 * Step 4 done, committed (`450e8fb`).
 * Step 5 done, committed.
 * Step 6 done (uncommitted unless the developer has since committed): `choker.rs`, choking per peer node, request queues from rate, snubbing; step 5's test limit changed (developer's decision, plan step 6).
-* Step 7 measured (uncommitted: `Node::unchoked`, the 6-leecher choker load test, `STARVED_LOG` in `tests/starved.rs`). Not done: stuck fetches remain, all from the doc layer (plan step 7 "Result"). **Waiting on the developer: ADR 0003, yes or no.** Then step 8.
+* Step 7 measured (uncommitted: `Node::unchoked`, the 6-leecher choker load test, `STARVED_LOG` in `tests/starved.rs`). Done with a hand-off: stuck fetches remain, all from the doc layer (plan step 7 "Result"). The developer decided for ADR 0003 (proposed; designed together after this plan).
+* Step 8: `spec.md` as built, sync-plan step 8 updated, ADR 0003 written (proposed). **Open: the developer's Pi checks** (armv7 build, sync large files Pi ↔ dev container, disk use, the author's upload ratio on real links). Then the plan is done and the sync plan resumes at step 8, or ADR 0003's plan comes first (the developer: "work on this together after this plan").
 * Don't save Rust files while `just stress` runs: the editor compiles them and the results change.
 * `just stress` runs the load tests in `tests/starved.rs`. Each run takes about 2 min and varies a lot (0 to 8 stuck of 8); judge on 5 runs, never on one.
 
