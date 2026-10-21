@@ -31,7 +31,7 @@ use crate::invite::{self, InviteTicket};
 use crate::join::{self, JoinProtocol, JoinReply, Ticket};
 use crate::member::{self, Names};
 use crate::monitor::Monitor;
-use crate::peer_wire::{self, PeerWireProtocol, PieceRequestProtocol};
+use crate::peer_wire::{self, PeerWireProtocol};
 use crate::peers::{PeerSnapshot, Peers};
 use crate::presence::{View, PRESENCE_INTERVAL};
 use crate::record::{validate_chain, GroupId, Record, SignedRecord, MEMBERS_PREFIX};
@@ -70,6 +70,9 @@ pub struct Config {
     /// each node adds itself to when it starts, as n0's DNS does outside
     /// tests. Lets a node reach another by ID alone, whenever it started.
     pub address_book: Option<MemoryLookup>,
+    /// `--direct-only`: file contents move only over direct paths, never
+    /// through a relay (for testing; see `plans/bittorrent/expectations.md`).
+    pub direct_only: bool,
 }
 
 impl Config {
@@ -79,6 +82,7 @@ impl Config {
             presence_interval: PRESENCE_INTERVAL,
             debounce: DEBOUNCE,
             address_book: None,
+            direct_only: false,
         }
     }
 }
@@ -165,14 +169,14 @@ impl Node {
             blobs.clone(),
             &endpoint,
             config.debounce,
+            config.direct_only,
             names.clone(),
         );
         let router = Router::builder(endpoint)
             .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
-            .accept(peer_wire::ALPN, PeerWireProtocol::new(folders.clone()))
             .accept(
-                peer_wire::PIECE_REQUEST_ALPN,
-                PieceRequestProtocol::new(folders.clone()),
+                peer_wire::ALPN,
+                PeerWireProtocol::new(folders.clone(), config.direct_only),
             )
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(iroh_docs::ALPN, docs.clone())

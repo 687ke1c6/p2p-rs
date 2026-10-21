@@ -9,8 +9,9 @@ Handoff for the next session. Read this first, then [plan.md](plan.md) and [expe
 * Step 1 done: `blocks.rs` split into `pieces.rs` and `peer_wire.rs`, all renames, tests renamed, entry encoding fixture `the_entry_encoding_is_unchanged`. `just check` passes.
 * Step 2 done in code: `Folders::retry_sync` (doc sync again each presence interval with online peers whose last sync failed), metadata blob fetched on entry arrival with retries (`META_FETCH_TRIES`), probe in `tests/starved.rs`. The index fault is gone; the 30 s latency criterion is not met (doc layer slow under load, see plan step 2 "Result"). Step 7 splits stuck fetches by cause. `just check` passes.
 * Steps 1 and 2 committed (`658a2f4`, `9a211f3`).
-* Step 3 done (uncommitted): the new peer wire, seeder side, beside the old protocol (`PIECE_REQUEST_ALPN`). `tests/peer_wire.rs` rewritten for it (3 tests). `just check` passes (77 tests).
-* **Next: step 4** (download from seeders; removes the old protocol).
+* Step 3 done, committed (`ae38050`).
+* Step 4 done (uncommitted): `picker.rs`, `Client::download`, old protocol removed, `--direct-only`, superseded staging removed. `just check` passes twice (82 tests). Not load-tested yet (step 7).
+* **Next: step 5** (leechers serve from their staging file).
 * `just stress` runs the load tests in `tests/starved.rs`. Each run takes about 2 min and varies a lot (0 to 8 stuck of 8); judge on 5 runs, never on one.
 
 ## Decisions 2026-10-21

@@ -37,7 +37,11 @@ enum Command {
     /// Print this node's ID, creating its key if there isn't one.
     Id,
     /// Run the node until Ctrl-C, creating its key if there isn't one.
-    Run,
+    Run {
+        /// Move file contents only over direct paths, never through a relay.
+        #[arg(long, env = "SYNC_NODE_DIRECT_ONLY")]
+        direct_only: bool,
+    },
     /// Found a new group with this node as its only member.
     Create,
     /// Manage invites to this node's group.
@@ -166,8 +170,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
     match command {
         Command::Id => println!("{}", key.public()),
-        Command::Run => {
-            let config = Config::new(Network::N0);
+        Command::Run { direct_only } => {
+            let config = Config {
+                direct_only,
+                ..Config::new(Network::N0)
+            };
             let node = Node::spawn_with(&config_dir, key, config).await?;
             tracing::info!("node {} running from {}", node.id(), config_dir.display());
             tokio::select! {

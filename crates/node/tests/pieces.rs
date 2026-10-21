@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use iroh::SecretKey;
 use iroh_blobs::Hash;
 use sync_node::index::FileMeta;
-use sync_node::peer_wire::{Schedule, OVERDUE, WINDOW};
 use sync_node::pieces::{
     hash_reader, piece_length, staging_path, Hasher, Staged, MAX_PIECE_LENGTH, MIN_PIECE_LENGTH,
 };
@@ -125,6 +124,7 @@ async fn the_index_carries_piece_lists() {
         presence_interval: Duration::from_millis(200),
         debounce: Duration::from_millis(100),
         address_book: None,
+        direct_only: false,
     };
     let node = Node::spawn_with(config_dir.path(), SecretKey::generate(), config)
         .await
@@ -211,107 +211,4 @@ fn staging_copies_only_pieces_that_match() {
     let staged = Staged::open(&temp, &meta, root, &[]).unwrap();
     assert!(staged.is_complete());
     assert_eq!((staged.copied, staged.to_fetch), (0, 0));
-}
-
-/// Every piece `p` is given at `now` until it has no room or nothing is
-/// left.
-fn take_all(schedule: &mut Schedule, p: usize, now: Instant) -> Vec<u32> {
-    std::iter::from_fn(|| schedule.next(p, now)).collect()
-}
-
-const MS: Duration = Duration::from_millis(1);
-
-#[test]
-fn peers_draw_from_one_queue_up_to_the_window() {
-    let t = Instant::now();
-    let window = WINDOW as u32;
-    let mut schedule = Schedule::new(0..2 * window + 3, 2);
-    assert_eq!(
-        take_all(&mut schedule, 0, t),
-        (0..window).collect::<Vec<_>>()
-    );
-    let second = take_all(&mut schedule, 1, t);
-    assert_eq!(second, (window..2 * window).collect::<Vec<_>>());
-    // A peer that delivers gets the next piece.
-    assert!(schedule.delivered(0, 0, t + MS).is_empty());
-    assert_eq!(schedule.next(0, t + MS), Some(2 * window));
-}
-
-#[test]
-fn the_endgame_asks_again_only_for_overdue_pieces() {
-    let t = Instant::now();
-    let mut schedule = Schedule::new(0..4, 3);
-    assert_eq!(take_all(&mut schedule, 0, t), [0, 1, 2, 3]);
-    // Requests typically take 10 ms.
-    assert!(schedule.delivered(0, 0, t + 10 * MS).is_empty());
-    // Nothing left in the queue, and nothing overdue yet.
-    assert_eq!(schedule.next(1, t + 15 * MS), None);
-    let due = t + 10 * MS * OVERDUE;
-    assert_eq!(schedule.next_overdue(t + 15 * MS), Some(due));
-    // Overdue: peer 1 is asked too, and no piece goes to a third.
-    let late = due + MS;
-    assert_eq!(take_all(&mut schedule, 1, late), [1, 2, 3]);
-    assert_eq!(schedule.next(2, late), None);
-    assert_eq!(schedule.next_overdue(late), None);
-    // The first to send a piece wins; the other's request can stop.
-    assert_eq!(schedule.delivered(1, 1, late + MS), [0]);
-    assert!(!schedule.is_asked(0, 1));
-    assert_eq!(schedule.delivered(0, 2, late + MS), [1]);
-    assert!(!schedule.is_complete());
-    assert_eq!(schedule.delivered(1, 3, late + MS), [0]);
-    assert!(schedule.is_complete());
-}
-
-#[test]
-fn without_a_delivery_nothing_is_overdue() {
-    let t = Instant::now();
-    let mut schedule = Schedule::new(0..2, 2);
-    take_all(&mut schedule, 0, t);
-    let later = t + Duration::from_secs(3600);
-    assert_eq!(schedule.next(1, later), None);
-    assert_eq!(schedule.next_overdue(later), None);
-}
-
-#[test]
-fn a_dropped_peer_s_pieces_go_to_the_others() {
-    let t = Instant::now();
-    let mut schedule = Schedule::new(0..4, 2);
-    assert_eq!(take_all(&mut schedule, 0, t), [0, 1, 2, 3]);
-    assert!(schedule.delivered(0, 0, t + MS).is_empty());
-    assert_eq!(schedule.next(1, t + 10 * MS), Some(1));
-    // Piece 1 stays with 1; 2 and 3 go back to the queue, in order.
-    assert_eq!(schedule.drop_peer(0), [1, 2, 3]);
-    assert!(schedule.is_asked(1, 1));
-    assert_eq!(take_all(&mut schedule, 1, t + 10 * MS), [2, 3]);
-    for index in 1..4 {
-        assert!(schedule.delivered(1, index, t + 20 * MS).is_empty());
-    }
-    assert!(schedule.is_complete());
-}
-
-#[test]
-fn a_returned_piece_is_asked_for_again_first() {
-    let t = Instant::now();
-    let mut schedule = Schedule::new(0..WINDOW as u32 + 1, 1);
-    take_all(&mut schedule, 0, t);
-    schedule.returned(0, 3);
-    assert!(!schedule.is_asked(0, 3));
-    assert_eq!(schedule.next(0, t), Some(3));
-    // Giving back a piece that isn't asked for changes nothing.
-    schedule.returned(0, 3);
-    schedule.returned(0, 3);
-    assert_eq!(schedule.next(0, t), Some(3));
-}
-
-#[test]
-fn a_peer_added_late_takes_what_is_left() {
-    let t = Instant::now();
-    let mut schedule = Schedule::new(0..WINDOW as u32 + 2, 0);
-    assert_eq!(schedule.add_peer(), 0);
-    take_all(&mut schedule, 0, t);
-    assert_eq!(schedule.add_peer(), 1);
-    assert_eq!(
-        take_all(&mut schedule, 1, t),
-        [WINDOW as u32, WINDOW as u32 + 1]
-    );
 }

@@ -375,13 +375,14 @@ impl Folders {
         blobs: FsStore,
         endpoint: &Endpoint,
         debounce: Duration,
+        direct_only: bool,
         names: Names,
     ) -> Self {
         Self(Arc::new(Inner {
             config_dir: config_dir.to_owned(),
             docs,
             downloader: blobs.downloader(endpoint),
-            client: Client::new(endpoint.clone()),
+            client: Client::new(endpoint.clone(), direct_only),
             blobs,
             me: endpoint.id(),
             debounce,
@@ -752,6 +753,7 @@ impl Folders {
             docs: self.0.docs.clone(),
             blobs: self.0.blobs.clone(),
             client: self.0.client.clone(),
+            folders: self.clone(),
             root: config.path.clone(),
             entries,
             changed,
@@ -1005,6 +1007,17 @@ impl Folders {
             entries: running.entries.clone(),
             apply: running.apply.clone(),
         })
+    }
+
+    /// The other nodes that keep folder `id`, as far as this node knows.
+    pub(crate) fn folder_peers(&self, id: NamespaceId) -> Vec<EndpointId> {
+        self.0
+            .running
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|r| r.peers.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// The folders this node keeps, by name.

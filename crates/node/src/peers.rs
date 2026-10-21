@@ -430,6 +430,14 @@ impl Peers {
     }
 }
 
+/// Whether `conn` has a selected path that isn't through a relay (as
+/// `status` counts it: see [`LinkKind::of`]).
+pub(crate) fn is_direct(conn: &Connection) -> bool {
+    conn.paths()
+        .iter()
+        .any(|path| path.is_selected() && LinkKind::of(path.remote_addr()) == LinkKind::Direct)
+}
+
 fn selected_path(conn: &Connection) -> Option<String> {
     conn.paths()
         .iter()

@@ -23,11 +23,22 @@ const HOUR: Duration = Duration::from_secs(3600);
 
 /// Starts a node with content transfer on.
 async fn spawn(dir: &Path, key: SecretKey, book: &MemoryLookup) -> Node {
+    spawn_direct_only(dir, key, book, false).await
+}
+
+/// Starts a node, with `--direct-only` if `direct_only`.
+async fn spawn_direct_only(
+    dir: &Path,
+    key: SecretKey,
+    book: &MemoryLookup,
+    direct_only: bool,
+) -> Node {
     let config = Config {
         network: Network::Local,
         presence_interval: INTERVAL,
         debounce: DEBOUNCE,
         address_book: Some(book.clone()),
+        direct_only,
     };
     Node::spawn_with(dir, key, config).await.unwrap()
 }
@@ -118,9 +129,19 @@ fn received(node: &Node, peer: &Node) -> u64 {
 
 /// A group of a node per directory.
 async fn group(dirs: &[tempfile::TempDir], book: &MemoryLookup) -> Vec<Node> {
+    group_direct_only(dirs, book, false).await
+}
+
+/// A group of a node per directory, all with `--direct-only` if
+/// `direct_only`.
+async fn group_direct_only(
+    dirs: &[tempfile::TempDir],
+    book: &MemoryLookup,
+    direct_only: bool,
+) -> Vec<Node> {
     let mut nodes = Vec::new();
     for dir in dirs {
-        nodes.push(spawn(dir.path(), SecretKey::generate(), book).await);
+        nodes.push(spawn_direct_only(dir.path(), SecretKey::generate(), book, direct_only).await);
     }
     nodes[0].create_group().await.unwrap();
     for node in &nodes[1..] {
@@ -857,6 +878,87 @@ async fn pieces_that_dont_match_are_refused() {
     assert_eq!(fetched(b, a), 0);
     let received = received(b, a);
     assert!(received < SIZE as u64 / 4, "received {received} bytes");
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// The staging files under `root`.
+fn staging_files(root: &Path) -> Vec<PathBuf> {
+    fs::read_dir(root)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".sync-node-tmp-"))
+        })
+        .collect()
+}
+
+/// A newer version that wins during a download stops it: its staging file
+/// is removed, and the newer version is fetched instead.
+#[tokio::test]
+async fn a_newer_version_stops_a_running_fetch() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ra, rb) = (pa.path(), pb.path().canonicalize().unwrap());
+    const SIZE: usize = 32 << 20;
+    let old: Vec<u8> = (0..SIZE).map(|i| (i * 5 + i / 3001) as u8).collect();
+    // Shares no piece with the old one, so nothing is copied locally.
+    let new: Vec<u8> = (0..SIZE).map(|i| (i * 7 + i / 2003 + 1) as u8).collect();
+    write(ra, "big.bin", &old);
+    let id = add_folder(a, "docs", ra, None).await;
+    add_folder(b, "docs", &rb, Some(id)).await;
+    eventually("b to be fetching the old version", || async {
+        fetched(b, a) > 1 << 20
+    })
+    .await;
+
+    write(ra, "big.bin", &new);
+    eventually("b to have the new version", || async {
+        read(&rb, "big.bin").is_some_and(|got| got == new)
+    })
+    .await;
+    // The old version's download stopped part way, and left nothing.
+    assert!(
+        fetched(b, a) < 2 * SIZE as u64,
+        "fetched {} bytes: the old version finished",
+        fetched(b, a)
+    );
+    assert!(!staging_path(&rb, "big.bin", Hash::new(&old)).exists());
+    eventually("no staging file to be left", || async {
+        staging_files(&rb).is_empty()
+    })
+    .await;
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// With `--direct-only`, files still move over direct paths (on one
+/// machine, every path is direct).
+#[tokio::test]
+async fn direct_only_nodes_converge() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group_direct_only(&dirs, &book, true).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let roots: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let data: Vec<u8> = (0..1usize << 20).map(|i| (i * 3 + i / 977) as u8).collect();
+    write(roots[0].path(), "data.bin", &data);
+    let id = add_folder(a, "docs", roots[0].path(), None).await;
+    add_folder(b, "docs", roots[1].path(), Some(id)).await;
+    eventually("b to fetch the file", || async {
+        read(roots[1].path(), "data.bin").is_some_and(|got| got == data)
+    })
+    .await;
+    assert_eq!(fetched(b, a), data.len() as u64);
 
     for node in nodes {
         node.shutdown().await.unwrap();

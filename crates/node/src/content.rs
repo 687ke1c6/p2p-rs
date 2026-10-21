@@ -8,8 +8,8 @@
 //! * a file this node is missing or holds an older version of is built
 //!   piece by piece: from what an earlier try left, then from this node's
 //!   own files (the old version at that path first, then any other file
-//!   with the same pieces), and the rest fetched over the peer wire
-//!   from the nodes holding it (`peer_wire::Client`). Every piece is checked
+//!   with the same pieces), and the rest downloaded over the peer wire
+//!   from the version's swarm (`peer_wire::Client`). Every piece is checked
 //!   against the piece hashes. Then the file is placed on disk;
 //! * a file that was deleted is deleted here too;
 //! * a delete and a new file with the same content, where this node has
@@ -35,8 +35,9 @@ use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::Hash;
 use iroh_docs::protocol::Docs;
 use iroh_docs::NamespaceId;
-use tokio::sync::{mpsc, oneshot, watch, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
+use crate::folder::Folders;
 use crate::index::{self, safe_path, Apply, Entries, FileMeta};
 use crate::member::Names;
 use crate::peer_wire::Client;
@@ -70,6 +71,8 @@ pub(crate) struct Content {
     pub blobs: FsStore,
     /// Fetches pieces from other nodes.
     pub client: Client,
+    /// The nodes that keep the folder, for each download's swarm.
+    pub folders: Folders,
     /// The folder root, where fetched files are staged.
     pub root: PathBuf,
     /// This node's entries, to find local copies of content.
@@ -128,6 +131,10 @@ struct Memory {
     /// not on every change to the folder, which would ask a node that sent
     /// bad pieces again and again.
     retry_at: HashMap<String, Instant>,
+    /// The staging files this task has fetched into: one whose version is
+    /// no longer wanted is removed at the next pass, not after
+    /// [`STALE_STAGING`].
+    staging: HashSet<PathBuf>,
 }
 
 impl Content {
@@ -164,7 +171,8 @@ impl Content {
         let mut waiting = HashMap::new();
         let mut ready = Vec::new();
         let actions = self.plan(entries, &mut memory.refused);
-        self.remove_stale_staging(&actions).await;
+        self.remove_stale_staging(&actions, &mut memory.staging)
+            .await;
         for action in actions {
             // Either half of a rename whose other half may not have arrived
             // yet waits RENAME_GRACE.
@@ -200,12 +208,13 @@ impl Content {
     }
 
     /// Removes the staging files at the folder root that none of `actions`
-    /// will fetch into and that nothing has written to for
-    /// [`STALE_STAGING`]: left by a fetch of a version no longer wanted (a
-    /// newer one came, or the file was deleted). One for a version still
-    /// wanted stays, for the fetch to resume. Runs between passes' actions,
-    /// so no fetch is writing.
-    async fn remove_stale_staging(&self, actions: &[Action]) {
+    /// will fetch into: at once for those this task fetched into (in
+    /// `staging`), else once nothing has written to them for
+    /// [`STALE_STAGING`]. They were left by a fetch of a version no longer
+    /// wanted (a newer one came, or the file was deleted). One for a version
+    /// still wanted stays, for the fetch to resume. Runs between passes'
+    /// actions, so no fetch is writing.
+    async fn remove_stale_staging(&self, actions: &[Action], staging: &mut HashSet<PathBuf>) {
         let wanted: HashSet<PathBuf> = actions
             .iter()
             .filter_map(|action| match action {
@@ -216,9 +225,17 @@ impl Content {
                 _ => None,
             })
             .collect();
+        let superseded: Vec<PathBuf> = staging.difference(&wanted).cloned().collect();
+        staging.retain(|path| wanted.contains(path));
         let root = self.root.clone();
         let removed = tokio::task::spawn_blocking(move || {
             let mut removed = Vec::new();
+            for path in superseded {
+                // Gone already if the fetch completed and the file was placed.
+                if std::fs::remove_file(&path).is_ok() {
+                    removed.push(path);
+                }
+            }
             for entry in std::fs::read_dir(&root)?.flatten() {
                 let name = entry.file_name();
                 let staging = name.to_str().is_some_and(pieces::is_staging_name);
@@ -526,6 +543,7 @@ impl Content {
             return Ok(None);
         }
         let sources = self.sources(path, meta);
+        memory.staging.insert(temp.clone());
         let (staging, wanted, root) = (temp.clone(), meta.clone(), self.root.clone());
         let staged =
             tokio::task::spawn_blocking(move || Staged::open(&staging, &wanted, &root, &sources))
@@ -575,9 +593,12 @@ impl Content {
         Ok(None)
     }
 
-    /// Fetches what `staged` lacks from `peers`, and from nodes that come
-    /// to hold version `meta` of `path` meanwhile: the folder's doc is
-    /// watched during the fetch, and new peers join it.
+    /// Downloads what `staged` lacks over the peer wire, from the swarm of
+    /// version `meta` of `path`: `peers` (the nodes whose entry has it) and
+    /// every other node that keeps the folder, asked again during the
+    /// download (see [`Client::download`]). The folder's doc is watched
+    /// meanwhile: once another version of `path` wins (or it is deleted),
+    /// the download stops and its staging file is removed.
     async fn fetch_from(
         &self,
         path: &str,
@@ -586,10 +607,9 @@ impl Content {
         staged: Staged,
     ) -> anyhow::Result<bool> {
         let content = meta.content.expect("fetching a file with content");
-        let (offer, offered) = watch::channel(peers);
         // Whether the watch took a wake meant for `run`.
         let woken = AtomicBool::new(false);
-        let watch = async {
+        let superseded = async {
             loop {
                 self.changed.notified().await;
                 woken.store(true, Ordering::Relaxed);
@@ -601,30 +621,39 @@ impl Content {
                             continue;
                         }
                     };
-                let holding = per_node
-                    .values()
-                    .filter(|m| m.content == Some(content) && m.node != self.me)
-                    .map(|m| m.node);
-                offer.send_if_modified(|ids| {
-                    let mut grew = false;
-                    for id in holding {
-                        if !ids.contains(&id) {
-                            tracing::info!(
-                                "folder {}: fetching {path}: {} has it now",
-                                self.name,
-                                self.names.display(id)
-                            );
-                            ids.push(id);
-                            grew = true;
-                        }
+                let metas: Vec<FileMeta> = per_node.into_values().collect();
+                let winner = match merge(&metas) {
+                    Some(Outcome::File(winner) | Outcome::Conflict { winner, .. }) => {
+                        Some(winner.content)
                     }
-                    grew
-                });
+                    Some(Outcome::Deleted) | None => None,
+                };
+                if winner != Some(content) {
+                    return;
+                }
             }
         };
+        let swarm = || {
+            let mut nodes = self.folders.folder_peers(self.folder);
+            nodes.extend(peers.iter().copied());
+            nodes.sort();
+            nodes.dedup();
+            nodes
+        };
+        let download = self.client.download(self.folder, path, meta, staged, swarm);
         let fetched = tokio::select! {
-            fetched = self.client.fetch_file(self.folder, path, meta, offered, staged) => fetched,
-            never = watch => never,
+            fetched = download => fetched,
+            () = superseded => {
+                let temp = pieces::staging_path(&self.root, path, content);
+                tracing::info!(
+                    "folder {}: {path}: a newer version came; stopped fetching this one",
+                    self.name
+                );
+                if let Err(err) = tokio::fs::remove_file(&temp).await {
+                    tracing::debug!("folder {}: removing {}: {err}", self.name, temp.display());
+                }
+                Ok(false)
+            }
         };
         if woken.load(Ordering::Relaxed) {
             // Other changes may have come with it: let the next pass see them.

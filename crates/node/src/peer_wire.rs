@@ -11,96 +11,50 @@
 //! keep the folder, and only after reading them from disk and checking them
 //! against its entry: never a file being edited, never a path outside the
 //! folder.
-//!
-//! The old protocol, one piece per request on its own stream
-//! ([`PIECE_REQUEST_ALPN`], [`Client`], [`Schedule`]), still fetches until
-//! BitTorrent plan step 4 replaces it.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::HashMap;
 use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use iroh::endpoint::{Connection, ReadExactError, RecvStream, SendStream, VarInt};
+use iroh::endpoint::{
+    Connection, ReadExactError, RecvStream, SendStream, VarInt, WeakConnectionHandle,
+};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointId};
 use iroh_blobs::Hash;
 use iroh_docs::NamespaceId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{watch, Semaphore};
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use crate::folder::{Folders, Serving};
 use crate::index::{safe_path, Apply, FileMeta};
-use crate::pieces::{read_piece, span, Staged, MAX_PIECE_LENGTH};
+use crate::picker::{Complete, Holds, Picker};
+use crate::pieces::{read_piece, span, Staged};
 
-/// The old one-piece-per-request protocol's ALPN, still used by
-/// [`Client::fetch_file`] (removed in BitTorrent plan step 4). Gated:
-/// members only.
-pub const PIECE_REQUEST_ALPN: &[u8] = b"/sync-node/blocks/0";
-
-/// Largest message (request or response header) accepted.
+/// Largest message (any but a `Piece`'s bytes) accepted.
 pub const MAX_HEADER: u32 = 8 << 10;
 
-/// How long a server waits for a request on a new stream.
+/// How long a node waits for the handshake on a new stream, and for its
+/// answer.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a client waits for a piece.
-pub const PIECE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Requests a node serves at once; more are refused as `Busy`.
-pub const MAX_SERVING: usize = 64;
-
-/// Stream error code for a request the server couldn't read.
+/// Stream error code for a message that breaks the protocol.
 pub const BAD_REQUEST: u32 = 400;
 
-/// Requests a client keeps open to one peer.
-pub const WINDOW: usize = 8;
-
-/// How long a client waits to connect to a peer.
+/// How long a node waits to connect to a peer.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a client waits before asking a busy peer again, and how many
-/// times it does before moving on.
-pub const BUSY_WAIT: Duration = Duration::from_millis(200);
-pub const BUSY_TRIES: u32 = 25;
-
-/// One piece of one version of one file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PieceRequest {
-    pub folder: NamespaceId,
-    /// Relative to the folder root, `/`-separated.
-    pub path: String,
-    /// The version of the file, by its content hash.
-    pub content: Hash,
-    /// The piece number.
-    pub index: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PieceResponse {
-    /// Followed by exactly `len` bytes.
-    Data {
-        len: u32,
-    },
-    Refused(Refusal),
-}
-
-/// Why a server didn't send a piece.
+/// Why a node won't join a swarm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum Refusal {
     #[error("doesn't keep this folder")]
     NotKept,
     #[error("no such file or version")]
     NoSuchFile,
-    #[error("the file changed")]
-    Changed,
-    #[error("busy")]
-    Busy,
-    #[error("refused by the relay policy")]
-    Policy,
 }
 
 /// Writes one framed message.
@@ -124,135 +78,6 @@ pub async fn read_message<T: DeserializeOwned>(recv: &mut RecvStream) -> anyhow:
     let mut body = vec![0; len as usize];
     recv.read_exact(&mut body).await?;
     Ok(postcard::from_bytes(&body)?)
-}
-
-/// Asks the node at the other end of `conn` for one piece. The bytes aren't
-/// checked here: the caller compares them with its piece hashes.
-pub async fn request_piece(
-    conn: &Connection,
-    request: &PieceRequest,
-) -> anyhow::Result<Result<Vec<u8>, Refusal>> {
-    let exchange = async {
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_message(&mut send, request).await?;
-        send.finish()?;
-        match read_message::<PieceResponse>(&mut recv).await? {
-            PieceResponse::Data { len } => {
-                anyhow::ensure!(len <= MAX_PIECE_LENGTH, "piece of {len} bytes is too large");
-                let mut piece = vec![0; len as usize];
-                recv.read_exact(&mut piece).await?;
-                Ok(Ok(piece))
-            }
-            PieceResponse::Refused(refusal) => Ok(Err(refusal)),
-        }
-    };
-    tokio::time::timeout(PIECE_TIMEOUT, exchange)
-        .await
-        .context("timed out waiting for a piece")?
-}
-
-/// The serving side of the old one-piece-per-request protocol
-/// ([`PIECE_REQUEST_ALPN`]).
-#[derive(Debug, Clone)]
-pub struct PieceRequestProtocol {
-    folders: Folders,
-    serving: Arc<Semaphore>,
-}
-
-impl PieceRequestProtocol {
-    pub(crate) fn new(folders: Folders) -> Self {
-        Self {
-            folders,
-            serving: Arc::new(Semaphore::new(MAX_SERVING)),
-        }
-    }
-
-    /// Answers one request on its own stream.
-    async fn answer(self, remote: EndpointId, mut send: SendStream, mut recv: RecvStream) {
-        let request =
-            tokio::time::timeout(REQUEST_TIMEOUT, read_message::<PieceRequest>(&mut recv));
-        let request = match request.await {
-            Ok(Ok(request)) => request,
-            failed => {
-                let why = match failed {
-                    Ok(Err(err)) => format!("{err:#}"),
-                    _ => "timed out".to_string(),
-                };
-                tracing::debug!("{}: bad piece request: {why}", remote.fmt_short());
-                let _ = recv.stop(VarInt::from_u32(BAD_REQUEST));
-                let _ = send.reset(VarInt::from_u32(BAD_REQUEST));
-                return;
-            }
-        };
-        let sent = async {
-            match self.serve(remote, &request).await {
-                Ok(piece) => {
-                    let len = piece.len() as u32;
-                    write_message(&mut send, &PieceResponse::Data { len }).await?;
-                    send.write_all(&piece).await?;
-                }
-                Err(refusal) => {
-                    tracing::debug!(
-                        "{}: refused piece {} of {}: {refusal}",
-                        remote.fmt_short(),
-                        request.index,
-                        request.path
-                    );
-                    write_message(&mut send, &PieceResponse::Refused(refusal)).await?;
-                }
-            }
-            send.finish()?;
-            anyhow::Ok(())
-        };
-        if let Err(err) = sent.await {
-            tracing::debug!("{}: sending a piece: {err:#}", remote.fmt_short());
-        }
-    }
-
-    /// The piece `request` asks for, read from disk and checked against this
-    /// node's entry, or why not.
-    async fn serve(&self, remote: EndpointId, request: &PieceRequest) -> Result<Vec<u8>, Refusal> {
-        let folder = self.folders.serving(request.folder, remote)?;
-        if !safe_path(&request.path) {
-            return Err(Refusal::NoSuchFile);
-        }
-        let entry = folder
-            .entries
-            .get(&request.path)
-            .filter(|e| e.content == Some(request.content))
-            .ok_or(Refusal::NoSuchFile)?;
-        if request.index as usize >= entry.pieces.len() {
-            return Err(Refusal::NoSuchFile);
-        }
-        let _permit = self
-            .serving
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Refusal::Busy)?;
-        let (root, path, index) = (folder.root.clone(), request.path.clone(), request.index);
-        let read =
-            tokio::task::spawn_blocking(move || read_piece(&root, &path, &entry, index)).await;
-        match read {
-            Ok(Ok(Some(piece))) => Ok(piece),
-            other => {
-                if let Ok(Err(err)) = &other {
-                    tracing::debug!("reading piece {index} of {}: {err}", request.path);
-                }
-                rehash(&folder, &request.path);
-                Err(Refusal::Changed)
-            }
-        }
-    }
-}
-
-impl ProtocolHandler for PieceRequestProtocol {
-    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        let remote = conn.remote_id();
-        while let Ok((send, recv)) = conn.accept_bi().await {
-            tokio::spawn(self.clone().answer(remote, send, recv));
-        }
-        Ok(())
-    }
 }
 
 /// The peer wire's ALPN. Gated: members only.
@@ -337,9 +162,17 @@ pub enum Why {
 /// [`write_message`]), each `Piece` followed by its bytes.
 #[derive(Debug)]
 pub struct Wire {
-    send: SendStream,
-    recv: RecvStream,
+    send: WireSend,
+    recv: WireRecv,
 }
+
+/// The sending half of a [`Wire`].
+#[derive(Debug)]
+pub struct WireSend(SendStream);
+
+/// The receiving half of a [`Wire`].
+#[derive(Debug)]
+pub struct WireRecv(RecvStream);
 
 impl Wire {
     /// Opens a stream on `conn` for the swarm `handshake` names, sends the
@@ -348,7 +181,10 @@ impl Wire {
     pub async fn open(conn: &Connection, handshake: &Handshake) -> anyhow::Result<(Self, Message)> {
         let (mut send, recv) = conn.open_bi().await?;
         write_message(&mut send, handshake).await?;
-        let mut wire = Self { send, recv };
+        let mut wire = Self {
+            send: WireSend(send),
+            recv: WireRecv(recv),
+        };
         let answer = tokio::time::timeout(REQUEST_TIMEOUT, wire.recv())
             .await
             .context("timed out waiting for the handshake's answer")??
@@ -357,22 +193,67 @@ impl Wire {
     }
 
     pub async fn send(&mut self, msg: &Message) -> anyhow::Result<()> {
-        write_message(&mut self.send, msg).await
+        self.send.send(msg).await
     }
 
     /// Sends a `Piece` message for `block` and its bytes, `data`.
     pub async fn send_piece(&mut self, block: Block, data: &[u8]) -> anyhow::Result<()> {
-        debug_assert_eq!(data.len(), block.length as usize);
-        write_message(&mut self.send, &Message::Piece(block)).await?;
-        self.send.write_all(data).await?;
-        Ok(())
+        self.send.send_piece(block, data).await
     }
 
     /// The next message, with a `Piece`'s bytes (empty for any other), or
     /// `None` if the other end finished the stream.
     pub async fn recv(&mut self) -> anyhow::Result<Option<(Message, Vec<u8>)>> {
+        self.recv.recv().await
+    }
+
+    /// Finishes this end of the stream.
+    pub fn finish(&mut self) -> anyhow::Result<()> {
+        self.send.finish()
+    }
+
+    /// The halves, to send and receive from separate tasks.
+    pub fn split(self) -> (WireSend, WireRecv) {
+        (self.send, self.recv)
+    }
+
+    /// Closes the stream both ways with `BAD_REQUEST`, for a message that
+    /// breaks the protocol.
+    fn reset(&mut self) {
+        let _ = self.recv.0.stop(VarInt::from_u32(BAD_REQUEST));
+        self.send.reset();
+    }
+}
+
+impl WireSend {
+    pub async fn send(&mut self, msg: &Message) -> anyhow::Result<()> {
+        write_message(&mut self.0, msg).await
+    }
+
+    /// Sends a `Piece` message for `block` and its bytes, `data`.
+    pub async fn send_piece(&mut self, block: Block, data: &[u8]) -> anyhow::Result<()> {
+        debug_assert_eq!(data.len(), block.length as usize);
+        write_message(&mut self.0, &Message::Piece(block)).await?;
+        self.0.write_all(data).await?;
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(self.0.finish()?)
+    }
+
+    /// Stops sending at once, with `BAD_REQUEST`.
+    pub fn reset(&mut self) {
+        let _ = self.0.reset(VarInt::from_u32(BAD_REQUEST));
+    }
+}
+
+impl WireRecv {
+    /// The next message, with a `Piece`'s bytes (empty for any other), or
+    /// `None` if the other end finished the stream.
+    pub async fn recv(&mut self) -> anyhow::Result<Option<(Message, Vec<u8>)>> {
         let mut len = [0; 4];
-        match self.recv.read_exact(&mut len).await {
+        match self.0.read_exact(&mut len).await {
             Ok(()) => {}
             Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
             Err(err) => return Err(err.into()),
@@ -380,7 +261,7 @@ impl Wire {
         let len = u32::from_le_bytes(len);
         anyhow::ensure!(len <= MAX_HEADER, "message of {len} bytes is too large");
         let mut body = vec![0; len as usize];
-        self.recv.read_exact(&mut body).await?;
+        self.0.read_exact(&mut body).await?;
         let msg: Message = postcard::from_bytes(&body)?;
         let mut data = Vec::new();
         if let Message::Piece(block) = &msg {
@@ -390,21 +271,9 @@ impl Wire {
                 block.length
             );
             data.resize(block.length as usize, 0);
-            self.recv.read_exact(&mut data).await?;
+            self.0.read_exact(&mut data).await?;
         }
         Ok(Some((msg, data)))
-    }
-
-    /// Finishes this end of the stream.
-    pub fn finish(&mut self) -> anyhow::Result<()> {
-        Ok(self.send.finish()?)
-    }
-
-    /// Closes the stream both ways with `BAD_REQUEST`, for a message that
-    /// breaks the protocol.
-    fn reset(&mut self) {
-        let _ = self.recv.stop(VarInt::from_u32(BAD_REQUEST));
-        let _ = self.send.reset(VarInt::from_u32(BAD_REQUEST));
     }
 }
 
@@ -418,6 +287,9 @@ impl Wire {
 #[derive(Debug, Clone)]
 pub struct PeerWireProtocol {
     folders: Folders,
+    /// `--direct-only`: requests that arrive over a relay are rejected
+    /// with `Policy`.
+    direct_only: bool,
 }
 
 /// The last piece verified on one stream, for its next blocks.
@@ -427,15 +299,29 @@ struct Verified {
 }
 
 impl PeerWireProtocol {
-    pub(crate) fn new(folders: Folders) -> Self {
-        Self { folders }
+    pub(crate) fn new(folders: Folders, direct_only: bool) -> Self {
+        Self {
+            folders,
+            direct_only,
+        }
     }
 
-    /// Runs one swarm stream until the other end finishes it.
-    async fn swarm(self, remote: EndpointId, send: SendStream, recv: RecvStream) {
-        let mut wire = Wire { send, recv };
+    /// Runs one swarm stream on `conn` until the other end finishes it.
+    /// Holds `conn` weakly: a strong handle would keep the connection open
+    /// while the stream waits.
+    async fn swarm(
+        self,
+        remote: EndpointId,
+        conn: WeakConnectionHandle,
+        send: SendStream,
+        recv: RecvStream,
+    ) {
+        let mut wire = Wire {
+            send: WireSend(send),
+            recv: WireRecv(recv),
+        };
         let handshake =
-            tokio::time::timeout(REQUEST_TIMEOUT, read_message::<Handshake>(&mut wire.recv));
+            tokio::time::timeout(REQUEST_TIMEOUT, read_message::<Handshake>(&mut wire.recv.0));
         let handshake = match handshake.await {
             Ok(Ok(handshake)) => handshake,
             failed => {
@@ -448,7 +334,7 @@ impl PeerWireProtocol {
                 return;
             }
         };
-        if let Err(err) = self.serve(remote, &handshake, &mut wire).await {
+        if let Err(err) = self.serve(remote, &conn, &handshake, &mut wire).await {
             tracing::debug!(
                 "{}: swarm for {}: {err:#}",
                 remote.fmt_short(),
@@ -461,6 +347,7 @@ impl PeerWireProtocol {
     async fn serve(
         &self,
         remote: EndpointId,
+        conn: &WeakConnectionHandle,
         handshake: &Handshake,
         wire: &mut Wire,
     ) -> anyhow::Result<()> {
@@ -482,8 +369,10 @@ impl PeerWireProtocol {
                     wire.send(&Message::Unchoke).await?;
                 }
                 Message::Request(block) => {
+                    let relayed = self.direct_only
+                        && !conn.upgrade().is_some_and(|c| crate::peers::is_direct(&c));
                     let answer = self
-                        .block(&folder, handshake, block, choked, &mut verified)
+                        .block(&folder, handshake, block, choked, relayed, &mut verified)
                         .await;
                     match answer {
                         Ok(data) => wire.send_piece(block, data).await?,
@@ -542,6 +431,7 @@ impl PeerWireProtocol {
         handshake: &Handshake,
         block: Block,
         choked: bool,
+        relayed: bool,
         verified: &'a mut Option<Verified>,
     ) -> Result<&'a [u8], Why> {
         // The entry now: the file may have changed since the handshake.
@@ -559,6 +449,9 @@ impl PeerWireProtocol {
             || end > span(&entry, block.piece).1 as u64
         {
             return Err(Why::Invalid);
+        }
+        if relayed {
+            return Err(Why::Policy);
         }
         if choked {
             return Err(Why::Choked);
@@ -588,7 +481,7 @@ impl ProtocolHandler for PeerWireProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let remote = conn.remote_id();
         while let Ok((send, recv)) = conn.accept_bi().await {
-            tokio::spawn(self.clone().swarm(remote, send, recv));
+            tokio::spawn(self.clone().swarm(remote, conn.weak_handle(), send, recv));
         }
         Ok(())
     }
@@ -605,39 +498,113 @@ fn rehash(folder: &Serving, path: &str) {
     }
 }
 
-/// The fetching side of the peer wire: one connection per peer,
-/// kept while it stays open.
+/// Which pieces of a file of `count` pieces `have` says this node has, as
+/// the message that tells a peer: `HaveAll`, `HaveNone` or a `Bitfield`.
+pub fn bitfield_message(have: &[bool]) -> Message {
+    if have.iter().all(|h| *h) {
+        return Message::HaveAll;
+    }
+    if !have.iter().any(|h| *h) {
+        return Message::HaveNone;
+    }
+    let mut bits = vec![0u8; have.len().div_ceil(8)];
+    for (i, _) in have.iter().enumerate().filter(|(_, h)| **h) {
+        bits[i / 8] |= 0x80 >> (i % 8);
+    }
+    Message::Bitfield(bits)
+}
+
+/// The pieces a peer's bitfield message says it has, for a file of `count`
+/// pieces; `None` if it isn't a bitfield message, or not one for `count`
+/// pieces (wrong length, or spare bits set).
+pub fn holds(msg: &Message, count: u32) -> Option<Holds> {
+    let count = count as usize;
+    match msg {
+        Message::HaveAll => Some(Holds::All),
+        Message::HaveNone => Some(Holds::These(vec![false; count])),
+        Message::Bitfield(bits) => {
+            if bits.len() != count.div_ceil(8) {
+                return None;
+            }
+            let have: Vec<bool> = (0..bits.len() * 8)
+                .map(|i| bits[i / 8] & (0x80 >> (i % 8)) != 0)
+                .collect();
+            if have[count..].iter().any(|h| *h) {
+                return None;
+            }
+            Some(Holds::These(have[..count].to_vec()))
+        }
+        _ => None,
+    }
+}
+
+/// Requests a node keeps open to one peer (the plan's fixed queue until
+/// step 6 sizes it from the peer's speed).
+pub const QUEUE: usize = 16;
+
+/// How often a download asks the nodes it isn't connected to again: a
+/// node that got the version since (its entry hadn't synced), or came back,
+/// joins the swarm.
+pub const REJOIN: Duration = Duration::from_secs(2);
+
+/// How long a download goes on with no peer joined before it gives up, for
+/// a later try.
+pub const GIVE_UP: Duration = Duration::from_secs(30);
+
+/// The downloading side of the peer wire: one connection per peer, kept
+/// while it stays open, and one stream per swarm on it.
 #[derive(Debug, Clone)]
 pub struct Client {
     endpoint: Endpoint,
+    /// `--direct-only`: no requests to a peer reached through a relay.
+    direct_only: bool,
     conns: Arc<Mutex<HashMap<EndpointId, Connection>>>,
     /// Bytes of verified pieces written, per peer.
     fetched: Arc<Mutex<HashMap<EndpointId, u64>>>,
 }
 
-/// What became of one piece request.
-enum Got {
-    /// The piece, checked against the piece hashes.
-    Piece(Vec<u8>),
-    Refused(Refusal),
-    /// The bytes don't match the piece's hash: the peer is wrong.
-    Mismatch,
-    /// The request failed: connection, stream or timeout.
-    Failed(anyhow::Error),
+/// One node a download asks.
+struct Remote {
+    id: EndpointId,
+    /// Bumped on each join, so events from an earlier one are ignored.
+    generation: u64,
+    state: State,
+}
+
+enum State {
+    /// Not in the swarm; asked again every [`REJOIN`] unless `banned`.
+    Out {
+        banned: bool,
+    },
+    Joining,
+    In {
+        conn: Connection,
+        send: WireSend,
+        /// Its number in the [`Picker`].
+        peer: usize,
+        unchoked: bool,
+        interested: bool,
+    },
+}
+
+enum Event {
+    Joined(anyhow::Result<(Connection, Wire, Message)>),
+    Received(anyhow::Result<Option<(Message, Vec<u8>)>>),
 }
 
 impl Client {
-    pub fn new(endpoint: Endpoint) -> Self {
+    pub fn new(endpoint: Endpoint, direct_only: bool) -> Self {
         Self {
             endpoint,
+            direct_only,
             conns: Arc::default(),
             fetched: Arc::default(),
         }
     }
 
-    /// Bytes of file data fetched from each peer since this node
-    /// started: verified pieces written, each counted once, for the
-    /// peer that sent it first.
+    /// Bytes of file data fetched from each peer since this node started:
+    /// verified pieces written, each block counted once, for the peer that
+    /// sent it.
     pub fn fetched(&self) -> HashMap<EndpointId, u64> {
         self.fetched.lock().unwrap().clone()
     }
@@ -648,418 +615,367 @@ impl Client {
         if let Some(conn) = open.filter(|c| c.close_reason().is_none()) {
             return Ok(conn);
         }
-        let conn = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            self.endpoint.connect(id, PIECE_REQUEST_ALPN),
-        )
-        .await
-        .context("timed out connecting")??;
+        let conn = tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(id, ALPN))
+            .await
+            .context("timed out connecting")??;
         self.conns.lock().unwrap().insert(id, conn.clone());
         Ok(conn)
     }
 
-    /// Fetches the pieces `staged` lacks for version `meta` of `path` in
-    /// `folder` from all the peers `offered` at once, as [`Schedule`]
-    /// hands them out. The offer may grow during the fetch (a node finished
-    /// its own copy): new peers join it. A peer that can't be reached, refuses, fails or
-    /// sends a piece that doesn't match is dropped for this file, and its
-    /// pieces go to the others. Every piece is checked against the piece hashes before it is
-    /// written. Returns whether the file is complete (and synced to disk);
-    /// if not, the staging file keeps what arrived, for a later try.
-    pub async fn fetch_file(
+    /// Downloads what `staged` lacks of version `meta` of `path` in `folder`:
+    /// joins the swarm with every node `peers` names, says it is interested
+    /// in those that have pieces it lacks, and once unchoked asks for blocks
+    /// as the [`Picker`] hands them out, up to [`QUEUE`] at a time. Each
+    /// piece is checked against its hash before it is written to the
+    /// staging file. A peer that sends a piece that doesn't match, or
+    /// rejects a request because it no longer has the file, is dropped for
+    /// this download. `peers` is asked again every [`REJOIN`].
+    ///
+    /// Returns whether the file is complete (and synced to disk); if not,
+    /// the staging file keeps the pieces that arrived, for a later try.
+    pub async fn download(
         &self,
         folder: NamespaceId,
         path: &str,
         meta: &FileMeta,
-        mut offered: watch::Receiver<Vec<EndpointId>>,
         mut staged: Staged,
+        peers: impl Fn() -> Vec<EndpointId>,
     ) -> anyhow::Result<bool> {
         let content = meta.content.context("fetching a tombstone")?;
-        let request = PieceRequest {
+        let handshake = Handshake {
             folder,
             path: path.to_string(),
             content,
-            index: 0,
         };
+        let mut picker = Picker::new(meta.piece_length, meta.size, staged.missing.drain(..));
+        let (events, mut received) = mpsc::unbounded_channel::<(usize, u64, Event)>();
+        // Joins and readers: stopped with the download.
         let mut tasks = JoinSet::new();
-        let mut schedule = Schedule::new(staged.missing.drain(..), 0);
-        let mut peers = Vec::new();
-        let ids = offered.borrow_and_update().clone();
-        self.join(&ids, &mut peers, &mut schedule, &mut tasks);
-        // Until the offer's sender is gone.
-        let mut watching = true;
-        // Open requests' tasks, by peer and piece number.
-        let mut requests: HashMap<(usize, u32), AbortHandle> = HashMap::new();
-        // Whether an `Event::Wake` is pending.
-        let mut waking = false;
-        while !schedule.is_complete() {
-            for (i, p) in peers.iter().enumerate() {
-                let Some(conn) = p.conn.as_ref().filter(|_| p.ready()) else {
-                    continue;
-                };
-                while let Some(index) = schedule.next(i, Instant::now()) {
-                    let conn = conn.clone();
-                    let request = PieceRequest {
-                        index,
-                        ..request.clone()
-                    };
-                    let expected = meta.pieces[index as usize];
-                    let task = tasks.spawn(async move {
-                        Event::Piece(i, index, fetch_piece(&conn, &request, expected).await)
-                    });
-                    requests.insert((i, index), task);
-                }
+        let mut remotes: Vec<Remote> = Vec::new();
+        // The node behind each picker peer.
+        let mut ids: Vec<EndpointId> = Vec::new();
+        let mut rejoin = tokio::time::interval(REJOIN);
+        rejoin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_in = Instant::now();
+        let me = self.endpoint.id();
+        while !picker.is_complete() {
+            self.request(&mut remotes, &mut picker).await;
+            let now = Instant::now();
+            if remotes.iter().any(|r| matches!(r.state, State::In { .. })) {
+                last_in = now;
             }
-            // Wake when a request becomes overdue, for the endgame.
-            if !waking {
-                if let Some(at) = schedule.next_overdue(Instant::now()) {
-                    waking = true;
-                    tasks.spawn(async move {
-                        tokio::time::sleep_until(at.into()).await;
-                        Event::Wake
-                    });
-                }
+            let stuck = remotes
+                .iter()
+                .all(|r| matches!(r.state, State::Out { banned: true }));
+            if now - last_in > GIVE_UP || (stuck && !remotes.is_empty()) {
+                return Ok(false);
             }
-            let joined = tokio::select! {
-                joined = tasks.join_next() => joined,
-                changed = offered.changed(), if watching => {
-                    match changed {
-                        Ok(()) => {
-                            let ids = offered.borrow_and_update().clone();
-                            self.join(&ids, &mut peers, &mut schedule, &mut tasks);
-                        }
-                        Err(_) => watching = false,
-                    }
-                    continue;
-                }
-            };
-            let Some(joined) = joined else {
-                // Nothing open, nobody left to ask.
-                break;
-            };
-            let event = match joined {
-                Ok(event) => event,
-                // A request that was stopped.
-                Err(err) if err.is_cancelled() => continue,
-                Err(err) => return Err(err.into()),
-            };
-            let (i, index, got) = match event {
-                Event::Connected(i, Ok(conn)) => {
-                    peers[i].conn = Some(conn);
-                    continue;
-                }
-                Event::Connected(i, Err(err)) => {
-                    let p = &mut peers[i];
-                    tracing::debug!("{}: connecting: {err:#}", p.id.fmt_short());
-                    p.dropped = true;
-                    continue;
-                }
-                Event::Resume(i) => {
-                    peers[i].paused = false;
-                    continue;
-                }
-                Event::Wake => {
-                    waking = false;
-                    continue;
-                }
-                Event::Piece(i, index, got) => (i, index, got),
-            };
-            requests.remove(&(i, index));
-            if !schedule.is_asked(i, index) {
-                // Stopped, but it finished first: another peer sent the
-                // piece, or this one was dropped.
-                continue;
-            }
-            let p = &mut peers[i];
-            let why = match got {
-                Got::Piece(piece) => {
-                    // Written here, not in the request's task, so a stopped
-                    // request never writes.
-                    let (file, offset) = (staged.file.clone(), span(meta, index).0);
-                    let len = piece.len() as u64;
-                    tokio::task::spawn_blocking(move || file.write_all_at(&piece, offset))
-                        .await?
-                        .context("writing the temporary file")?;
-                    *self.fetched.lock().unwrap().entry(p.id).or_default() += len;
-                    for other in schedule.delivered(i, index, Instant::now()) {
-                        if let Some(task) = requests.remove(&(other, index)) {
-                            task.abort();
+            let wake = picker.next_overdue(now);
+            tokio::select! {
+                _ = rejoin.tick() => {
+                    for id in peers() {
+                        if id != me && !remotes.iter().any(|r| r.id == id) {
+                            remotes.push(Remote { id, generation: 0, state: State::Out { banned: false } });
                         }
                     }
-                    continue;
-                }
-                Got::Refused(Refusal::Busy) if p.busy < BUSY_TRIES => {
-                    p.busy += 1;
-                    schedule.returned(i, index);
-                    if !p.paused {
-                        p.paused = true;
-                        tasks.spawn(async move {
-                            tokio::time::sleep(BUSY_WAIT).await;
-                            Event::Resume(i)
-                        });
+                    for (i, remote) in remotes.iter_mut().enumerate() {
+                        if matches!(remote.state, State::Out { banned: false }) {
+                            remote.generation += 1;
+                            remote.state = State::Joining;
+                            let (client, handshake, events) = (self.clone(), handshake.clone(), events.clone());
+                            let (id, generation) = (remote.id, remote.generation);
+                            tasks.spawn(async move {
+                                let joined = async {
+                                    let conn = client.connect(id).await?;
+                                    let (wire, answer) = Wire::open(&conn, &handshake).await?;
+                                    anyhow::Ok((conn, wire, answer))
+                                };
+                                let _ = events.send((i, generation, Event::Joined(joined.await)));
+                            });
+                        }
                     }
-                    continue;
                 }
-                Got::Refused(refusal) => anyhow::anyhow!("refused piece {index}: {refusal}"),
-                Got::Mismatch => anyhow::anyhow!("piece {index} doesn't match its hash"),
-                Got::Failed(err) => err.context(format!("piece {index}")),
-            };
-            tracing::debug!("{}: fetching {path}: {why:#}", p.id.fmt_short());
-            p.dropped = true;
-            if p.conn.as_ref().is_some_and(|c| c.close_reason().is_some()) {
-                self.conns.lock().unwrap().remove(&p.id);
-            }
-            schedule.returned(i, index);
-            for index in schedule.drop_peer(i) {
-                if let Some(task) = requests.remove(&(i, index)) {
-                    task.abort();
+                Some((i, generation, event)) = received.recv() => {
+                    if remotes[i].generation != generation {
+                        continue;
+                    }
+                    match event {
+                        Event::Joined(joined) => {
+                            self.joined(i, joined, &mut remotes, &mut picker, &mut ids, &events, &mut tasks).await;
+                        }
+                        Event::Received(Ok(Some((msg, data)))) => {
+                            self.on_message(i, msg, &data, &mut remotes, &mut picker, &ids, meta, &staged, path).await?;
+                        }
+                        Event::Received(ended) => {
+                            if let Err(err) = ended {
+                                tracing::debug!("{}: {path}: {err:#}", remotes[i].id.fmt_short());
+                            }
+                            leave(&mut remotes[i], &mut picker, false);
+                        }
+                    }
                 }
+                () = tokio::time::sleep_until(wake.unwrap_or(now).into()), if wake.is_some() => {}
             }
         }
-        tasks.abort_all();
-        if !schedule.is_complete() {
-            return Ok(false);
+        for remote in &mut remotes {
+            if let State::In { send, .. } = &mut remote.state {
+                let _ = send.send(&Message::NotInterested).await;
+                let _ = send.finish();
+            }
         }
         tokio::task::spawn_blocking(move || staged.sync()).await??;
         Ok(true)
     }
 
-    /// Adds the peers among `ids` not in `peers` yet, and starts
-    /// connecting to them.
-    fn join(
-        &self,
-        ids: &[EndpointId],
-        peers: &mut Vec<Peer>,
-        schedule: &mut Schedule,
-        tasks: &mut JoinSet<Event>,
-    ) {
-        for &id in ids {
-            if peers.iter().any(|p| p.id == id) {
+    /// Asks every unchoked peer in the swarm for blocks, up to [`QUEUE`]
+    /// open each.
+    async fn request(&self, remotes: &mut [Remote], picker: &mut Picker) {
+        for remote in remotes.iter_mut() {
+            let State::In {
+                conn,
+                send,
+                peer,
+                unchoked: true,
+                ..
+            } = &mut remote.state
+            else {
+                continue;
+            };
+            if self.direct_only && !crate::peers::is_direct(conn) {
                 continue;
             }
-            if !peers.is_empty() {
-                tracing::debug!("{}: joins the fetch", id.fmt_short());
+            let mut failed = false;
+            while picker.open(*peer) < QUEUE {
+                let Some(block) = picker.next(*peer, Instant::now()) else {
+                    break;
+                };
+                if let Err(err) = send.send(&Message::Request(block)).await {
+                    tracing::debug!("{}: requesting: {err:#}", remote.id.fmt_short());
+                    failed = true;
+                    break;
+                }
             }
-            let (i, client) = (schedule.add_peer(), self.clone());
-            tasks.spawn(async move { Event::Connected(i, client.connect(id).await) });
-            peers.push(Peer::new(id));
-        }
-    }
-}
-
-/// Which peer is asked for which piece during a fetch. Every peer
-/// draws from one queue of missing pieces, up to [`WINDOW`] requests open to
-/// each: a faster peer finishes its pieces sooner and so is given more.
-///
-/// Once the queue is empty (the endgame), a peer with room is also asked
-/// for a piece whose request to another peer is overdue: open more than
-/// [`OVERDUE`] times as long as requests in this fetch typically take. The
-/// first to send it wins, so a slow or stalled peer can't hold up the
-/// end, while peers of about the same speed aren't asked twice for the
-/// same bytes.
-///
-/// Bookkeeping only: [`Client::fetch_file`] makes the requests, and passes
-/// the time in. Peers are numbered from 0.
-#[derive(Debug)]
-pub struct Schedule {
-    missing: VecDeque<u32>,
-    /// Open requests: piece number → the peers asked for it (one, or
-    /// two in the endgame), and when.
-    asked: BTreeMap<u32, Vec<(usize, Instant)>>,
-    /// Open requests per peer.
-    open: Vec<usize>,
-    /// How long a delivered request typically took (a moving average), once
-    /// one has been.
-    typical: Option<Duration>,
-}
-
-/// How many times the typical request time a request must be open before
-/// its piece is asked of a second peer.
-pub const OVERDUE: u32 = 2;
-
-impl Schedule {
-    pub fn new(missing: impl IntoIterator<Item = u32>, peers: usize) -> Self {
-        Self {
-            missing: missing.into_iter().collect(),
-            asked: BTreeMap::new(),
-            open: vec![0; peers],
-            typical: None,
+            if failed {
+                leave(remote, picker, false);
+            }
         }
     }
 
-    /// Adds a peer, numbered next.
-    pub fn add_peer(&mut self) -> usize {
-        self.open.push(0);
-        self.open.len() - 1
-    }
-
-    /// Whether every piece has been delivered.
-    pub fn is_complete(&self) -> bool {
-        self.missing.is_empty() && self.asked.is_empty()
-    }
-
-    /// The next piece to ask peer `p` for at `now`, if it has room: the
-    /// first missing piece or, in the endgame, the first piece whose only
-    /// request, to another peer, is overdue.
-    pub fn next(&mut self, p: usize, now: Instant) -> Option<u32> {
-        if self.open[p] >= WINDOW {
-            return None;
-        }
-        let index = match self.missing.pop_front() {
-            Some(index) => index,
-            None => {
-                let overdue = self.overdue_after()?;
-                *self
-                    .asked
-                    .iter()
-                    .find(|(_, by)| by.len() == 1 && by[0].0 != p && now - by[0].1 > overdue)?
-                    .0
+    /// A join started at the last [`REJOIN`] ended: the peer is in the
+    /// swarm (it sent its bitfield) or not.
+    #[allow(clippy::too_many_arguments)]
+    async fn joined(
+        &self,
+        i: usize,
+        joined: anyhow::Result<(Connection, Wire, Message)>,
+        remotes: &mut [Remote],
+        picker: &mut Picker,
+        ids: &mut Vec<EndpointId>,
+        events: &mpsc::UnboundedSender<(usize, u64, Event)>,
+        tasks: &mut JoinSet<()>,
+    ) {
+        let remote = &mut remotes[i];
+        let (conn, wire, answer) = match joined {
+            Ok(joined) => joined,
+            Err(err) => {
+                tracing::debug!("{}: joining the swarm: {err:#}", remote.id.fmt_short());
+                let mut conns = self.conns.lock().unwrap();
+                if conns
+                    .get(&remote.id)
+                    .is_some_and(|c| c.close_reason().is_some())
+                {
+                    conns.remove(&remote.id);
+                }
+                remote.state = State::Out { banned: false };
+                return;
             }
         };
-        self.asked.entry(index).or_default().push((p, now));
-        self.open[p] += 1;
-        Some(index)
-    }
-
-    /// When, after `now`, the next request becomes overdue, if one will: the
-    /// time to look again for endgame requests.
-    pub fn next_overdue(&self, now: Instant) -> Option<Instant> {
-        let overdue = self.overdue_after()?;
-        if !self.missing.is_empty() {
-            return None;
-        }
-        self.asked
-            .values()
-            .filter(|by| by.len() == 1)
-            .map(|by| by[0].1 + overdue)
-            .filter(|at| *at > now)
-            .min()
-    }
-
-    fn overdue_after(&self) -> Option<Duration> {
-        self.typical.map(|t| t * OVERDUE)
-    }
-
-    /// Whether peer `p` is asked for piece `index`: not delivered by
-    /// another, nor given back.
-    pub fn is_asked(&self, p: usize, index: u32) -> bool {
-        self.asked
-            .get(&index)
-            .is_some_and(|by| by.iter().any(|(q, _)| *q == p))
-    }
-
-    /// Peer `p` delivered piece `index` at `now`. Returns the other
-    /// peers asked for it, whose requests can stop.
-    pub fn delivered(&mut self, p: usize, index: u32, now: Instant) -> Vec<usize> {
-        let by = self.asked.remove(&index).unwrap_or_default();
-        let mut others = Vec::new();
-        for (q, at) in by {
-            self.open[q] -= 1;
-            if q == p {
-                let took = now - at;
-                self.typical = Some(match self.typical {
-                    Some(typical) => (typical * 7 + took) / 8,
-                    None => took,
-                });
-            } else {
-                others.push(q);
-            }
-        }
-        others
-    }
-
-    /// Peer `p` didn't deliver piece `index`: it goes back to the front
-    /// of the queue, unless another peer is still asked for it.
-    pub fn returned(&mut self, p: usize, index: u32) {
-        let Some(by) = self.asked.get_mut(&index) else {
+        let Some(holds) = holds(&answer, picker.piece_count()) else {
+            // Refused (it doesn't have the version, or doesn't keep the
+            // folder): it may later.
+            tracing::debug!("{}: not in the swarm: {answer:?}", remote.id.fmt_short());
+            remote.state = State::Out { banned: false };
             return;
         };
-        let Some(at) = by.iter().position(|(q, _)| *q == p) else {
+        let interested = picker.wants(&holds);
+        let peer = picker.add_peer(holds);
+        ids.push(remote.id);
+        let (mut send, mut recv) = wire.split();
+        let mut said = send.send(&bitfield_message(&picker.have())).await;
+        if said.is_ok() && interested {
+            said = send.send(&Message::Interested).await;
+        }
+        if let Err(err) = said {
+            tracing::debug!("{}: joining the swarm: {err:#}", remote.id.fmt_short());
+            picker.drop_peer(peer);
+            remote.state = State::Out { banned: false };
             return;
+        }
+        let (events, generation) = (events.clone(), remote.generation);
+        tasks.spawn(async move {
+            loop {
+                let got = recv.recv().await;
+                let more = matches!(got, Ok(Some(_)));
+                if events.send((i, generation, Event::Received(got))).is_err() || !more {
+                    return;
+                }
+            }
+        });
+        remote.state = State::In {
+            conn,
+            send,
+            peer,
+            unchoked: false,
+            interested,
         };
-        by.remove(at);
-        self.open[p] -= 1;
-        if by.is_empty() {
-            self.asked.remove(&index);
-            self.missing.push_front(index);
-        }
     }
 
-    /// Gives back every piece peer `p` is asked for (see
-    /// [`returned`](Self::returned)), and returns them: their requests can
-    /// stop.
-    pub fn drop_peer(&mut self, p: usize) -> Vec<u32> {
-        let pieces: Vec<u32> = self
-            .asked
-            .iter()
-            .filter(|(_, by)| by.iter().any(|(q, _)| *q == p))
-            .map(|(&index, _)| index)
-            .collect();
-        // Last first: each goes to the front, so the queue stays in order.
-        for &index in pieces.iter().rev() {
-            self.returned(p, index);
+    /// Handles one message from the peer of `remotes[i]`.
+    #[allow(clippy::too_many_arguments)]
+    async fn on_message(
+        &self,
+        i: usize,
+        msg: Message,
+        data: &[u8],
+        remotes: &mut [Remote],
+        picker: &mut Picker,
+        ids: &[EndpointId],
+        meta: &FileMeta,
+        staged: &Staged,
+        path: &str,
+    ) -> anyhow::Result<()> {
+        let id = remotes[i].id;
+        let State::In {
+            send,
+            peer,
+            unchoked,
+            interested,
+            ..
+        } = &mut remotes[i].state
+        else {
+            return Ok(());
+        };
+        let peer = *peer;
+        match msg {
+            Message::Unchoke => *unchoked = true,
+            Message::Choke => *unchoked = false,
+            Message::Have(piece) => {
+                picker.has(peer, piece);
+                if !*interested && picker.wants(&Holds::These(one_piece(picker, piece))) {
+                    *interested = true;
+                    let _ = send.send(&Message::Interested).await;
+                }
+            }
+            Message::Piece(block) => {
+                let got = picker.received(peer, block, data, Instant::now());
+                for other in got.cancel {
+                    let owner = remotes
+                        .iter_mut()
+                        .find(|r| matches!(&r.state, State::In { peer, .. } if *peer == other));
+                    if let Some(Remote {
+                        state: State::In { send, .. },
+                        ..
+                    }) = owner
+                    {
+                        let _ = send.send(&Message::Cancel(block)).await;
+                    }
+                }
+                if let Some(complete) = got.complete {
+                    self.check(complete, remotes, picker, ids, meta, staged, path)
+                        .await?;
+                }
+            }
+            Message::Reject(block, why) => {
+                picker.rejected(peer, block);
+                match why {
+                    // Asked again once unchoked, or once the path is direct.
+                    Why::Choked | Why::Policy => {}
+                    Why::Changed | Why::NotHave | Why::Invalid => {
+                        tracing::debug!("{}: {path}: rejected {block:?}: {why}", id.fmt_short());
+                        leave(&mut remotes[i], picker, true);
+                    }
+                }
+            }
+            // Requests are for leechers that serve: BitTorrent plan step 5.
+            Message::Refused(_)
+            | Message::Bitfield(_)
+            | Message::HaveAll
+            | Message::HaveNone
+            | Message::Interested
+            | Message::NotInterested
+            | Message::Request(_)
+            | Message::Cancel(_) => {}
         }
-        pieces
+        Ok(())
+    }
+
+    /// Checks a piece that is complete in memory against its hash: writes
+    /// it to the staging file if it matches, else drops every peer that
+    /// sent part of it and asks for it again.
+    #[allow(clippy::too_many_arguments)]
+    async fn check(
+        &self,
+        complete: Complete,
+        remotes: &mut [Remote],
+        picker: &mut Picker,
+        ids: &[EndpointId],
+        meta: &FileMeta,
+        staged: &Staged,
+        path: &str,
+    ) -> anyhow::Result<()> {
+        let Complete {
+            piece,
+            data,
+            senders,
+        } = complete;
+        let expected = meta.pieces[piece as usize];
+        let (offset, _) = span(meta, piece);
+        let file = staged.file.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            if Hash::new(&data) != expected {
+                return Ok(false);
+            }
+            file.write_all_at(&data, offset).map(|()| true)
+        })
+        .await?
+        .context("writing the staging file")?;
+        if written {
+            picker.verified(piece);
+            let mut fetched = self.fetched.lock().unwrap();
+            for (peer, bytes) in senders {
+                *fetched.entry(ids[peer]).or_default() += u64::from(bytes);
+            }
+            return Ok(());
+        }
+        picker.failed(piece);
+        for (peer, _) in senders {
+            let bad = remotes
+                .iter_mut()
+                .find(|r| matches!(&r.state, State::In { peer: p, .. } if *p == peer));
+            if let Some(remote) = bad {
+                tracing::debug!(
+                    "{}: {path}: piece {piece} doesn't match its hash",
+                    remote.id.fmt_short()
+                );
+                leave(remote, picker, true);
+            }
+        }
+        Ok(())
     }
 }
 
-/// One peer during a fetch.
-struct Peer {
-    id: EndpointId,
-    /// Once connected.
-    conn: Option<Connection>,
-    /// `Busy` answers so far.
-    busy: u32,
-    /// Waiting after a `Busy` answer.
-    paused: bool,
-    /// Unreachable, or refused, failed or sent a wrong piece: not asked
-    /// again for this file.
-    dropped: bool,
+/// A file's pieces with only `piece` held, to ask the picker whether it
+/// wants it.
+fn one_piece(picker: &Picker, piece: u32) -> Vec<bool> {
+    (0..picker.piece_count()).map(|i| i == piece).collect()
 }
 
-impl Peer {
-    fn new(id: EndpointId) -> Self {
-        Self {
-            id,
-            conn: None,
-            busy: 0,
-            paused: false,
-            dropped: false,
-        }
+/// Takes `remote` out of the swarm: its requests go back to the picker.
+/// `banned`: not asked again during this download.
+fn leave(remote: &mut Remote, picker: &mut Picker, banned: bool) {
+    if let State::In { peer, send, .. } = &mut remote.state {
+        picker.drop_peer(*peer);
+        send.reset();
     }
-
-    /// Whether it can be given more pieces.
-    fn ready(&self) -> bool {
-        !self.paused && !self.dropped
-    }
-}
-
-/// Something that happened during a fetch, for the peer at an index.
-enum Event {
-    Connected(usize, anyhow::Result<Connection>),
-    /// Piece number, and what became of the request.
-    Piece(usize, u32, Got),
-    /// A pause after `Busy` is over.
-    Resume(usize),
-    /// A request may be overdue: time to look for endgame requests.
-    Wake,
-}
-
-/// Requests one piece and checks it against `expected`.
-async fn fetch_piece(conn: &Connection, request: &PieceRequest, expected: Hash) -> Got {
-    let piece = match request_piece(conn, request).await {
-        Ok(Ok(piece)) => piece,
-        Ok(Err(refusal)) => return Got::Refused(refusal),
-        Err(err) => return Got::Failed(err),
-    };
-    let checked = tokio::task::spawn_blocking(move || {
-        if Hash::new(&piece) == expected {
-            Got::Piece(piece)
-        } else {
-            Got::Mismatch
-        }
-    });
-    checked
-        .await
-        .unwrap_or_else(|err| Got::Failed(anyhow::Error::from(err)))
+    remote.state = State::Out { banned };
 }

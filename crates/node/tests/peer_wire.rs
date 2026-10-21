@@ -29,6 +29,7 @@ async fn spawn(dir: &Path, book: &MemoryLookup) -> Node {
         presence_interval: INTERVAL,
         debounce: Duration::from_millis(100),
         address_book: Some(book.clone()),
+        direct_only: false,
     };
     Node::spawn_with(dir, SecretKey::generate(), config)
         .await

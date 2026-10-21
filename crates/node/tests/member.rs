@@ -20,6 +20,7 @@ async fn spawn(dir: &Path) -> Node {
         presence_interval: INTERVAL,
         debounce: Duration::from_millis(100),
         address_book: None,
+        direct_only: false,
     };
     Node::spawn_with(dir, SecretKey::generate(), config)
         .await

@@ -13,6 +13,7 @@ pub(crate) mod monitor;
 pub mod node;
 pub mod peer_wire;
 pub mod peers;
+pub mod picker;
 pub mod pieces;
 pub mod presence;
 pub mod record;

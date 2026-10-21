@@ -108,13 +108,20 @@ Not BitTorrent, but step 7's load test can't pass without it.
 
 #### Step 4: Download from Seeders
 
-* [ ] Piece picker (pure bookkeeping, tested on its own like `Schedule`): partial first, rarest first, one peer per piece, endgame with `Cancel`, a peer's pieces back to the pool when it is dropped.
-* [ ] Download loop per swarm: handshake with each seeder, `Interested`, requests up to a fixed queue of 16 per peer, write each verified piece to the staging file.
-* [ ] `--direct-only` / `SYNC_NODE_DIRECT_ONLY` (`Config::direct_only`, off by default): the download loop skips relay-only peers, the server answers `Reject(Policy)` over a relay, and a path change to a relay returns that peer's requests to the picker.
-* [ ] A superseded version stops its swarm and removes its staging file at once.
-* [ ] The content task fetches with it. Remove `/sync-node/blocks/0`, `Client::fetch_file`, `Schedule`, `WINDOW`, `BUSY_*`, `MAX_SERVING`, `Content::fetch_from`'s doc watch.
-* [ ] Tests: all of `tests/content.rs` passes. Picker tests replace the `Schedule` tests. A superseded version leaves no staging file. Direct only: on `Network::Local` every path is direct, so a test checks that fetches still pass with it on; the relay case is checked by the developer (block outbound UDP on one side, as sync-plan step 8).
+* [x] Piece picker (pure bookkeeping, tested on its own like `Schedule`): partial first, rarest first, one peer per piece, endgame with `Cancel`, a peer's pieces back to the pool when it is dropped.
+* [x] Download loop per swarm: handshake with each seeder, `Interested`, requests up to a fixed queue of 16 per peer, write each verified piece to the staging file.
+* [x] `--direct-only` / `SYNC_NODE_DIRECT_ONLY` (`Config::direct_only`, off by default): the download loop skips relay-only peers, the server answers `Reject(Policy)` over a relay, and a path change to a relay returns that peer's requests to the picker.
+* [x] A superseded version stops its swarm and removes its staging file at once.
+* [x] The content task fetches with it. Remove `/sync-node/blocks/0`, `Client::fetch_file`, `Schedule`, `WINDOW`, `BUSY_*`, `MAX_SERVING`, `Content::fetch_from`'s doc watch.
+* [x] Tests: all of `tests/content.rs` passes. Picker tests replace the `Schedule` tests. A superseded version leaves no staging file. Direct only: on `Network::Local` every path is direct, so a test checks that fetches still pass with it on; the relay case is checked by the developer (block outbound UDP on one side, as sync-plan step 8).
 * **Done when:** two and three nodes converge over the peer wire only, and a bad piece's sender is dropped.
+* Done 2026-10-21. As built:
+  * The picker is its own module, `picker.rs` (`Picker`, `Holds`, `Complete`), tested in `tests/picker.rs` (9 tests). A piece's blocks stay in the picker's memory until all have arrived and the piece is checked: nothing unchecked reaches the staging file (as `pieces_that_dont_match_are_refused` requires). A partial piece of a peer that leaves is kept for another peer to finish; a piece that fails its hash starts again from scratch.
+  * `Client::download`: one reader task per peer (`Wire::split`), one loop that requests and handles messages. The swarm is the nodes whose entry has the version plus every node that keeps the folder (`Folders::folder_peers`); nodes not in it are asked again every `REJOIN` (2 s), so a node that got the version since joins a running download (this replaces `fetch_from`'s doc watch). It gives up after `GIVE_UP` (30 s) with no peer in the swarm. A peer is dropped for the download on a bad piece or on `Reject(Changed | NotHave | Invalid)`; `Choked` and `Policy` only give the block back.
+  * Fetched bytes are counted per block, for the peer that sent it, once its piece is verified.
+  * Superseded version: a watch on the doc stops the download; and the content task remembers the staging files it made (`Memory::staging`) and removes one whose version is no longer wanted at the next pass (needed when the seeder's `Reject(Changed)` ends the download first). New tests: `a_newer_version_stops_a_running_fetch`, `direct_only_nodes_converge`.
+  * `--direct-only` counts a path as direct as `status` does: any selected path that isn't a relay (`peers::is_direct`). Server tasks hold the connection weakly.
+  * `/sync-node/blocks/0` is gone: **every node in a group must run this version** (ADR 0002).
 
 #### Step 5: Leechers Serve
 
