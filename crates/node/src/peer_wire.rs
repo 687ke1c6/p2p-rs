@@ -1,15 +1,20 @@
-//! The peer wire (see `plans/blocks/spec.md`; BitTorrent plan step 3
-//! replaces it): file contents moved between nodes one piece per request.
-//!
-//! A request names a folder, a path, the content (version) of the file and a
-//! piece number, on its own bidirectional QUIC stream; the answer is a
-//! header and the piece's bytes, or a refusal. Messages are a little-endian
-//! `u32` length and a postcard body of at most [`MAX_HEADER`] bytes.
+//! The peer wire (BitTorrent's peer wire protocol, see
+//! `plans/bittorrent/plan.md`): one bidirectional QUIC stream per swarm on a
+//! [`ALPN`] connection. The node that wants pieces opens it with a
+//! [`Handshake`]; then [`Message`]s both ways: bitfields and `Have`,
+//! interest and choking, requests for blocks of pieces, answered with
+//! `Piece` or `Reject`. Messages are a little-endian `u32` length and a
+//! postcard body of at most [`MAX_HEADER`] bytes; a `Piece` is followed by
+//! its bytes.
 //!
 //! A node serves only pieces of files its own index lists, to members that
 //! keep the folder, and only after reading them from disk and checking them
 //! against its entry: never a file being edited, never a path outside the
 //! folder.
+//!
+//! The old protocol, one piece per request on its own stream
+//! ([`PIECE_REQUEST_ALPN`], [`Client`], [`Schedule`]), still fetches until
+//! BitTorrent plan step 4 replaces it.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::os::unix::fs::FileExt;
@@ -17,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
+use iroh::endpoint::{Connection, ReadExactError, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointId};
 use iroh_blobs::Hash;
@@ -27,12 +32,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::{AbortHandle, JoinSet};
 
-use crate::folder::Folders;
+use crate::folder::{Folders, Serving};
 use crate::index::{safe_path, Apply, FileMeta};
 use crate::pieces::{read_piece, span, Staged, MAX_PIECE_LENGTH};
 
-/// The peer wire's ALPN. Gated: members only.
-pub const ALPN: &[u8] = b"/sync-node/blocks/0";
+/// The old one-piece-per-request protocol's ALPN, still used by
+/// [`Client::fetch_file`] (removed in BitTorrent plan step 4). Gated:
+/// members only.
+pub const PIECE_REQUEST_ALPN: &[u8] = b"/sync-node/blocks/0";
 
 /// Largest message (request or response header) accepted.
 pub const MAX_HEADER: u32 = 8 << 10;
@@ -144,14 +151,15 @@ pub async fn request_piece(
         .context("timed out waiting for a piece")?
 }
 
-/// The serving side of the peer wire.
+/// The serving side of the old one-piece-per-request protocol
+/// ([`PIECE_REQUEST_ALPN`]).
 #[derive(Debug, Clone)]
-pub struct PeerWireProtocol {
+pub struct PieceRequestProtocol {
     folders: Folders,
     serving: Arc<Semaphore>,
 }
 
-impl PeerWireProtocol {
+impl PieceRequestProtocol {
     pub(crate) fn new(folders: Folders) -> Self {
         Self {
             folders,
@@ -230,17 +238,349 @@ impl PeerWireProtocol {
                 if let Ok(Err(err)) = &other {
                     tracing::debug!("reading piece {index} of {}: {err}", request.path);
                 }
-                // The file no longer matches the entry: have the index look
-                // at it, in case the watcher hasn't (or can't: same size and
-                // time). Dropped if the index task is busy; it's a nudge.
-                if let Some(apply) = &folder.apply {
-                    let _ = apply.try_send(Apply::Rehash {
-                        path: request.path.clone(),
-                    });
-                }
+                rehash(&folder, &request.path);
                 Err(Refusal::Changed)
             }
         }
+    }
+}
+
+impl ProtocolHandler for PieceRequestProtocol {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        let remote = conn.remote_id();
+        while let Ok((send, recv)) = conn.accept_bi().await {
+            tokio::spawn(self.clone().answer(remote, send, recv));
+        }
+        Ok(())
+    }
+}
+
+/// The peer wire's ALPN. Gated: members only.
+pub const ALPN: &[u8] = b"/sync-node/peer-wire/0";
+
+/// The block length a leecher asks for: 16 KiB, as BitTorrent. The last
+/// block of a piece may be shorter.
+pub const BLOCK_LENGTH: u32 = 16 << 10;
+
+/// The longest block a node serves; a longer request is rejected.
+pub const MAX_BLOCK_LENGTH: u32 = 128 << 10;
+
+/// The first message on a swarm's stream, from the node that opened it: the
+/// swarm is version `content` of `path` in `folder` (BitTorrent's info
+/// hash).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handshake {
+    pub folder: NamespaceId,
+    /// Relative to the folder root, `/`-separated.
+    pub path: String,
+    pub content: Hash,
+}
+
+/// A block: `length` bytes from `begin` in piece `piece`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Block {
+    pub piece: u32,
+    pub begin: u32,
+    pub length: u32,
+}
+
+/// A peer-wire message. After the [`Handshake`], the other end answers
+/// with `Refused` (and closes the stream) or with its bitfield (`HaveAll`,
+/// `HaveNone` or `Bitfield`); the opener sends its bitfield too. Anything
+/// after that, both ways.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Message {
+    /// The answer to a handshake for a swarm the other end won't join.
+    Refused(Refusal),
+    /// Which pieces the sender has: one bit per piece, the first piece in
+    /// the high bit of the first byte.
+    Bitfield(Vec<u8>),
+    /// The sender has every piece: a seeder (BEP 6).
+    HaveAll,
+    HaveNone,
+    /// The sender has verified this piece.
+    Have(u32),
+    Interested,
+    NotInterested,
+    /// The sender won't serve requests until `Unchoke`.
+    Choke,
+    Unchoke,
+    Request(Block),
+    /// Followed by exactly the block's `length` bytes.
+    Piece(Block),
+    /// A request the sender no longer wants; it is still answered.
+    Cancel(Block),
+    /// A request the sender won't serve (BEP 6): every request gets a
+    /// `Piece` or a `Reject`.
+    Reject(Block, Why),
+}
+
+/// Why a request was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum Why {
+    #[error("choked")]
+    Choked,
+    /// The file no longer matches the swarm's version.
+    #[error("the file changed")]
+    Changed,
+    #[error("the piece isn't there")]
+    NotHave,
+    /// Past the end of the piece, empty, or longer than
+    /// [`MAX_BLOCK_LENGTH`].
+    #[error("not a block of this file")]
+    Invalid,
+    #[error("refused by the relay policy")]
+    Policy,
+}
+
+/// One swarm's stream, at either end: framed messages (see
+/// [`write_message`]), each `Piece` followed by its bytes.
+#[derive(Debug)]
+pub struct Wire {
+    send: SendStream,
+    recv: RecvStream,
+}
+
+impl Wire {
+    /// Opens a stream on `conn` for the swarm `handshake` names, sends the
+    /// handshake and returns the other end's answer: `Refused`, or its
+    /// bitfield.
+    pub async fn open(conn: &Connection, handshake: &Handshake) -> anyhow::Result<(Self, Message)> {
+        let (mut send, recv) = conn.open_bi().await?;
+        write_message(&mut send, handshake).await?;
+        let mut wire = Self { send, recv };
+        let answer = tokio::time::timeout(REQUEST_TIMEOUT, wire.recv())
+            .await
+            .context("timed out waiting for the handshake's answer")??
+            .context("closed before answering the handshake")?;
+        Ok((wire, answer.0))
+    }
+
+    pub async fn send(&mut self, msg: &Message) -> anyhow::Result<()> {
+        write_message(&mut self.send, msg).await
+    }
+
+    /// Sends a `Piece` message for `block` and its bytes, `data`.
+    pub async fn send_piece(&mut self, block: Block, data: &[u8]) -> anyhow::Result<()> {
+        debug_assert_eq!(data.len(), block.length as usize);
+        write_message(&mut self.send, &Message::Piece(block)).await?;
+        self.send.write_all(data).await?;
+        Ok(())
+    }
+
+    /// The next message, with a `Piece`'s bytes (empty for any other), or
+    /// `None` if the other end finished the stream.
+    pub async fn recv(&mut self) -> anyhow::Result<Option<(Message, Vec<u8>)>> {
+        let mut len = [0; 4];
+        match self.recv.read_exact(&mut len).await {
+            Ok(()) => {}
+            Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        }
+        let len = u32::from_le_bytes(len);
+        anyhow::ensure!(len <= MAX_HEADER, "message of {len} bytes is too large");
+        let mut body = vec![0; len as usize];
+        self.recv.read_exact(&mut body).await?;
+        let msg: Message = postcard::from_bytes(&body)?;
+        let mut data = Vec::new();
+        if let Message::Piece(block) = &msg {
+            anyhow::ensure!(
+                block.length <= MAX_BLOCK_LENGTH,
+                "block of {} bytes is too large",
+                block.length
+            );
+            data.resize(block.length as usize, 0);
+            self.recv.read_exact(&mut data).await?;
+        }
+        Ok(Some((msg, data)))
+    }
+
+    /// Finishes this end of the stream.
+    pub fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(self.send.finish()?)
+    }
+
+    /// Closes the stream both ways with `BAD_REQUEST`, for a message that
+    /// breaks the protocol.
+    fn reset(&mut self) {
+        let _ = self.recv.stop(VarInt::from_u32(BAD_REQUEST));
+        let _ = self.send.reset(VarInt::from_u32(BAD_REQUEST));
+    }
+}
+
+/// The serving side of the peer wire: one task per swarm stream.
+///
+/// A seeder (this node's entry has the version) answers `HaveAll`, unchokes
+/// a peer once it is interested (no choker yet: BitTorrent plan step 6), and
+/// answers every request in order, with `Piece` or `Reject`. A piece is
+/// read from disk and checked against its hash before its first block is
+/// sent, and kept for the blocks after it.
+#[derive(Debug, Clone)]
+pub struct PeerWireProtocol {
+    folders: Folders,
+}
+
+/// The last piece verified on one stream, for its next blocks.
+struct Verified {
+    piece: u32,
+    data: Vec<u8>,
+}
+
+impl PeerWireProtocol {
+    pub(crate) fn new(folders: Folders) -> Self {
+        Self { folders }
+    }
+
+    /// Runs one swarm stream until the other end finishes it.
+    async fn swarm(self, remote: EndpointId, send: SendStream, recv: RecvStream) {
+        let mut wire = Wire { send, recv };
+        let handshake =
+            tokio::time::timeout(REQUEST_TIMEOUT, read_message::<Handshake>(&mut wire.recv));
+        let handshake = match handshake.await {
+            Ok(Ok(handshake)) => handshake,
+            failed => {
+                let why = match failed {
+                    Ok(Err(err)) => format!("{err:#}"),
+                    _ => "timed out".to_string(),
+                };
+                tracing::debug!("{}: bad handshake: {why}", remote.fmt_short());
+                wire.reset();
+                return;
+            }
+        };
+        if let Err(err) = self.serve(remote, &handshake, &mut wire).await {
+            tracing::debug!(
+                "{}: swarm for {}: {err:#}",
+                remote.fmt_short(),
+                handshake.path
+            );
+            wire.reset();
+        }
+    }
+
+    async fn serve(
+        &self,
+        remote: EndpointId,
+        handshake: &Handshake,
+        wire: &mut Wire,
+    ) -> anyhow::Result<()> {
+        let folder = match self.join(remote, handshake) {
+            Ok(folder) => folder,
+            Err(refusal) => {
+                wire.send(&Message::Refused(refusal)).await?;
+                wire.finish()?;
+                return Ok(());
+            }
+        };
+        wire.send(&Message::HaveAll).await?;
+        let mut choked = true;
+        let mut verified: Option<Verified> = None;
+        while let Some((msg, _)) = wire.recv().await? {
+            match msg {
+                Message::Interested if choked => {
+                    choked = false;
+                    wire.send(&Message::Unchoke).await?;
+                }
+                Message::Request(block) => {
+                    let answer = self
+                        .block(&folder, handshake, block, choked, &mut verified)
+                        .await;
+                    match answer {
+                        Ok(data) => wire.send_piece(block, data).await?,
+                        Err(why) => {
+                            tracing::debug!(
+                                "{}: rejected {block:?} of {}: {why}",
+                                remote.fmt_short(),
+                                handshake.path
+                            );
+                            wire.send(&Message::Reject(block, why)).await?;
+                        }
+                    }
+                }
+                // A seeder downloads nothing: the peer's pieces and choking
+                // don't matter. Requests are answered in order, so a cancel
+                // always comes too late.
+                Message::Interested
+                | Message::NotInterested
+                | Message::Bitfield(_)
+                | Message::HaveAll
+                | Message::HaveNone
+                | Message::Have(_)
+                | Message::Choke
+                | Message::Unchoke
+                | Message::Cancel(_)
+                | Message::Reject(..) => {}
+                Message::Refused(_) | Message::Piece(_) => {
+                    anyhow::bail!("unexpected {msg:?}")
+                }
+            }
+        }
+        wire.finish()?;
+        Ok(())
+    }
+
+    /// The folder to serve the swarm `handshake` names from, if this node
+    /// seeds it to `remote`.
+    fn join(&self, remote: EndpointId, handshake: &Handshake) -> Result<Serving, Refusal> {
+        let folder = self.folders.serving(handshake.folder, remote)?;
+        if !safe_path(&handshake.path) {
+            return Err(Refusal::NoSuchFile);
+        }
+        folder
+            .entries
+            .get(&handshake.path)
+            .filter(|e| e.content == Some(handshake.content))
+            .ok_or(Refusal::NoSuchFile)?;
+        Ok(folder)
+    }
+
+    /// The bytes of `block`, from the verified piece if it is that one's,
+    /// else read from disk and checked; or why not.
+    async fn block<'a>(
+        &self,
+        folder: &Serving,
+        handshake: &Handshake,
+        block: Block,
+        choked: bool,
+        verified: &'a mut Option<Verified>,
+    ) -> Result<&'a [u8], Why> {
+        // The entry now: the file may have changed since the handshake.
+        let entry = folder
+            .entries
+            .get(&handshake.path)
+            .filter(|e| e.content == Some(handshake.content))
+            .ok_or(Why::Changed)?;
+        if block.piece as usize >= entry.pieces.len() {
+            return Err(Why::Invalid);
+        }
+        let end = u64::from(block.begin) + u64::from(block.length);
+        if block.length == 0
+            || block.length > MAX_BLOCK_LENGTH
+            || end > span(&entry, block.piece).1 as u64
+        {
+            return Err(Why::Invalid);
+        }
+        if choked {
+            return Err(Why::Choked);
+        }
+        if verified.as_ref().is_none_or(|v| v.piece != block.piece) {
+            *verified = None;
+            let (root, path, piece) = (folder.root.clone(), handshake.path.clone(), block.piece);
+            let read =
+                tokio::task::spawn_blocking(move || read_piece(&root, &path, &entry, piece)).await;
+            match read {
+                Ok(Ok(Some(data))) => *verified = Some(Verified { piece, data }),
+                other => {
+                    if let Ok(Err(err)) = &other {
+                        tracing::debug!("reading piece {piece} of {}: {err}", handshake.path);
+                    }
+                    rehash(folder, &handshake.path);
+                    return Err(Why::Changed);
+                }
+            }
+        }
+        let data = &verified.as_ref().expect("verified above").data;
+        Ok(&data[block.begin as usize..end as usize])
     }
 }
 
@@ -248,9 +588,20 @@ impl ProtocolHandler for PeerWireProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let remote = conn.remote_id();
         while let Ok((send, recv)) = conn.accept_bi().await {
-            tokio::spawn(self.clone().answer(remote, send, recv));
+            tokio::spawn(self.clone().swarm(remote, send, recv));
         }
         Ok(())
+    }
+}
+
+/// The file at `path` no longer matches its entry: has the index look at
+/// it, in case the watcher hasn't (or can't: same size and time). Dropped if
+/// the index task is busy; it's a nudge.
+fn rehash(folder: &Serving, path: &str) {
+    if let Some(apply) = &folder.apply {
+        let _ = apply.try_send(Apply::Rehash {
+            path: path.to_string(),
+        });
     }
 }
 
@@ -297,9 +648,12 @@ impl Client {
         if let Some(conn) = open.filter(|c| c.close_reason().is_none()) {
             return Ok(conn);
         }
-        let conn = tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(id, ALPN))
-            .await
-            .context("timed out connecting")??;
+        let conn = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            self.endpoint.connect(id, PIECE_REQUEST_ALPN),
+        )
+        .await
+        .context("timed out connecting")??;
         self.conns.lock().unwrap().insert(id, conn.clone());
         Ok(conn)
     }

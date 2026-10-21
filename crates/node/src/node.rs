@@ -31,7 +31,7 @@ use crate::invite::{self, InviteTicket};
 use crate::join::{self, JoinProtocol, JoinReply, Ticket};
 use crate::member::{self, Names};
 use crate::monitor::Monitor;
-use crate::peer_wire::{self, PeerWireProtocol};
+use crate::peer_wire::{self, PeerWireProtocol, PieceRequestProtocol};
 use crate::peers::{PeerSnapshot, Peers};
 use crate::presence::{View, PRESENCE_INTERVAL};
 use crate::record::{validate_chain, GroupId, Record, SignedRecord, MEMBERS_PREFIX};
@@ -170,6 +170,10 @@ impl Node {
         let router = Router::builder(endpoint)
             .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
             .accept(peer_wire::ALPN, PeerWireProtocol::new(folders.clone()))
+            .accept(
+                peer_wire::PIECE_REQUEST_ALPN,
+                PieceRequestProtocol::new(folders.clone()),
+            )
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(iroh_docs::ALPN, docs.clone())
             .accept(MEMBERS_ALPN, MembersProtocol(gate.clone()))

@@ -49,7 +49,7 @@ Not recommended: discard the work (loses the 80% that stays), or keep it uncommi
 * **ALPN:** `/sync-node/peer-wire/0`. Gated and tracked like the others. `/sync-node/blocks/0` is removed.
 * **Connections:** one peer-wire connection per pair of nodes (ALPN `/sync-node/peer-wire/0`, kept in the `Client` connection cache, dialled when not there). It is separate from the gossip, docs and blobs connections: a QUIC connection has one ALPN. **One bidirectional QUIC stream per swarm** on it: BitTorrent has one TCP connection per torrent; a QUIC stream is the same thing at a lower cost. The node that wants pieces opens the stream.
 * **Handshake** (first message on the stream, then the answer): `{ folder, path, content }`. The swarm's id is the content hash with the folder and path, as an info hash. The other end answers with its bitfield (`HaveAll` for a seeder, as BEP 6), or rejects (`NotKept`, `NoSuchFile`) and closes the stream.
-* **Messages after it** (both ways, framed as now): `Bitfield`, `HaveAll`, `HaveNone`, `Have(piece)`, `Interested`, `NotInterested`, `Choke`, `Unchoke`, `Request { piece, begin, length }`, `Piece { piece, begin }` + bytes, `Cancel { piece, begin, length }`, `Reject { piece, begin, length, why }` (BEP 6 fast extension: a request is answered, never dropped). `why`: `Choked`, `Changed`, `NotHave`, `Policy` (sync-plan step 8).
+* **Messages after it** (both ways, framed as now): `Bitfield`, `HaveAll`, `HaveNone`, `Have(piece)`, `Interested`, `NotInterested`, `Choke`, `Unchoke`, `Request { piece, begin, length }`, `Piece { piece, begin }` + bytes, `Cancel { piece, begin, length }`, `Reject { piece, begin, length, why }` (BEP 6 fast extension: a request is answered, never dropped). `why`: `Choked`, `Changed`, `NotHave`, `Invalid`, `Policy` (sync-plan step 8).
 * **Block:** 16 KiB (`BLOCK_LENGTH`); the last block of a piece may be short. A requested block of more than 128 KiB is rejected.
 * **Serving:** only verified pieces. A seeder reads from the file, a leecher from its staging file; both re-hash the whole piece before the first block of it is sent (a cache of the last few verified pieces avoids a re-hash per block). A mismatch → `Reject(Changed)` and `Apply::Rehash` (file) or the piece goes back to missing (staging file).
 * **Piece picker** (per swarm): partial pieces first, then rarest first among pieces some unchoked peer has, ties at random. One peer per piece while not in the endgame, so a bad piece has one sender, who is dropped from the swarm. **Endgame:** once every missing block is asked for, an overdue block (open more than 2 × the typical block time, as now) is asked of another peer too, and the loser gets `Cancel`.
@@ -94,9 +94,17 @@ Not BitTorrent, but step 7's load test can't pass without it.
 
 #### Step 3: Peer Wire, Seeder Side
 
-* [ ] `peer_wire.rs`: ALPN, messages, handshake, the per-stream serve loop. A seeder answers `HaveAll`, starts unchoked (no choker yet), serves blocks with the on-disk checks, answers every request with `Piece` or `Reject`.
-* [ ] Tests (port `tests/block_protocol.rs`): a member gets blocks that make up pieces matching the piece hashes; rejected: `NotKept`, `NoSuchFile`, `Changed` (and the index catches up), unsafe path, a request over 128 KiB, a block past the end of the piece; a non-member can't connect; a garbage or oversized message closes the stream, not the connection.
+* [x] `peer_wire.rs`: ALPN, messages, handshake, the per-stream serve loop. A seeder answers `HaveAll`, starts unchoked (no choker yet), serves blocks with the on-disk checks, answers every request with `Piece` or `Reject`.
+* [x] Tests (port `tests/block_protocol.rs`): a member gets blocks that make up pieces matching the piece hashes; rejected: `NotKept`, `NoSuchFile`, `Changed` (and the index catches up), unsafe path, a request over 128 KiB, a block past the end of the piece; a non-member can't connect; a garbage or oversized message closes the stream, not the connection.
 * **Done when:** a node serves exactly the blocks of the pieces its index describes, and rejects everything else.
+* Done 2026-10-21. As built (more exact than the design above):
+  * The old protocol stays beside it until step 4: its ALPN and server are now `PIECE_REQUEST_ALPN` and `PieceRequestProtocol`; `ALPN` and `PeerWireProtocol` are the new ones.
+  * `Wire` is the stream at either end (`open`, `send`, `send_piece`, `recv`); step 4's download loop uses it.
+  * Handshake answer: `Refused(NotKept | NoSuchFile)` and the stream is finished, or the answerer's bitfield message. The opener sends its own bitfield message after it.
+  * A seeder starts choked and sends `Unchoke` on `Interested`, so step 6's choker only has to decide when.
+  * `Why::Invalid` added (not in the design's list): a block past the end of its piece, empty, or over `MAX_BLOCK_LENGTH` (128 KiB), or a piece past the last. Checks run in order: entry still has the version (`Changed`), `Invalid`, `Choked`, then the disk read.
+  * The cache of verified pieces is the last piece per stream only: a piece can be 16 MiB, and a cache per stream of more would cost too much memory on the Pi.
+  * Requests are answered in order on the stream, so a `Cancel` always comes too late and is ignored.
 
 #### Step 4: Download from Seeders
 
