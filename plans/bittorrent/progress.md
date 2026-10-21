@@ -6,8 +6,10 @@ Handoff for the next session. Read this first, then [plan.md](plan.md) and [expe
 
 * Block work committed in `93d8f91` (on `main`). Everything below is uncommitted.
 * Step 0 done: the developer reviewed the docs and wrote [expectations.md](expectations.md) (the download ceremony in BitTorrent terms; reviewed and corrected 2026-10-21).
-* Step 1 done (uncommitted): `blocks.rs` split into `pieces.rs` and `peer_wire.rs`, all renames, tests renamed, entry encoding fixture `the_entry_encoding_is_unchanged`. `just check` passes. **Next: the developer commits step 1 (with the doc changes, or apart); then step 2.**
-* `just stress` runs the load tests in `tests/starved.rs`.
+* Step 1 done (uncommitted): `blocks.rs` split into `pieces.rs` and `peer_wire.rs`, all renames, tests renamed, entry encoding fixture `the_entry_encoding_is_unchanged`. `just check` passes.
+* Step 2 done in code (uncommitted): `Folders::retry_sync` (doc sync again each presence interval with online peers whose last sync failed), metadata blob fetched on entry arrival with retries (`META_FETCH_TRIES`), probe in `tests/starved.rs`. The index fault is gone; the 30 s latency criterion is not met (doc layer slow under load, see plan step 2 "Result"). Step 7 splits stuck fetches by cause. `just check` passes.
+* **Next: step 3** (peer wire, seeder side).
+* `just stress` runs the load tests in `tests/starved.rs`. Each run takes about 2 min and varies a lot (0 to 8 stuck of 8); judge on 5 runs, never on one.
 
 ## Decisions 2026-10-21
 

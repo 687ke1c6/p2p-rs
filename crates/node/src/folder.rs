@@ -14,7 +14,7 @@
 //! node holds the docs store. Like `member add`, it queues the request as a
 //! file `folder-adds/<name>` holding the path, and the monitor applies it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::io;
@@ -32,12 +32,12 @@ use iroh_blobs::store::fs::FsStore;
 use iroh_docs::engine::LiveEvent;
 use iroh_docs::protocol::Docs;
 use iroh_docs::store::Query;
-use iroh_docs::{Capability, NamespaceId, NamespaceSecret};
+use iroh_docs::{Capability, ContentStatus, NamespaceId, NamespaceSecret};
 use n0_future::task::AbortOnDropHandle;
 use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Notify};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::content::Content;
 use crate::index::{self, Apply, Entries, FileMeta, FolderIndex, IndexStats};
@@ -61,6 +61,11 @@ pub const FOLDER_NODES_PREFIX: &str = "folder-nodes/";
 
 /// How long fetching one missing index metadata blob may take.
 const META_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many times, a second apart, an entry's metadata blob that didn't
+/// arrive with it is fetched from the node that sent the entry, before
+/// [`Folders::fetch_missing`] (each presence interval) is left to it.
+const META_FETCH_TRIES: u32 = 10;
 
 /// Requests waiting for a folder's index task.
 const APPLY_QUEUE: usize = 16;
@@ -334,6 +339,10 @@ struct Running {
     changed: Arc<Notify>,
     /// The nodes the doc is synced with.
     peers: BTreeSet<EndpointId>,
+    /// The peers whose last doc sync with this node succeeded, either way
+    /// round. Docs doesn't try a failed sync again (see
+    /// [`Folders::retry_sync`]).
+    synced: Arc<Mutex<HashSet<EndpointId>>>,
     /// This node's entries, kept by the index task.
     entries: Entries,
     /// To the index task, while it runs.
@@ -512,8 +521,51 @@ impl Folders {
         let dirty = Arc::new(AtomicBool::new(true));
         let changed = Arc::new(Notify::new());
         let (flag, notify) = (dirty.clone(), changed.clone());
+        let synced = Arc::new(Mutex::new(HashSet::new()));
+        let results = synced.clone();
+        let (blobs, downloader) = (self.0.blobs.clone(), self.0.downloader.clone());
         let events = tokio::spawn(async move {
+            // Metadata fetches, stopped with this task.
+            let mut fetches = JoinSet::new();
             while let Some(event) = events.next().await {
+                // Docs fetches an entry's metadata once, when the entry
+                // arrives, and not again if that fails (as it does on a busy
+                // machine): fetch it here until it is there.
+                if let Ok(LiveEvent::InsertRemote {
+                    from,
+                    entry,
+                    content_status: ContentStatus::Missing | ContentStatus::Incomplete,
+                }) = &event
+                {
+                    let (hash, from) = (entry.content_hash(), *from);
+                    let (blobs, downloader) = (blobs.clone(), downloader.clone());
+                    let (flag, notify) = (flag.clone(), notify.clone());
+                    fetches.spawn(async move {
+                        for _ in 0..META_FETCH_TRIES {
+                            // Docs' own fetch first: usually it succeeds.
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            if blobs.has(hash).await.unwrap_or(false) {
+                                break;
+                            }
+                            let download = downloader.download(hash, vec![from]);
+                            if let Ok(Ok(())) =
+                                tokio::time::timeout(META_FETCH_TIMEOUT, download).await
+                            {
+                                flag.store(true, Ordering::Relaxed);
+                                notify.notify_one();
+                                break;
+                            }
+                        }
+                    });
+                }
+                while fetches.try_join_next().is_some() {}
+                if let Ok(LiveEvent::SyncFinished(sync)) = &event {
+                    let mut results = results.lock().unwrap();
+                    match sync.result {
+                        Ok(_) => results.insert(sync.peer),
+                        Err(_) => results.remove(&sync.peer),
+                    };
+                }
                 if matches!(
                     event,
                     Ok(LiveEvent::InsertLocal { .. }
@@ -533,6 +585,7 @@ impl Folders {
             dirty,
             changed,
             peers: BTreeSet::new(),
+            synced,
             entries: Entries::default(),
             apply: None,
         })
@@ -565,6 +618,46 @@ impl Folders {
             running.dirty.store(true, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// Starts syncing each folder's doc again with every peer `online` says
+    /// is online whose last sync failed or hasn't finished. Docs syncs only
+    /// when asked, on a new gossip neighbour, or on a neighbour's report, and
+    /// never tries a failed sync again: entries written before a node joined
+    /// would never reach it. Docs runs one sync per peer at a time, so a
+    /// sync still running isn't doubled. Every presence interval.
+    pub(crate) async fn retry_sync(&self, online: impl Fn(EndpointId) -> bool) {
+        let due: Vec<(NamespaceId, Vec<EndpointId>)> = {
+            let running = self.0.running.lock().unwrap();
+            running
+                .iter()
+                .map(|(id, r)| {
+                    let synced = r.synced.lock().unwrap();
+                    let due = r.peers.iter().copied();
+                    (
+                        *id,
+                        due.filter(|p| !synced.contains(p) && online(*p)).collect(),
+                    )
+                })
+                .filter(|(_, due): &(_, Vec<_>)| !due.is_empty())
+                .collect()
+        };
+        for (id, peers) in due {
+            let Ok(Some(doc)) = self.0.docs.open(id).await else {
+                continue;
+            };
+            tracing::debug!(
+                "doc {}: syncing again with {} peers",
+                id.fmt_short(),
+                peers.len()
+            );
+            if let Err(err) = doc
+                .start_sync(peers.into_iter().map(EndpointAddr::new).collect())
+                .await
+            {
+                tracing::debug!("doc {}: syncing again: {err:#}", id.fmt_short());
+            }
+        }
     }
 
     /// Fetches the metadata blobs of entries docs synced but couldn't fetch
@@ -880,7 +973,11 @@ impl Folders {
             .unwrap()
             .iter()
             .filter(|(_, r)| r.peers.contains(&id))
-            .map(|(folder, _)| *folder)
+            .map(|(folder, r)| {
+                // Until this sync succeeds, `retry_sync` tries again.
+                r.synced.lock().unwrap().remove(&id);
+                *folder
+            })
             .collect();
         for folder in shared {
             if let Ok(Some(doc)) = self.0.docs.open(folder).await {

@@ -81,9 +81,16 @@ No change of behaviour.
 
 Not BitTorrent, but step 7's load test can't pass without it.
 
-* [ ] `Folders::sync_peers` starts sync with a node once only. Start it again each presence interval with every online node that keeps the folder, as `fetch_missing` does for metadata blobs.
-* [ ] Prove the cause first: a probe in `tests/starved.rs` that logs when b's doc gets a's entry for the file, and the iroh-docs sync results between them.
-* **Done when:** in 5 runs of `a_starved_node_fetches_every_file`, no b has `in_view: false` or waits more than 30 s for a's entry.
+* [x] `Folders::sync_peers` starts sync with a node once only. Start it again each presence interval with every online node that keeps the folder **whose last doc sync failed or hasn't finished** (decided 2026-10-21: not every interval with every node; a full reconciliation each 5 s per peer and folder buys nothing after a success). `Running::synced` holds the peers whose last `SyncFinished` was `Ok`; `Folders::retry_sync` runs each presence interval; `resync_with` clears the peer, so a node that comes back syncs again until it succeeds.
+* [x] Prove the cause first: a probe in `tests/starved.rs` that logs when b's doc gets a's entry for the file, and the iroh-docs sync results between them.
+  * Probe (2026-10-21, 5 runs): `Stuck::timeline` has both docs' `SyncFinished`, gossip neighbours, the entry's arrival, and when each node first started doc sync with the other.
+  * Index fault seen 2 times in 40 groups: b starts doc sync with a once, then nothing for 70 s (no sync result, no neighbour); a never starts sync with b (it hasn't read b's "keeps" record). b never gets the entry.
+  * iroh-docs 0.101 (`engine/live.rs`) syncs only on `start_sync`, a new gossip neighbour, or a neighbour's report; a failed sync is not tried again. Our `sync_peers` calls `start_sync` once per node, `resync_with` only when a member comes online.
+  * Most `Err("Failed to close connection1")` results moved the entry anyway (it arrives right after): the error is on close.
+  * Other stuck groups were not index faults: a late folder listing (membership, 32–67 s) or the entry in view and the transport slow (steps 3–6).
+* **Done when:** in 5 runs of `a_starved_node_fetches_every_file`, no b that kept the folder has `in_view: false` or waits more than 30 s for a's entry, counted from when b keeps the folder (`view_after` in the probe). A late folder listing (membership doc) is not this step's fault and is not counted; the fetch itself is steps 3–7.
+* [x] Metadata blob retry (found by the probe after the sync retry): docs fetches an entry's metadata blob once, on arrival, and under load that always failed (no `ContentReady`); the entry then waited for the tick-based `fetch_missing_meta`, 30–49 s. The doc event task now fetches it from the sending node, 1 s apart, up to `META_FETCH_TRIES` (10) times.
+* **Result (2026-10-21, 10 runs after the sync retry, 5 after the metadata retry):** the index fault is gone: no b that kept the folder lacked a's entry for want of a sync. **The 30 s criterion is not met:** in the last 5 runs, 11 of 37 listed groups had the file in view after 30–64 s, and 1 had the entry but not its metadata after 56 s. The time is spread over the doc layer under load: 10–17 s from keeping the folder to the first doc sync, failed syncs, the metadata blob's download. Also seen once: a doc sync that hung for 65 s, blocking every retry with that peer (iroh-docs has no timeout in `connect_and_sync`; only a patch of iroh-docs can add one). Not chased further here: step 7 counts these against the doc layer, as input to a possible ADR 0003 (own index exchange, Syncthing-style).
 
 #### Step 3: Peer Wire, Seeder Side
 
@@ -119,6 +126,7 @@ Not BitTorrent, but step 7's load test can't pass without it.
 
 * [ ] `just stress`: `a_starved_node_fetches_every_file` and `a_starved_node_reads_every_record` pass 5 runs in a row.
 * [ ] Compare with the block-protocol baseline (0, 2, 2, 2 of 8 stuck, 2026-10-20).
+* [ ] Split each stuck fetch by its cause with the probe in `tests/starved.rs` (`Stuck::timeline`, `view_after`): doc layer (listing, sync, metadata blob) or peer wire. If the doc layer still causes stuck fetches, the developer decides on ADR 0003 (own index exchange for folder docs, Syncthing-style; folder index first, membership after, as its own plan).
 * [ ] Constants that are guesses (block length, queue limits, slots, rounds, timeouts) are written in the notes with what the load tests showed.
 * **Done when:** no fetch is stuck under load.
 

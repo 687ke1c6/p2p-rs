@@ -181,6 +181,7 @@ impl Monitor {
             tracing::debug!("broadcasting presence: {err:#}");
         }
 
+        self.folders.retry_sync(|id| self.view.is_online(id)).await;
         let (came, went) = self.view.update_online();
         for id in came.into_iter().filter(|id| *id != self.me()) {
             tracing::info!("{} is online", self.names.display(id));
