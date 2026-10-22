@@ -1,6 +1,9 @@
+use std::future::IntoFuture;
 use std::io::IsTerminal;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
@@ -12,6 +15,7 @@ use sync_node::key::{self, KEY_FILE};
 use sync_node::member::{self, check_name};
 use sync_node::presence::PRESENCE_INTERVAL;
 use sync_node::status::STATUS_FILE;
+use sync_node::ui;
 use sync_node::{invite, Config, Group, Network, Node, Ticket};
 
 /// Local-first folder sync over iroh.
@@ -41,6 +45,13 @@ enum Command {
         /// Move file contents only over direct paths, never through a relay.
         #[arg(long, env = "SYNC_NODE_DIRECT_ONLY")]
         direct_only: bool,
+        /// Serve the web UI on this address, e.g. 127.0.0.1:7777. There is no
+        /// auth: use a loopback address. No address, no web UI.
+        #[arg(long, env = "SYNC_NODE_UI_ADDR")]
+        ui_addr: Option<SocketAddr>,
+        /// The built web UI. Defaults to `ui/` next to the executable.
+        #[arg(long, env = "SYNC_NODE_UI_DIR")]
+        ui_dir: Option<PathBuf>,
     },
     /// Found a new group with this node as its only member.
     Create,
@@ -170,13 +181,52 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
     match command {
         Command::Id => println!("{}", key.public()),
-        Command::Run { direct_only } => {
+        Command::Run {
+            direct_only,
+            ui_addr,
+            ui_dir,
+        } => {
+            // Bound before the node starts, so a taken address fails `run`
+            // at once.
+            let listener = match ui_addr {
+                Some(addr) => Some((
+                    addr,
+                    tokio::net::TcpListener::bind(addr)
+                        .await
+                        .with_context(|| format!("binding the UI address {addr}"))?,
+                )),
+                None => None,
+            };
             let config = Config {
                 direct_only,
                 ..Config::new(Network::N0)
             };
-            let node = Node::spawn_with(&config_dir, key, config).await?;
+            let node = Arc::new(Node::spawn_with(&config_dir, key, config).await?);
             tracing::info!("node {} running from {}", node.id(), config_dir.display());
+            let (stop_ui, ui_stopped) = tokio::sync::oneshot::channel::<()>();
+            let server = match listener {
+                Some((addr, listener)) => {
+                    let ui_dir = match ui_dir {
+                        Some(dir) => dir,
+                        None => ui::UiConfig::default_ui_dir()
+                            .context("finding the UI dir next to the executable")?,
+                    };
+                    tracing::info!("web UI at http://{addr}/ from {}", ui_dir.display());
+                    let app = ui::router(
+                        node.clone(),
+                        ui::UiConfig {
+                            addr,
+                            ui_dir,
+                            config_dir: config_dir.clone(),
+                        },
+                    );
+                    let serve = axum::serve(listener, app).with_graceful_shutdown(async {
+                        let _ = ui_stopped.await;
+                    });
+                    Some(tokio::spawn(serve.into_future()))
+                }
+                None => None,
+            };
             tokio::select! {
                 _ = node.endpoint().online() => {
                     tracing::info!("online at {:?}", node.addr());
@@ -185,6 +235,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 result = tokio::signal::ctrl_c() => result?,
             }
             tracing::info!("shutting down");
+            if let Some(server) = server {
+                let _ = stop_ui.send(());
+                server.await?.context("web UI server")?;
+            }
+            let node = Arc::try_unwrap(node)
+                .map_err(|_| anyhow::anyhow!("the web UI still holds the node"))?;
             node.shutdown().await?;
         }
         Command::Create => {

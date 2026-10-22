@@ -19,6 +19,7 @@ pub mod pieces;
 pub mod presence;
 pub mod record;
 pub mod status;
+pub mod ui;
 pub mod view;
 
 pub use group::Group;

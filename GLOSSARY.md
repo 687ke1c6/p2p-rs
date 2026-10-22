@@ -103,6 +103,20 @@ Once every missing block is asked for, an overdue block is asked of another peer
 The file a fetch writes pieces into, at the folder root, until it is complete and placed. A leecher serves its verified pieces from it.
 _Avoid_: Temporary file, partial file
 
+## Interface
+
+**Web UI**:
+The page that the running node serves to a browser: what the node sees, and the setup actions (create, join, invites, members, folders). Part of `sync-node run` (ADR 0004).
+_Avoid_: Dashboard, front end, metrics page, console
+
+**UI address**:
+The address the web UI's server listens on, set by `--ui-addr` / `SYNC_NODE_UI_ADDR`. No UI address, no server.
+_Avoid_: Port, bind (alone)
+
+**UI dir**:
+The directory of the built page that the server sends, set by `--ui-dir` / `SYNC_NODE_UI_DIR`; `ui/` next to the executable by default. Built from the `ui/` source directory into `ui/dist/`.
+_Avoid_: Static dir, assets
+
 ## Processes
 
 **Download ceremony**
