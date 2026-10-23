@@ -14,7 +14,8 @@ use iroh_blobs::Hash;
 use iroh_docs::NamespaceId;
 use sync_node::index::FileMeta;
 use sync_node::peer_wire::{
-    self, holds, Block, Handshake, Message, Refusal, Why, Wire, BLOCK_LENGTH, MAX_BLOCK_LENGTH,
+    self, holds, Block, Handshake, Message, Refusal, SwarmPeerState, Why, Wire, BLOCK_LENGTH,
+    MAX_BLOCK_LENGTH,
 };
 use sync_node::picker::Holds;
 use sync_node::pieces::{staging_path, MIN_PIECE_LENGTH};
@@ -450,6 +451,15 @@ async fn a_leecher_serves_from_its_staging_file() {
         b.fetched().get(&a.id()).copied().unwrap_or(0) > 2 << 20
     })
     .await;
+    // The seeder's choker uploads to b, as its next published rows show.
+    eventually("a's rows to show b unchoked", || async {
+        a.transfers()
+            .uploads
+            .iter()
+            .any(|u| u.id == b.id() && u.unchoked && u.interested)
+    })
+    .await;
+    let a_id = a.id();
     a.shutdown().await.unwrap();
 
     let swarm = handshake(id, "big.bin", hash);
@@ -497,6 +507,22 @@ async fn a_leecher_serves_from_its_staging_file() {
         panic!("not a bitfield: {again:?}");
     };
     assert!(!have[bad as usize] && have[good as usize]);
+
+    // b's download goes on without a, with the pieces it has.
+    eventually("b's snapshot to show a out of the swarm", || async {
+        b.transfers().swarms.iter().any(|s| {
+            s.folder == id
+                && s.path == "big.bin"
+                && s.content == hash
+                && s.pieces == meta.pieces.len() as u32
+                && s.have > 0
+                && s.have < s.pieces
+                && s.peers
+                    .iter()
+                    .any(|p| p.id == a_id && !matches!(p.state, SwarmPeerState::In(_)))
+        })
+    })
+    .await;
 
     b.shutdown().await.unwrap();
     c.shutdown().await.unwrap();

@@ -93,6 +93,13 @@ A peer doesn't serve the other end's requests now. **Unchoke** ends it. Upload s
 **Optimistic unchoke**:
 An unchoke that rotates to another interested peer, so its speed can be measured.
 
+**Snubbed**:
+A peer that has requests open but sent no block for 60 s. It is asked for one block at a time until it sends.
+
+**Stuck**:
+A download with no peer in its swarm that both unchokes this node and has a piece it lacks. With no peer in the swarm for 30 s, the download stops, for a later try.
+_Avoid_: Stalled, hung
+
 **Rarest first**:
 Pieces held by the fewest peers are asked for first.
 
@@ -112,6 +119,10 @@ _Avoid_: Dashboard, front end, metrics page, console
 **UI address**:
 The address the web UI's server listens on, set by `--ui-addr` / `SYNC_NODE_UI_ADDR`. No UI address, no server.
 _Avoid_: Port, bind (alone)
+
+**UI topic**:
+One read the web UI subscribes to over its WebSocket, named as its read route (`status`, `folders`, `folders/<name>`, `transfers`); the node sends its data whenever it changes (ADR 0005).
+_Avoid_: Topic (alone: that's the gossip presence topic), channel, feed, subscription
 
 **UI dir**:
 The directory of the built page that the server sends, set by `--ui-dir` / `SYNC_NODE_UI_DIR`; `ui/` next to the executable by default. Built from the `ui/` source directory into `ui/dist/`.

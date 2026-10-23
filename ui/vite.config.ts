@@ -12,7 +12,15 @@ export default defineConfig({
   resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
   server: {
     proxy: {
-      "/api": { target: `http://${nodeAddr}`, changeOrigin: true },
+      "/api": {
+        target: `http://${nodeAddr}`,
+        changeOrigin: true,
+        ws: true,
+        // The node takes a WebSocket only from its own UI address (ADR 0005).
+        configure: (proxy) => {
+          proxy.on("proxyReqWs", (proxyReq) => proxyReq.setHeader("origin", `http://${nodeAddr}`));
+        },
+      },
     },
   },
 });

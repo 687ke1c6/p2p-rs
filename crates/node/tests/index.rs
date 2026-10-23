@@ -11,7 +11,7 @@ use iroh_docs::store::Query;
 use iroh_docs::NamespaceId;
 use n0_future::StreamExt;
 use sync_node::folder;
-use sync_node::index::FileMeta;
+use sync_node::index::{key_path, FileMeta};
 use sync_node::view::Version;
 use sync_node::{Config, Network, Node};
 
@@ -117,7 +117,7 @@ async fn entry_times(node: &Node, id: NamespaceId) -> HashMap<String, u64> {
         .map(|entry| {
             let entry = entry.unwrap();
             (
-                String::from_utf8(entry.key().to_vec()).unwrap(),
+                key_path(entry.key()).unwrap().to_string(),
                 entry.timestamp(),
             )
         })
@@ -296,7 +296,7 @@ async fn burst_of_changes_yields_one_update_per_file() {
     {
         if let LiveEvent::InsertLocal { entry } = event.unwrap() {
             *writes
-                .entry(String::from_utf8(entry.key().to_vec()).unwrap())
+                .entry(key_path(entry.key()).unwrap().to_string())
                 .or_default() += 1;
         }
     }
@@ -382,6 +382,40 @@ async fn missing_root_pauses_the_folder_instead_of_deleting() {
     )
     .await;
     assert!(tombstones(&node, id).await.is_empty());
+
+    node.shutdown().await.unwrap();
+}
+
+/// A path that starts with another one (`notes.md`, `notes`) keeps its
+/// entry when the shorter one is written later, and its delete is recorded.
+/// iroh-docs removes an author's older entries whose keys start with a new
+/// entry's key, so the index's keys must be prefix-free.
+#[tokio::test]
+async fn a_path_that_starts_with_another_keeps_its_entry() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let root = folder.path();
+    let node = spawn(config_dir.path(), SecretKey::generate()).await;
+    node.create_group().await.unwrap();
+    let id = node.add_folder("docs", root).await.unwrap();
+    write(root, "notes.md", "long");
+    wait_live(&node, id, &[("notes.md", "long")]).await;
+
+    write(root, "notes", "short");
+    wait_live(&node, id, &[("notes", "short"), ("notes.md", "long")]).await;
+    // And again: a tombstone at the shorter path, written after.
+    fs::remove_file(root.join("notes")).unwrap();
+    eventually("notes to be tombstoned", || async {
+        tombstones(&node, id).await.contains("notes")
+    })
+    .await;
+    wait_live(&node, id, &[("notes.md", "long")]).await;
+
+    fs::remove_file(root.join("notes.md")).unwrap();
+    eventually("notes.md to be tombstoned", || async {
+        tombstones(&node, id).await.contains("notes.md")
+    })
+    .await;
 
     node.shutdown().await.unwrap();
 }

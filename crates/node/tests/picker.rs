@@ -275,3 +275,26 @@ fn a_piece_a_peer_lacks_or_this_node_lost_is_asked_for_elsewhere() {
     assert_eq!(picker.have(), [false, false]);
     assert_eq!(picker.next(a, t).unwrap().piece, 1);
 }
+
+#[test]
+fn progress_counts() {
+    let mut picker = Picker::new(PIECE, 4 * u64::from(PIECE), [1, 2, 3]);
+    let seeder = picker.add_peer(Holds::All);
+    let partial = picker.add_peer(Holds::These(vec![true, false, true, false]));
+    assert_eq!((picker.held(seeder), picker.held(partial)), (4, 2));
+    assert_eq!(picker.have_count(), 1);
+    picker.has(partial, 3);
+    assert_eq!(picker.held(partial), 3);
+    assert_eq!(picker.active(), 0);
+    let t = Instant::now();
+    // Two pieces started; the first in full, so it waits for its check.
+    let blocks = take(&mut picker, seeder, BLOCKS as usize + 1, t);
+    assert_eq!(picker.active(), 2);
+    for block in blocks.iter().filter(|b| b.piece == blocks[0].piece) {
+        picker.received(seeder, *block, &bytes(*block), t + MS);
+    }
+    assert_eq!(picker.active(), 2);
+    picker.verified(blocks[0].piece);
+    assert_eq!(picker.active(), 1);
+    assert_eq!(picker.have_count(), 2);
+}

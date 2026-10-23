@@ -2,3 +2,4 @@
 .claude/skills
 /ui/node_modules
 /ui/dist
+/test

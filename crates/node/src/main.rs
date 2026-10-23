@@ -212,7 +212,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                             .context("finding the UI dir next to the executable")?,
                     };
                     tracing::info!("web UI at http://{addr}/ from {}", ui_dir.display());
-                    let app = ui::router(
+                    let (app, topics) = ui::router(
                         node.clone(),
                         ui::UiConfig {
                             addr,
@@ -223,7 +223,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                     let serve = axum::serve(listener, app).with_graceful_shutdown(async {
                         let _ = ui_stopped.await;
                     });
-                    Some(tokio::spawn(serve.into_future()))
+                    Some((topics, tokio::spawn(serve.into_future())))
                 }
                 None => None,
             };
@@ -235,7 +235,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 result = tokio::signal::ctrl_c() => result?,
             }
             tracing::info!("shutting down");
-            if let Some(server) = server {
+            if let Some((topics, server)) = server {
+                // The WebSockets first: graceful shutdown waits for them.
+                topics.stop().await;
                 let _ = stop_ui.send(());
                 server.await?.context("web UI server")?;
             }

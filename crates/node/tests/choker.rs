@@ -33,6 +33,7 @@ fn with_few_peers_every_interested_peer_is_unchoked() {
     // A peer that isn't interested isn't unchoked.
     let mut choker = Choker::<u32>::default();
     assert!(choker.round(&[], false).is_empty());
+    assert_eq!(choker.optimistic(), None);
 }
 
 #[test]
@@ -42,6 +43,7 @@ fn the_optimistic_unchoke_rotates_through_every_choked_peer() {
     let first = choker.round(&all, false);
     let optimistic = |set: &HashSet<u32>| *set.iter().find(|k| **k < 4).unwrap();
     let start = optimistic(&first);
+    assert_eq!(choker.optimistic(), Some(start));
     // Without a rotation it stays.
     assert_eq!(optimistic(&choker.round(&all, false)), start);
     // Each rotation moves it to the slow peer that had it least recently:
@@ -49,6 +51,7 @@ fn the_optimistic_unchoke_rotates_through_every_choked_peer() {
     let mut seen = HashSet::from([start]);
     for _ in 0..3 {
         let next = optimistic(&choker.round(&all, true));
+        assert_eq!(choker.optimistic(), Some(next));
         assert!(seen.insert(next), "{next} came back before the others");
     }
     assert_eq!(seen, HashSet::from([0, 1, 2, 3]));

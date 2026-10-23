@@ -89,6 +89,12 @@ impl<K: Copy + Eq + Hash + Ord> Choker<K> {
         unchoked.extend(self.optimistic);
         unchoked
     }
+
+    /// The optimistic unchoke of the last round, if there was a choked
+    /// interested peer for it.
+    pub fn optimistic(&self) -> Option<K> {
+        self.optimistic
+    }
 }
 
 /// Bytes per second, over the last [`RATE_WINDOW`].

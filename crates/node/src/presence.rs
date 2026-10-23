@@ -80,6 +80,7 @@ impl SignedPresence {
 
 /// A pair's connection type, as the group reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub enum LinkState {
     Direct,
     Relay,

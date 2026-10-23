@@ -11,7 +11,7 @@ use iroh::SecretKey;
 use iroh_blobs::Hash;
 use iroh_docs::NamespaceId;
 use sync_node::content::{RENAME_GRACE, STALE_STAGING};
-use sync_node::index::FileMeta;
+use sync_node::index::{doc_key, FileMeta};
 use sync_node::pieces::{staging_path, Hasher, MIN_PIECE_LENGTH};
 use sync_node::view::Version;
 use sync_node::{Config, Network, Node};
@@ -285,13 +285,9 @@ async fn unsafe_paths_are_refused() {
             a.id(),
             Version::default().bumped(a.id()),
         );
-        doc.set_bytes(
-            author,
-            path.as_bytes().to_vec(),
-            postcard::to_stdvec(&meta).unwrap(),
-        )
-        .await
-        .unwrap();
+        doc.set_bytes(author, doc_key(path), postcard::to_stdvec(&meta).unwrap())
+            .await
+            .unwrap();
     }
     // A safe path whose piece hashes don't describe its content.
     let mut hasher = Hasher::new(4);
@@ -306,7 +302,7 @@ async fn unsafe_paths_are_refused() {
     liar.pieces = vec![Hash::new(b"something else")];
     doc.set_bytes(
         author,
-        b"liar.txt".to_vec(),
+        doc_key("liar.txt"),
         postcard::to_stdvec(&liar).unwrap(),
     )
     .await
@@ -860,7 +856,7 @@ async fn pieces_that_dont_match_are_refused() {
     let author = a.docs().author_default().await.unwrap();
     doc.set_bytes(
         author,
-        b"real.bin".to_vec(),
+        doc_key("real.bin"),
         postcard::to_stdvec(&lie).unwrap(),
     )
     .await

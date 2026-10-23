@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use iroh::endpoint::{
     Connection, ReadExactError, RecvStream, SendStream, VarInt, WeakConnectionHandle,
 };
@@ -309,7 +310,7 @@ struct Verified {
 impl PeerWireProtocol {
     /// The nodes the choker has unchoked now.
     pub(crate) fn unchoked(&self) -> Vec<EndpointId> {
-        let state = self.uploads.0.lock().unwrap();
+        let state = self.uploads.state.lock().unwrap();
         let mut out: Vec<EndpointId> = state
             .peers
             .iter()
@@ -318,6 +319,15 @@ impl PeerWireProtocol {
             .collect();
         out.sort();
         out
+    }
+
+    /// What this node downloads and uploads now, for the web UI's
+    /// Transfers view: copied out of the locks.
+    pub(crate) fn transfers(&self) -> Transfers {
+        Transfers {
+            swarms: self.swarms.snapshot(),
+            uploads: self.uploads.snapshot(),
+        }
     }
 
     pub(crate) fn new(folders: Folders, direct_only: bool) -> Self {
@@ -606,7 +616,12 @@ impl PeerWireProtocol {
 /// [`Choker`] decides on, every [`ROUND`] and whenever a peer's interest
 /// changes.
 #[derive(Debug, Clone, Default)]
-struct Uploads(Arc<Mutex<UploadState>>);
+struct Uploads {
+    state: Arc<Mutex<UploadState>>,
+    /// The rows of [`Uploads::publish`], for readers that must not take
+    /// `state`'s lock.
+    published: Arc<ArcSwap<Vec<UploadSnapshot>>>,
+}
 
 #[derive(Debug, Default)]
 struct UploadState {
@@ -637,7 +652,7 @@ impl Uploads {
     /// A new stream from `remote`, choked until the choker says otherwise:
     /// whether `remote` is unchoked, to follow.
     fn join(&self, remote: EndpointId) -> (UploadStream, watch::Receiver<bool>) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let peer = state.peers.entry(remote).or_insert_with(|| Uploading {
             streams: 0,
             interested: 0,
@@ -658,7 +673,7 @@ impl Uploads {
     /// rotates the optimistic unchoke every [`ROTATE_EVERY`] rounds, or
     /// because a peer's interest changed.
     fn round(&self, timer: bool) {
-        let mut guard = self.0.lock().unwrap();
+        let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
         let rotate = timer && {
             state.rounds += 1;
@@ -679,17 +694,53 @@ impl Uploads {
         }
     }
 
-    /// Runs choker rounds every [`ROUND`], until dropped.
+    /// Runs choker rounds every [`ROUND`], and publishes the rows every
+    /// [`SNAPSHOT_EVERY`], until dropped.
     fn run(&self) -> AbortOnDropHandle<()> {
         let uploads = self.clone();
         AbortOnDropHandle::new(tokio::spawn(async move {
-            let mut every = tokio::time::interval(ROUND);
-            every.tick().await;
+            let mut rounds = tokio::time::interval(ROUND);
+            rounds.tick().await;
+            let mut snapshots = tokio::time::interval(SNAPSHOT_EVERY);
             loop {
-                every.tick().await;
-                uploads.round(true);
+                tokio::select! {
+                    _ = rounds.tick() => uploads.round(true),
+                    _ = snapshots.tick() => uploads.publish(),
+                }
             }
         }))
+    }
+}
+
+impl Uploads {
+    /// Copies the rows for [`Uploads::snapshot`]: every [`SNAPSHOT_EVERY`],
+    /// read or not, so a reader never changes when `state` is locked.
+    fn publish(&self) {
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
+        let optimistic = state.choker.optimistic();
+        let now = Instant::now();
+        let mut out: Vec<UploadSnapshot> = state
+            .peers
+            .iter_mut()
+            .map(|(id, peer)| UploadSnapshot {
+                id: *id,
+                streams: peer.streams,
+                interested: peer.interested > 0,
+                unchoked: *peer.unchoked.borrow(),
+                optimistic: optimistic == Some(*id),
+                rate: peer.rate.per_second(now),
+            })
+            .collect();
+        drop(guard);
+        out.sort_by_key(|u| u.id);
+        self.published.store(Arc::new(out));
+    }
+
+    /// Each peer this node has swarm streams from, by ID, as last
+    /// published. Takes no lock.
+    fn snapshot(&self) -> Vec<UploadSnapshot> {
+        self.published.load_full().to_vec()
     }
 }
 
@@ -700,7 +751,7 @@ impl UploadStream {
         }
         self.interested = interested;
         {
-            let mut state = self.uploads.0.lock().unwrap();
+            let mut state = self.uploads.state.lock().unwrap();
             if let Some(peer) = state.peers.get_mut(&self.remote) {
                 if interested {
                     peer.interested += 1;
@@ -713,7 +764,7 @@ impl UploadStream {
     }
 
     fn sent(&self, bytes: u32) {
-        let mut state = self.uploads.0.lock().unwrap();
+        let mut state = self.uploads.state.lock().unwrap();
         if let Some(peer) = state.peers.get_mut(&self.remote) {
             peer.rate.add(u64::from(bytes), Instant::now());
         }
@@ -723,7 +774,7 @@ impl UploadStream {
 impl Drop for UploadStream {
     fn drop(&mut self) {
         self.interested(false);
-        let mut state = self.uploads.0.lock().unwrap();
+        let mut state = self.uploads.state.lock().unwrap();
         if let Some(peer) = state.peers.get_mut(&self.remote) {
             peer.streams -= 1;
             if peer.streams == 0 {
@@ -760,6 +811,91 @@ async fn read_all(mut recv: WireRecv, messages: mpsc::Sender<anyhow::Result<(Mes
     }
 }
 
+/// What this node downloads and uploads now (`Node::transfers`).
+#[derive(Debug, Clone, Default)]
+pub struct Transfers {
+    /// The downloads running, by folder, path and version.
+    pub swarms: Vec<SwarmSnapshot>,
+    /// Each peer with swarm streams to this node's server, by ID.
+    pub uploads: Vec<UploadSnapshot>,
+}
+
+/// One running download.
+#[derive(Debug, Clone)]
+pub struct SwarmSnapshot {
+    pub folder: NamespaceId,
+    pub path: String,
+    pub content: Hash,
+    pub size: u64,
+    pub piece_length: u32,
+    pub pieces: u32,
+    /// Verified, in the staging file.
+    pub have: u32,
+    /// Started but not verified yet.
+    pub active: u32,
+    /// Every node the download asks, in the swarm or not.
+    pub peers: Vec<SwarmPeer>,
+    /// No peer in the swarm both has a piece this node lacks and unchokes
+    /// it. With no peer in the swarm for [`GIVE_UP`], the download stops,
+    /// for a later try.
+    pub stuck: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SwarmPeer {
+    pub id: EndpointId,
+    pub state: SwarmPeerState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SwarmPeerState {
+    /// Not in the swarm: asked again every [`REJOIN`].
+    Out,
+    /// Not asked again during this download: it sent a bad piece, or no
+    /// longer has the file.
+    Banned,
+    Joining,
+    In(InSwarm),
+}
+
+/// A peer in a swarm, as the download sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InSwarm {
+    /// It serves this node's requests.
+    pub unchoked: bool,
+    /// This node told it that it wants pieces it has.
+    pub interested: bool,
+    /// Bytes per second it sends this node.
+    pub rate: f64,
+    /// Requests open to it.
+    pub open: usize,
+    /// It sent no block for [`SNUB_AFTER`] with requests open: one request
+    /// at a time until it does.
+    pub snubbed: bool,
+    /// How many pieces it has.
+    pub pieces: u32,
+}
+
+/// What this node uploads to one peer, over all its swarms.
+#[derive(Debug, Clone)]
+pub struct UploadSnapshot {
+    pub id: EndpointId,
+    /// Its swarm streams to this node's server.
+    pub streams: usize,
+    /// It wants pieces on at least one of them.
+    pub interested: bool,
+    /// The choker uploads to it.
+    pub unchoked: bool,
+    /// It holds the optimistic unchoke.
+    pub optimistic: bool,
+    /// Bytes per second this node sends it.
+    pub rate: f64,
+}
+
+/// How often a download publishes its state for [`Swarms::snapshot`], at
+/// most, and how often [`Uploads`] publishes its rows.
+const SNAPSHOT_EVERY: Duration = Duration::from_secs(1);
+
 /// The swarms this node is downloading, so its server can serve the
 /// pieces they have verified from their staging files: a leecher serves.
 #[derive(Debug, Clone, Default)]
@@ -778,12 +914,26 @@ struct Leeching {
     have: watch::Sender<Vec<bool>>,
     /// Pieces a server found no longer match in the staging file.
     lost: mpsc::UnboundedSender<u32>,
+    /// The download's peers and picker, as last published: the download
+    /// stores it, readers load it, and neither waits for the other.
+    view: ArcSwap<DownloadView>,
+}
+
+/// What a download publishes for [`Swarms::snapshot`] every
+/// [`SNAPSHOT_EVERY`], whether anything reads it or not.
+#[derive(Debug, Default)]
+struct DownloadView {
+    have: u32,
+    active: u32,
+    peers: Vec<SwarmPeer>,
+    stuck: bool,
 }
 
 /// Keeps a download in [`Swarms`] until dropped.
 struct Registered {
     swarms: Swarms,
     key: SwarmKey,
+    leeching: Arc<Leeching>,
 }
 
 impl Drop for Registered {
@@ -795,14 +945,44 @@ impl Drop for Registered {
 impl Swarms {
     fn register(&self, handshake: &Handshake, leeching: Leeching) -> Registered {
         let key = (handshake.folder, handshake.path.clone(), handshake.content);
-        self.0
-            .lock()
-            .unwrap()
-            .insert(key.clone(), Arc::new(leeching));
+        let leeching = Arc::new(leeching);
+        self.0.lock().unwrap().insert(key.clone(), leeching.clone());
         Registered {
             swarms: self.clone(),
             key,
+            leeching,
         }
+    }
+
+    /// The downloads running, by folder, path and version.
+    fn snapshot(&self) -> Vec<SwarmSnapshot> {
+        let running: Vec<(SwarmKey, Arc<Leeching>)> = self
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, leeching)| (key.clone(), leeching.clone()))
+            .collect();
+        let mut out: Vec<SwarmSnapshot> = running
+            .into_iter()
+            .map(|((folder, path, content), leeching)| {
+                let view = leeching.view.load_full();
+                SwarmSnapshot {
+                    folder,
+                    path,
+                    content,
+                    size: leeching.meta.size,
+                    piece_length: leeching.meta.piece_length,
+                    pieces: leeching.meta.pieces.len() as u32,
+                    have: view.have,
+                    active: view.active,
+                    peers: view.peers.clone(),
+                    stuck: view.stuck,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| (a.folder, &a.path).cmp(&(b.folder, &b.path)));
+        out
     }
 
     fn get(&self, handshake: &Handshake) -> Option<Arc<Leeching>> {
@@ -1000,7 +1180,7 @@ impl Client {
         // pieces verified so far, and those to come.
         let (have, _) = watch::channel(picker.have());
         let (lost, mut lost_pieces) = mpsc::unbounded_channel();
-        let _registered = self.swarms.register(
+        let registered = self.swarms.register(
             &handshake,
             Leeching {
                 meta: meta.clone(),
@@ -1008,6 +1188,7 @@ impl Client {
                 file: staged.file.clone(),
                 have: have.clone(),
                 lost,
+                view: ArcSwap::default(),
             },
         );
         let (events, mut received) = mpsc::unbounded_channel::<(usize, u64, Event)>();
@@ -1019,10 +1200,16 @@ impl Client {
         let mut rejoin = tokio::time::interval(REJOIN);
         rejoin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_in = Instant::now();
+        let mut next_snapshot = last_in;
         let me = self.endpoint.id();
         while !picker.is_complete() {
             self.request(&mut remotes, &mut picker).await;
             let now = Instant::now();
+            if now >= next_snapshot {
+                next_snapshot = now + SNAPSHOT_EVERY;
+                let view = view(&mut remotes, &picker, now);
+                registered.leeching.view.store(Arc::new(view));
+            }
             if remotes.iter().any(|r| matches!(r.state, State::In { .. })) {
                 last_in = now;
             }
@@ -1114,7 +1301,7 @@ impl Client {
             if self.direct_only && !crate::peers::is_direct(conn) {
                 continue;
             }
-            let snubbed = picker.open(*peer) > 0 && now - *last_block > SNUB_AFTER;
+            let snubbed = snubbed(picker, *peer, *last_block, now);
             let queue = queue_length(rate.per_second(now), snubbed);
             let mut failed = false;
             while picker.open(*peer) < queue {
@@ -1349,6 +1536,51 @@ impl Client {
             }
         }
         Ok(())
+    }
+}
+
+/// Whether picker peer `peer` has requests open but sent no block since
+/// `last_block`, for [`SNUB_AFTER`].
+fn snubbed(picker: &Picker, peer: usize, last_block: Instant, now: Instant) -> bool {
+    picker.open(peer) > 0 && now - last_block > SNUB_AFTER
+}
+
+/// A download's state at `now`, for [`Swarms::snapshot`].
+fn view(remotes: &mut [Remote], picker: &Picker, now: Instant) -> DownloadView {
+    let peers: Vec<SwarmPeer> = remotes
+        .iter_mut()
+        .map(|remote| SwarmPeer {
+            id: remote.id,
+            state: match &mut remote.state {
+                State::Out { banned: false } => SwarmPeerState::Out,
+                State::Out { banned: true } => SwarmPeerState::Banned,
+                State::Joining => SwarmPeerState::Joining,
+                State::In {
+                    peer,
+                    unchoked,
+                    interested,
+                    rate,
+                    last_block,
+                    ..
+                } => SwarmPeerState::In(InSwarm {
+                    unchoked: *unchoked,
+                    interested: *interested,
+                    rate: rate.per_second(now),
+                    open: picker.open(*peer),
+                    snubbed: snubbed(picker, *peer, *last_block, now),
+                    pieces: picker.held(*peer),
+                }),
+            },
+        })
+        .collect();
+    let stuck = !peers
+        .iter()
+        .any(|p| matches!(&p.state, SwarmPeerState::In(s) if s.unchoked && s.interested));
+    DownloadView {
+        have: picker.have_count(),
+        active: picker.active(),
+        peers,
+        stuck,
     }
 }
 

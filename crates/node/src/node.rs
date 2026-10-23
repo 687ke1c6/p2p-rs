@@ -23,7 +23,7 @@ use n0_future::StreamExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use crate::folder::{FolderState, Folders};
+use crate::folder::{FolderState, Folders, ViewFile};
 use crate::gate::{Gate, GateHooks, MembersProtocol, JOIN_ALPN, MEMBERS_ALPN};
 use crate::group::{Group, GroupError};
 use crate::index::{self, FileMeta, DEBOUNCE};
@@ -31,7 +31,7 @@ use crate::invite::{self, InviteTicket};
 use crate::join::{self, JoinProtocol, JoinReply, Ticket};
 use crate::member::{self, Names};
 use crate::monitor::Monitor;
-use crate::peer_wire::{self, PeerWireProtocol};
+use crate::peer_wire::{self, PeerWireProtocol, Transfers};
 use crate::peers::{PeerSnapshot, Peers};
 use crate::presence::{View, PRESENCE_INTERVAL};
 use crate::record::{validate_chain, GroupId, Record, SignedRecord, MEMBERS_PREFIX};
@@ -338,6 +338,12 @@ impl Node {
         self.wire.unchoked()
     }
 
+    /// The downloads running (swarms, pieces, peers) and the uploads per
+    /// peer (choked or not, rate), for the web UI's Transfers view.
+    pub fn transfers(&self) -> Transfers {
+        self.wire.transfers()
+    }
+
     /// This node's connections and traffic to each node it has connected
     /// to, member or not, whether or not its membership doc lists it yet.
     pub fn peers(&self) -> Vec<PeerSnapshot> {
@@ -385,6 +391,12 @@ impl Node {
     /// The folders this node is indexing.
     pub fn folders(&self) -> Vec<FolderState> {
         self.folders.list()
+    }
+
+    /// The view `folder show` prints for folder `name`, as this node last
+    /// wrote it. `None` if there is none yet.
+    pub fn view_file(&self, name: &str) -> anyhow::Result<Option<ViewFile>> {
+        crate::folder::read_view(&self.config_dir, name)
     }
 
     /// This node's index of folder `id`, tombstones included, as stored in

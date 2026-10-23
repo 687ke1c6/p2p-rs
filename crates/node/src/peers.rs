@@ -22,6 +22,7 @@ use crate::member::Names;
 
 /// How a peer is reached: the kind of the selected path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub enum LinkKind {
     Direct,
     Relay,
@@ -48,6 +49,7 @@ impl LinkKind {
 /// Bytes sent and received, split by path kind. UDP payload bytes, so they
 /// include QUIC overhead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Traffic {
     pub direct_sent: u64,
     pub direct_recv: u64,

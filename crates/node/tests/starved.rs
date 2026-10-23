@@ -15,6 +15,7 @@ use iroh::SecretKey;
 use iroh_docs::engine::LiveEvent;
 use iroh_docs::NamespaceId;
 use n0_future::StreamExt;
+use sync_node::index::doc_key;
 use sync_node::{Config, Network, Node};
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -161,7 +162,7 @@ async fn watch_doc(who: &'static str, node: &Node, id: NamespaceId, start: Insta
                     entry,
                     content_status,
                     ..
-                } if entry.key() == b"big.bin" => {
+                } if entry.key() == doc_key("big.bin") => {
                     probe.0.lock().unwrap().0.get_or_insert(at);
                     meta = Some(entry.content_hash());
                     format!("entry arrived, content {content_status:?}")
