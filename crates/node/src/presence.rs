@@ -17,7 +17,7 @@ use iroh_gossip::TopicId;
 use serde::{Deserialize, Serialize};
 
 use crate::peers::LinkKind;
-use crate::record::{GroupId, SignedRecord};
+use crate::record::{GroupId, SignedRecord, SignedRemoval};
 
 /// How often a node announces itself, by default.
 pub const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
@@ -110,8 +110,8 @@ impl fmt::Display for LinkState {
     }
 }
 
-/// What this node has heard: the member list and the latest presence of
-/// each member.
+/// What this node has heard: the member list, the removed nodes and the
+/// latest presence of each member.
 #[derive(Debug, Clone)]
 pub struct View(Arc<Mutex<ViewState>>);
 
@@ -119,6 +119,7 @@ pub struct View(Arc<Mutex<ViewState>>);
 struct ViewState {
     offline_after: Duration,
     members: Vec<SignedRecord>,
+    removed: Vec<SignedRemoval>,
     heard: HashMap<EndpointId, (Presence, Instant)>,
     /// Online as of the last [`View::update_online`], for logging changes.
     online: HashSet<EndpointId>,
@@ -129,6 +130,7 @@ impl View {
         Self(Arc::new(Mutex::new(ViewState {
             offline_after: presence_interval * OFFLINE_AFTER_INTERVALS,
             members: Vec::new(),
+            removed: Vec::new(),
             heard: HashMap::new(),
             online: HashSet::new(),
         })))
@@ -149,6 +151,22 @@ impl View {
             .collect();
         state.members = members;
         added
+    }
+
+    pub fn removed(&self) -> Vec<SignedRemoval> {
+        self.0.lock().unwrap().removed.clone()
+    }
+
+    pub fn set_removed(&self, removed: Vec<SignedRemoval>) {
+        self.0.lock().unwrap().removed = removed;
+    }
+
+    /// Whether `id` is a member, or the member list hasn't been read yet
+    /// (it always holds this node once read). For work that starts before
+    /// the first read, such as a download at startup.
+    pub fn may_be_member(&self, id: EndpointId) -> bool {
+        let state = self.0.lock().unwrap();
+        state.members.is_empty() || state.members.iter().any(|s| s.record.member == id)
     }
 
     pub fn is_member(&self, id: EndpointId) -> bool {

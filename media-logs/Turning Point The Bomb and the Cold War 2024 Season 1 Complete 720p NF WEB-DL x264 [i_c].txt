@@ -1,0 +1,44 @@
+NAME
+  Id: 1
+  Name: Turning Point The Bomb and the Cold War 2024 Season 1 Complete 720p NF WEB-DL x264 [i_c]
+  Hash: d9115fc62b9dc3b3ce2cc82c6e9b794ada7eb9af
+  Magnet: magnet:?xt=urn:btih:d9115fc62b9dc3b3ce2cc82c6e9b794ada7eb9af&dn=Turning%20Point%20The%20Bomb%20and%20the%20Cold%20War%202024%20Season%201%20Complete%20720p%20NF%20WEB-DL%20x264%20%5Bi%5Fc%5D
+  Labels: 
+
+TRANSFER
+  State: Idle
+  Location: /media/Shows
+  Percent Done: 100%
+  ETA: 0 seconds (0 seconds)
+  Download Speed: 0 kB/s
+  Upload Speed: 0 kB/s
+  Have: 13.91 GB (13.91 GB verified)
+  Availability: 100%
+  Total size: 13.91 GB (13.91 GB wanted)
+  Downloaded: 13.92 GB
+  Uploaded: 19.59 MB
+  Ratio: 0.0
+  Corrupt DL: None
+  Peers: connected to 1, uploading to 0, downloading from 0
+
+HISTORY
+  Date added:       Sun Dec  8 18:06:03 2024
+  Date finished:    Mon Dec  9 00:42:44 2024
+  Date started:     Sun Dec  8 18:06:31 2024
+  Latest activity:  Mon Dec  9 00:42:44 2024
+  Downloading Time: 7 hours (25274 seconds)
+  Seeding Time:     3 seconds (3 seconds)
+
+ORIGINS
+  Public torrent: Yes
+  Piece Count: 6632
+  Piece Size: 2.00 MiB
+
+LIMITS & BANDWIDTH
+  Download Limit: Unlimited
+  Upload Limit: Unlimited
+  Ratio Limit: Default
+  Honors Session Limits: Yes
+  Peer limit: 50
+  Bandwidth Priority: Normal
+

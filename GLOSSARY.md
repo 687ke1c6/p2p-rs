@@ -13,8 +13,15 @@ One running instance, identified by its public key.
 _Avoid_: Device, client. A node is a **peer** only in a swarm (see Content).
 
 **Member**:
-A node holding a valid signed record in its group.
+A node holding a valid signed record in its group, whose chain of records reaches the founder through no removed node.
 _Avoid_: User, participant
+
+**Removal**:
+A member's signed statement that a node is no longer in the group. It always wins: the removed ID can't come back. Members whose chain goes through the removed node are no longer members either, unless another member adds them again (ADR 0006).
+_Avoid_: Revocation, ban, kick
+
+**Group name**:
+The group's display name, set by any member, the same on every node. Cosmetic: the group ID identifies the group.
 
 ## Folders
 
@@ -24,6 +31,10 @@ _Avoid_: Share, repo, sync root
 
 **Document/doc**
 The iroh-doc document that is replicated across the group
+
+**Disabled folder**:
+A folder turned off on one node (`folder disable`): not watched or indexed, fetches nothing and serves nothing, while its doc still syncs and its entries stay. Enabled again, it catches up as a node coming back online does: its first scan writes what changed meanwhile, deletes included.
+_Avoid_: Paused (that's a folder whose root or marker is missing), muted, unmapped
 
 **Entry**:
 One members description of one path in a folder: its content, size, modification time and version, stored in the 'folder' iroh-doc document

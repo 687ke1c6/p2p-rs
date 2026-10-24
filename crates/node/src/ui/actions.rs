@@ -1,17 +1,17 @@
 //! The web UI's actions: the setup the CLI does with `create`, `join`,
-//! `invite create`, `member add` and `folder add`, with the same checks and
-//! error texts.
+//! `invite create`, `member add`, `member remove`, `group name` and
+//! `folder add`, with the same checks and error texts.
 //!
 //! Create and join run as tasks that finish even if their request goes (a
 //! closed tab, the join limit): stopped half-way, they could leave the node
-//! in a group without its monitor. Member and folder adds go through the
-//! queues the running node applies, as from the CLI.
+//! in a group without its monitor. The others go through the queues the
+//! running node applies, as from the CLI.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use iroh::{EndpointAddr, EndpointId};
@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use super::{ApiError, AppState, UiBackend};
 use crate::group::GroupError;
-use crate::member::check_name;
+use crate::member::{check_name, check_removable};
 use crate::presence::PRESENCE_INTERVAL;
 use crate::record::GroupId;
 use crate::{folder, invite, member, Ticket};
@@ -82,6 +82,29 @@ pub struct MemberRequest {
     pub name: Option<String>,
 }
 
+/// `POST /api/folders/{name}/enabled`, for a folder this node keeps.
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct FolderEnabledRequest {
+    pub enabled: bool,
+}
+
+/// `POST /api/members/remove`.
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct RemoveRequest {
+    /// The member's node ID.
+    pub id: String,
+}
+
+/// `POST /api/group/name`.
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct GroupNameRequest {
+    /// Shown with the group ID, on every node.
+    pub name: String,
+}
+
 /// `POST /api/folders`.
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -92,8 +115,10 @@ pub struct FolderRequest {
     pub path: String,
 }
 
-/// `POST /api/members` and `POST /api/folders`: queued for the running node,
-/// which applies it within `within_secs`.
+/// `POST /api/members`, `/api/members/remove`, `/api/group/name`,
+/// `/api/folders`, `/api/folders/{name}/enabled` and
+/// `/api/folders/{name}/remove`: queued for the running node, which applies
+/// it within `within_secs`.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct QueuedAnswer {
@@ -187,16 +212,41 @@ pub(super) async fn add_member(
     body: Result<Json<MemberRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<QueuedAnswer>), ApiError> {
     let request = parse(body)?;
-    let id: EndpointId = request.id.trim().parse().map_err(|_| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            format!("not a node ID: {}", request.id),
-        )
-    })?;
+    let id = node_id(&request.id)?;
     in_group(&*state.backend)?;
     let name = checked_name(request.name.as_deref())?;
     member::queue_add(&state.config.config_dir, id, name.as_deref())
         .map_err(anyhow::Error::from)?;
+    Ok(QueuedAnswer::new())
+}
+
+pub(super) async fn remove_member(
+    State(state): State<AppState>,
+    body: Result<Json<RemoveRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<QueuedAnswer>), ApiError> {
+    let request = parse(body)?;
+    let id = node_id(&request.id)?;
+    let status = state.backend.status().ok_or(GroupError::NotInGroup)?;
+    let bad = |text: String| ApiError::new(StatusCode::BAD_REQUEST, text);
+    check_removable(id, status.node, status.founder).map_err(|err| bad(err.to_string()))?;
+    // Unlike the CLI, which has only the group file, the page knows the
+    // members.
+    if status.member(id).is_none() {
+        return Err(bad(format!("{} is not a member", id.fmt_short())));
+    }
+    member::queue_remove(&state.config.config_dir, id).map_err(anyhow::Error::from)?;
+    Ok(QueuedAnswer::new())
+}
+
+pub(super) async fn name_group(
+    State(state): State<AppState>,
+    body: Result<Json<GroupNameRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<QueuedAnswer>), ApiError> {
+    let request = parse(body)?;
+    in_group(&*state.backend)?;
+    let name = check_name(&request.name)
+        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    member::queue_group_name(&state.config.config_dir, &name).map_err(anyhow::Error::from)?;
     Ok(QueuedAnswer::new())
 }
 
@@ -223,10 +273,55 @@ pub(super) async fn add_folder(
     Ok(QueuedAnswer::new())
 }
 
+pub(super) async fn set_folder_enabled(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Result<Json<FolderEnabledRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<QueuedAnswer>), ApiError> {
+    let request = parse(body)?;
+    in_group(&*state.backend)?;
+    let bad = |text: String| ApiError::new(StatusCode::BAD_REQUEST, text);
+    let name = folder::check_folder_name(&name).map_err(|err| bad(err.to_string()))?;
+    // A name that isn't kept is the caller's mistake, as with the CLI.
+    if !folder::load_local(&state.config.config_dir)?
+        .iter()
+        .any(|f| f.name == name)
+    {
+        return Err(bad(format!("this node doesn't keep folder {name}")));
+    }
+    folder::set_enabled(&state.config.config_dir, &name, request.enabled)?;
+    Ok(QueuedAnswer::new())
+}
+
+/// `POST /api/folders/{name}/remove`, with an empty JSON body.
+pub(super) async fn remove_folder(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<(StatusCode, Json<QueuedAnswer>), ApiError> {
+    in_group(&*state.backend)?;
+    let bad = |text: String| ApiError::new(StatusCode::BAD_REQUEST, text);
+    let name = folder::check_folder_name(&name).map_err(|err| bad(err.to_string()))?;
+    if !folder::load_local(&state.config.config_dir)?
+        .iter()
+        .any(|f| f.name == name)
+    {
+        return Err(bad(format!("this node doesn't keep folder {name}")));
+    }
+    folder::queue_remove(&state.config.config_dir, &name)?;
+    Ok(QueuedAnswer::new())
+}
+
 /// The request body, or 400 with why it isn't one.
 fn parse<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     body.map(|Json(body)| body)
         .map_err(|rejection| ApiError::new(StatusCode::BAD_REQUEST, rejection.body_text()))
+}
+
+/// A node ID, or 400.
+fn node_id(text: &str) -> Result<EndpointId, ApiError> {
+    text.trim()
+        .parse()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, format!("not a node ID: {text}")))
 }
 
 fn checked_name(name: Option<&str>) -> Result<Option<String>, ApiError> {

@@ -1,7 +1,7 @@
 //! A running node: an iroh endpoint with the blobs, gossip and docs protocols,
 //! gated to group members, plus the join and members protocols.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,7 +34,9 @@ use crate::monitor::Monitor;
 use crate::peer_wire::{self, PeerWireProtocol, Transfers};
 use crate::peers::{PeerSnapshot, Peers};
 use crate::presence::{View, PRESENCE_INTERVAL};
-use crate::record::{validate_chain, GroupId, Record, SignedRecord, MEMBERS_PREFIX};
+use crate::record::{
+    GroupId, Record, Removal, SignedRecord, SignedRemoval, MEMBERS_PREFIX, REMOVED_PREFIX,
+};
 use crate::status::Status;
 use crate::view::FolderView;
 
@@ -165,6 +167,7 @@ impl Node {
             .await
             .context("opening docs store")?;
 
+        let view = View::new(config.presence_interval);
         let folders = Folders::new(
             config_dir,
             docs.clone(),
@@ -173,6 +176,7 @@ impl Node {
             config.debounce,
             config.direct_only,
             names.clone(),
+            view.clone(),
         );
         let wire = PeerWireProtocol::new(folders.clone(), config.direct_only);
         let router = Router::builder(endpoint)
@@ -199,7 +203,7 @@ impl Node {
             config_dir: config_dir.to_owned(),
             gate,
             peers,
-            view: View::new(config.presence_interval),
+            view,
             names,
             folders,
             wire,
@@ -314,6 +318,18 @@ impl Node {
         read_members(&self.docs, &self.blobs, &group).await
     }
 
+    /// The members and the removals that count, in this node's copy of the
+    /// membership doc.
+    pub async fn membership(&self) -> anyhow::Result<Membership> {
+        let group = self.group().ok_or(GroupError::NotInGroup)?;
+        read_membership(&self.docs, &self.blobs, &group).await
+    }
+
+    /// The group's name, as of the last presence interval.
+    pub fn group_name(&self) -> Option<String> {
+        self.names.group()
+    }
+
     /// How to show `id`: its name if it has one, otherwise its short ID. Names
     /// are re-read from the membership doc every presence interval.
     pub fn display(&self, id: EndpointId) -> String {
@@ -362,6 +378,7 @@ impl Node {
             &self.peers.snapshot(),
             &self.names,
             &self.folders.list(),
+            &self.folders.available(),
         ))
     }
 
@@ -493,23 +510,48 @@ impl Node {
     }
 }
 
+/// The membership doc as a node reads it.
+#[derive(Debug, Clone, Default)]
+pub struct Membership {
+    /// One valid record per member, oldest first.
+    pub members: Vec<SignedRecord>,
+    /// The removals that count, one per removed node, oldest first.
+    pub removed: Vec<SignedRemoval>,
+}
+
 /// The valid records in a copy of the membership doc, one per member.
 pub(crate) async fn read_members(
     docs: &Docs,
     blobs: &FsStore,
     group: &Group,
 ) -> anyhow::Result<Vec<SignedRecord>> {
+    Ok(read_membership(docs, blobs, group).await?.members)
+}
+
+/// Reads the members and removals in a copy of the membership doc.
+///
+/// A removal counts if it is for this group, its signature checks out, it
+/// doesn't remove the founder, and its signer has a chain to the founder.
+/// The signer's own removal doesn't undo it: a removal always wins, and a
+/// removed node can't come back. A node is a member if it isn't removed and
+/// has a record signed by a member, from the founder out: so a member added
+/// by a removed node is no longer one, unless another member adds it again.
+pub(crate) async fn read_membership(
+    docs: &Docs,
+    blobs: &FsStore,
+    group: &Group,
+) -> anyhow::Result<Membership> {
     let doc = docs
         .open(group.id)
         .await?
         .context("membership doc missing")?;
-    let entries = doc
+    let mut records = Vec::new();
+    for entry in doc
         .get_many(Query::key_prefix(MEMBERS_PREFIX))
         .await?
         .collect::<Vec<_>>()
-        .await;
-    let mut records = Vec::new();
-    for entry in entries {
+        .await
+    {
         let entry = entry?;
         let Ok(bytes) = blobs.get_bytes(entry.content_hash()).await else {
             continue; // Content not fetched yet.
@@ -520,20 +562,82 @@ pub(crate) async fn read_members(
             }
         }
     }
-    let mut valid = HashMap::new();
-    for signed in &records {
-        let member = signed.record.member;
-        let candidates = records
-            .iter()
-            .filter(|other| other.record.member != member)
-            .chain([signed]);
-        if validate_chain(group.id, group.founder, member, candidates).is_ok() {
-            valid.entry(member).or_insert_with(|| signed.clone());
+    let mut removals = Vec::new();
+    for entry in doc
+        .get_many(Query::key_prefix(REMOVED_PREFIX))
+        .await?
+        .collect::<Vec<_>>()
+        .await
+    {
+        let entry = entry?;
+        let Ok(bytes) = blobs.get_bytes(entry.content_hash()).await else {
+            continue;
+        };
+        if let Ok(signed) = SignedRemoval::from_bytes(&bytes) {
+            if entry.key() == Removal::doc_key(signed.removal.member).as_bytes() {
+                removals.push(signed);
+            }
         }
     }
-    let mut valid: Vec<_> = valid.into_values().collect();
-    valid.sort_by_key(|signed| signed.record.added_at);
-    Ok(valid)
+
+    let chained = reachable(group, &records, &HashSet::new());
+    let mut removed: HashMap<EndpointId, SignedRemoval> = HashMap::new();
+    for signed in removals {
+        let removal = &signed.removal;
+        if removal.group == group.id
+            && removal.member != group.founder
+            && chained.contains_key(&removal.removed_by)
+            && signed.verify_signature()
+        {
+            let first = removed
+                .entry(removal.member)
+                .or_insert_with(|| signed.clone());
+            if signed.removal.removed_at < first.removal.removed_at {
+                *first = signed;
+            }
+        }
+    }
+    let removed_ids = removed.keys().copied().collect();
+    let mut members: Vec<_> = reachable(group, &records, &removed_ids)
+        .into_values()
+        .collect();
+    members.sort_by_key(|signed| signed.record.added_at);
+    let mut removed: Vec<_> = removed.into_values().collect();
+    removed.sort_by_key(|signed| signed.removal.removed_at);
+    Ok(Membership { members, removed })
+}
+
+/// The nodes not in `removed` that `records` link to the founder, from the
+/// founder out, each with the record that links it.
+fn reachable(
+    group: &Group,
+    records: &[SignedRecord],
+    removed: &HashSet<EndpointId>,
+) -> HashMap<EndpointId, SignedRecord> {
+    let mut members: HashMap<EndpointId, SignedRecord> = HashMap::new();
+    loop {
+        let before = members.len();
+        for signed in records {
+            let record = &signed.record;
+            if record.group != group.id
+                || members.contains_key(&record.member)
+                || removed.contains(&record.member)
+            {
+                continue;
+            }
+            let linked = if record.added_by == record.member {
+                record.member == group.founder
+            } else {
+                members.contains_key(&record.added_by)
+            };
+            if linked && signed.verify_signature() {
+                members.insert(record.member, signed.clone());
+            }
+        }
+        if members.len() == before {
+            return members;
+        }
+    }
 }
 
 fn store_dir(config_dir: &Path, name: &str) -> anyhow::Result<PathBuf> {

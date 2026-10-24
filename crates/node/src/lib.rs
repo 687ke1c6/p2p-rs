@@ -25,5 +25,5 @@ pub mod view;
 pub use group::Group;
 pub use invite::InviteTicket;
 pub use join::Ticket;
-pub use node::{Config, Network, Node};
+pub use node::{Config, Membership, Network, Node};
 pub use status::Status;

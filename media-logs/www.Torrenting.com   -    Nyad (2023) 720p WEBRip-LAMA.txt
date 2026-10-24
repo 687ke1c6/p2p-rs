@@ -1,0 +1,44 @@
+NAME
+  Id: 1
+  Name: www.Torrenting.com   -    Nyad (2023) 720p WEBRip-LAMA
+  Hash: 08d5a2aa9d71c2aa78c43343a86e3ed6fd17e536
+  Magnet: magnet:?xt=urn:btih:08d5a2aa9d71c2aa78c43343a86e3ed6fd17e536&dn=www.Torrenting.com%20%20%20-%20%20%20%20Nyad%20%282023%29%20720p%20WEBRip-LAMA
+  Labels: 
+
+TRANSFER
+  State: Idle
+  Location: /media/Movies
+  Percent Done: 100%
+  ETA: 0 seconds (0 seconds)
+  Download Speed: 0 kB/s
+  Upload Speed: 0 kB/s
+  Have: 1.17 GB (1.17 GB verified)
+  Availability: 100%
+  Total size: 1.17 GB (1.17 GB wanted)
+  Downloaded: 1.17 GB
+  Uploaded: None
+  Ratio: 0.0
+  Corrupt DL: None
+  Peers: connected to 0, uploading to 0, downloading from 0
+
+HISTORY
+  Date added:       Sat Mar 23 19:59:00 2024
+  Date finished:    Sat Mar 23 20:06:41 2024
+  Date started:     Sat Mar 23 19:59:15 2024
+  Latest activity:  Sat Mar 23 20:06:41 2024
+  Downloading Time: 8 minutes (495 seconds)
+  Seeding Time:     4 seconds (4 seconds)
+
+ORIGINS
+  Public torrent: Yes
+  Piece Count: 140
+  Piece Size: 8.00 MiB
+
+LIMITS & BANDWIDTH
+  Download Limit: Unlimited
+  Upload Limit: Unlimited
+  Ratio Limit: Default
+  Honors Session Limits: Yes
+  Peer limit: 50
+  Bandwidth Priority: Normal
+

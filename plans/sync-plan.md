@@ -32,7 +32,7 @@ Settle each before or during the step that needs it, and record the decision in 
 * **Conflicts:** decided 2026-10-18, see **Folders & the File Index**. Implemented in step 7.
 * **Deletes:** tombstones, so a file deleted on one node isn't restored from another (decided: a tombstone is an index entry with no content, see below). Still open: when tombstones can be cleaned up. For now they are kept forever; cleaning one up safely needs every member to have seen it, which ties in with **Removing a member**.
 * **Renames:** detect them (same hash, new path) rather than treating them as a delete plus a new file. Implemented in step 7, on the receiving side.
-* **Removing a member:** who may revoke a membership record, and what happens when an add and a remove race. The likely default is that any member may remove any other, and a removal always wins.
+* **Removing a member:** proposed 2026-10-23 in ADR 0006: any member may remove any other except the founder, a removal always wins, and it cascades to the members the removed node added.
 * **Ignore rules:** decided 2026-10-18, see **Folders & the File Index** below.
 
 ### Design Decisions

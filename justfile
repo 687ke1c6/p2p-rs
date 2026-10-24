@@ -19,7 +19,7 @@ node *args:
 # Cross-compile the node for armv7 (Debian bookworm armhf) into target/release/armv7,
 # build the web UI, and copy both to the Pi: ~/sync-node and ~/ui (its default UI dir)
 armv7: ui
-    docker build -f Dockerfile.armv7 --output type=local,dest=target/release/armv7 . && scp target/release/armv7/sync-node g@raspberrypi:~ && rsync -avP --delete ui/dist/ g@raspberrypi:~/ui/
+    docker build -f Dockerfile.armv7 --output type=local,dest=target/release/armv7 .
 
 # Build the web UI into ui/dist/
 ui:

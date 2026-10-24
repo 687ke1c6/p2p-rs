@@ -637,9 +637,11 @@ impl Content {
                 }
             }
         };
+        // Members only: a removed node's entries stay in the doc.
         let swarm = || {
             let mut nodes = self.folders.folder_peers(self.folder);
             nodes.extend(peers.iter().copied());
+            nodes.retain(|id| self.folders.is_member(*id));
             nodes.sort();
             nodes.dedup();
             nodes

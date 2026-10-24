@@ -1,6 +1,7 @@
 //! The running node's view of its group, kept up to date once per presence
-//! interval: apply adds queued by `member add`, re-read the membership doc
-//! and log new members and renames, gossip this
+//! interval: apply the adds, removals and group name queued by `member add`,
+//! `member remove` and `group name`, re-read the membership doc, log new and
+//! removed members and renames, stop admitting removed nodes, gossip this
 //! node's presence, log members coming online or going offline, and rewrite
 //! the status file.
 
@@ -17,10 +18,10 @@ use iroh_gossip::net::Gossip;
 use n0_future::StreamExt;
 
 use crate::folder::Folders;
-use crate::gate::Gate;
+use crate::gate::{Gate, NOT_A_MEMBER};
 use crate::group::Group;
 use crate::member::{self, Names, Rename};
-use crate::node::{read_members, ACTIVE_VIEW};
+use crate::node::{read_membership, Membership, ACTIVE_VIEW};
 use crate::peers::Peers;
 use crate::presence::{topic, Presence, SignedPresence, View};
 use crate::record::{unix_now, SignedRecord};
@@ -47,11 +48,11 @@ impl Monitor {
     }
 
     pub async fn run(self) {
-        let members = read_members(&self.docs, &self.blobs, &self.group)
+        let membership = read_membership(&self.docs, &self.blobs, &self.group)
             .await
             .unwrap_or_default();
-        self.view.set_members(members.clone());
-        self.refresh_names(&members, false).await;
+        let members = membership.members.clone();
+        self.update_membership(membership, false).await;
         tracing::info!(
             "group {} founded by {}; {} members: {}",
             self.group.id.fmt_short(),
@@ -117,6 +118,8 @@ impl Monitor {
 
     async fn on_tick(&self, sender: &GossipSender, neighbours: &HashSet<EndpointId>) {
         self.apply_queued_adds().await;
+        self.apply_queued_removes().await;
+        self.apply_queued_group_name().await;
         // Records whose content didn't arrive with them (members, folders)
         // are unreadable until it does.
         if let Err(err) = self
@@ -131,18 +134,8 @@ impl Monitor {
             tracing::warn!("checking folders: {err:#}");
         }
         self.folders.write_views(self.group.id, &self.names).await;
-        match read_members(&self.docs, &self.blobs, &self.group).await {
-            Ok(members) => {
-                let added = self.view.set_members(members.clone());
-                self.refresh_names(&members, true).await;
-                for added in added {
-                    tracing::info!(
-                        "member added: {} (by {})",
-                        self.names.display(added.record.member),
-                        self.names.display(added.record.added_by)
-                    );
-                }
-            }
+        match read_membership(&self.docs, &self.blobs, &self.group).await {
+            Ok(membership) => self.update_membership(membership, true).await,
             Err(err) => tracing::warn!("reading the membership doc: {err:#}"),
         }
 
@@ -288,6 +281,15 @@ impl Monitor {
     }
 
     async fn apply_add(&self, id: EndpointId, name: Option<&str>) -> anyhow::Result<()> {
+        if self.gate.is_removed(id) {
+            // Logged, not returned: queuing it again wouldn't help.
+            tracing::warn!(
+                "not adding {}: it was removed from the group, and a removed node can't come \
+                 back; it can join with a new ID (`sync-node --clear-config`)",
+                id.fmt_short()
+            );
+            return Ok(());
+        }
         if !self.view.is_member(id) {
             member::write_record(&self.docs, self.group.id, &self.key, id).await?;
             self.gate.admit(id, "added by ID");
@@ -305,7 +307,138 @@ impl Monitor {
         Ok(())
     }
 
-    /// Re-reads members' names, logging changes if `log` is set.
+    /// Applies the removals `member remove` queued in `removes/`. A file
+    /// that can't be used, or a node that can't be removed, is logged and
+    /// the file removed; one that fails to write is kept for the next
+    /// interval.
+    async fn apply_queued_removes(&self) {
+        let queued = match member::queued_removes(&self.config_dir) {
+            Ok(queued) => queued,
+            Err(err) => {
+                tracing::warn!("reading queued removals: {err:#}");
+                return;
+            }
+        };
+        for queued in queued {
+            let done = match queued.id {
+                Ok(id) => match self.apply_remove(id).await {
+                    Ok(()) => true,
+                    Err(err) => {
+                        tracing::warn!("removing {}: {err:#}", id.fmt_short());
+                        false
+                    }
+                },
+                Err(why) => {
+                    tracing::warn!("ignoring queued removal {}: {why}", queued.path.display());
+                    true
+                }
+            };
+            if done {
+                if let Err(err) = std::fs::remove_file(&queued.path) {
+                    tracing::warn!("removing {}: {err}", queued.path.display());
+                }
+            }
+        }
+    }
+
+    /// Writes a removal of `id`. Refusals are logged, not returned: queuing
+    /// them again wouldn't help.
+    async fn apply_remove(&self, id: EndpointId) -> anyhow::Result<()> {
+        let label = self.names.display(id);
+        if let Err(err) = member::check_removable(id, self.me(), self.group.founder) {
+            tracing::warn!("not removing {label}: {err}");
+            return Ok(());
+        }
+        if self.gate.is_removed(id) {
+            return Ok(());
+        }
+        if !self.view.is_member(id) {
+            tracing::warn!("not removing {label}: not a member");
+            return Ok(());
+        }
+        member::write_removal(&self.docs, self.group.id, &self.key, id).await?;
+        Ok(())
+    }
+
+    /// Applies the group name `group name` queued, if any.
+    async fn apply_queued_group_name(&self) {
+        let (path, name) = match member::queued_group_name(&self.config_dir) {
+            Ok(Some(queued)) => queued,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!("reading the queued group name: {err:#}");
+                return;
+            }
+        };
+        match name {
+            Ok(name) => {
+                if let Err(err) = member::write_group_name(&self.docs, self.group.id, &name).await {
+                    tracing::warn!("naming the group: {err:#}");
+                    return;
+                }
+            }
+            Err(why) => tracing::warn!("ignoring queued group name: {why}"),
+        }
+        if let Err(err) = std::fs::remove_file(&path) {
+            tracing::warn!("removing {}: {err}", path.display());
+        }
+    }
+
+    /// Takes in a new read of the membership doc: members, removals and
+    /// names. Stops admitting removed nodes and closes their connections.
+    /// Logs the changes if `log` is set.
+    async fn update_membership(&self, membership: Membership, log: bool) {
+        let Membership { members, removed } = membership;
+        let before: HashSet<EndpointId> = self
+            .view
+            .members()
+            .iter()
+            .map(|s| s.record.member)
+            .collect();
+        let after: HashSet<EndpointId> = members.iter().map(|s| s.record.member).collect();
+        let added = self.view.set_members(members.clone());
+        self.view.set_removed(removed.clone());
+        let newly_removed = self
+            .gate
+            .set_removed(removed.iter().map(|s| s.removal.member).collect());
+        for id in &newly_removed {
+            self.peers
+                .close(*id, NOT_A_MEMBER, b"removed from the group");
+        }
+        // Names before the refresh: a removed member's name goes with it.
+        if log {
+            for id in before.difference(&after) {
+                let why = match removed.iter().find(|s| s.removal.member == *id) {
+                    Some(s) => format!("removed by {}", self.names.display(s.removal.removed_by)),
+                    None => "the member that added it was removed".to_string(),
+                };
+                tracing::info!("{} is no longer a member: {why}", self.names.display(*id));
+            }
+        }
+        if let Some(s) = removed.iter().find(|s| s.removal.member == self.me()) {
+            if newly_removed.contains(&self.me()) {
+                tracing::warn!(
+                    "this node was removed from the group by {}; it can't sync with the \
+                     group any more. To join again, clear the config dir \
+                     (`sync-node --clear-config`): a new ID can be added",
+                    self.names.display(s.removal.removed_by)
+                );
+            }
+        }
+        self.refresh_names(&members, log).await;
+        if log {
+            for added in added {
+                tracing::info!(
+                    "member added: {} (by {})",
+                    self.names.display(added.record.member),
+                    self.names.display(added.record.added_by)
+                );
+            }
+        }
+    }
+
+    /// Re-reads members' names and the group's name, logging changes if
+    /// `log` is set.
     async fn refresh_names(&self, members: &[SignedRecord], log: bool) {
         let names = match member::read_names(&self.docs, &self.blobs, self.group.id, members).await
         {
@@ -316,6 +449,15 @@ impl Monitor {
             }
         };
         let renames = self.names.replace(names);
+        match member::read_group_name(&self.docs, &self.blobs, self.group.id).await {
+            Ok(name) => {
+                let changed = self.names.set_group(name.clone());
+                if let (true, true, Some(name)) = (log, changed, name) {
+                    tracing::info!("the group is now named {name}");
+                }
+            }
+            Err(err) => tracing::warn!("reading the group name: {err:#}"),
+        }
         if !log {
             return;
         }
@@ -338,6 +480,7 @@ impl Monitor {
             &self.peers.snapshot(),
             &self.names,
             &self.folders.list(),
+            &self.folders.available(),
         )
     }
 

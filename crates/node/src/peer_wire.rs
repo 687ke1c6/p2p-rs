@@ -418,6 +418,7 @@ impl PeerWireProtocol {
         let (mut upload, mut unchoked) = self.uploads.join(remote);
         let mut choked = true;
         let mut verified: Option<Verified> = None;
+        let mut served = folder.served.clone();
         loop {
             let want = upload.interested && *unchoked.borrow_and_update();
             if want == choked {
@@ -434,6 +435,8 @@ impl PeerWireProtocol {
                     changed?;
                     continue;
                 }
+                // The folder was disabled: no longer in the swarm.
+                Err(_) = served.changed() => break,
                 msg = incoming.recv() => match msg {
                     Some(msg) => msg?.0,
                     None => break,
@@ -851,8 +854,8 @@ pub struct SwarmPeer {
 pub enum SwarmPeerState {
     /// Not in the swarm: asked again every [`REJOIN`].
     Out,
-    /// Not asked again during this download: it sent a bad piece, or no
-    /// longer has the file.
+    /// Not asked again during this download: it sent a bad piece, no
+    /// longer has the file, or is no longer a member.
     Banned,
     Joining,
     In(InSwarm),
@@ -1222,9 +1225,16 @@ impl Client {
             let wake = picker.next_overdue(now);
             tokio::select! {
                 _ = rejoin.tick() => {
-                    for id in peers() {
+                    let listed = peers();
+                    for &id in &listed {
                         if id != me && !remotes.iter().any(|r| r.id == id) {
                             remotes.push(Remote { id, generation: 0, state: State::Out { banned: false } });
+                        }
+                    }
+                    // No longer listed (no longer a member): not asked again.
+                    for remote in remotes.iter_mut() {
+                        if matches!(remote.state, State::Out { banned: false }) && !listed.contains(&remote.id) {
+                            remote.state = State::Out { banned: true };
                         }
                     }
                     for (i, remote) in remotes.iter_mut().enumerate() {

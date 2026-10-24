@@ -13,7 +13,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, PathEvent, PathId, PathStats, WeakConnectionHandle};
+use iroh::endpoint::{Connection, PathEvent, PathId, PathStats, VarInt, WeakConnectionHandle};
 use iroh::{EndpointId, TransportAddr};
 use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -217,6 +217,25 @@ impl Peers {
         Self {
             state: Arc::default(),
             names,
+        }
+    }
+
+    /// Closes every connection to `id` with `code`.
+    pub fn close(&self, id: EndpointId, code: u32, reason: &[u8]) {
+        let conns: Vec<Connection> = self
+            .state
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|peer| {
+                peer.conns
+                    .values()
+                    .filter_map(|conn| conn.handle.upgrade())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for conn in conns {
+            conn.close(VarInt::from_u32(code), reason);
         }
     }
 

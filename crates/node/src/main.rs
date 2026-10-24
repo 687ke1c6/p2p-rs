@@ -65,6 +65,11 @@ enum Command {
         #[command(subcommand)]
         command: FolderCommand,
     },
+    /// Manage the group.
+    Group {
+        #[command(subcommand)]
+        command: GroupCommand,
+    },
     /// Manage the group's members.
     Member {
         #[command(subcommand)]
@@ -96,6 +101,13 @@ enum InviteCommand {
 }
 
 #[derive(Subcommand)]
+enum GroupCommand {
+    /// Name the group, or rename it, on every node. Queued for the running
+    /// node, which applies it within one presence interval.
+    Name { name: String },
+}
+
+#[derive(Subcommand)]
 enum FolderCommand {
     /// Keep a folder at `path` on this node: joins the group's folder of that
     /// name, or creates it. Queued for the running node, which applies it
@@ -106,6 +118,18 @@ enum FolderCommand {
         /// The directory on this node.
         path: PathBuf,
     },
+    /// Stop keeping a folder on this node, as before `folder add`. Its files
+    /// stay on disk; only this node's own files in it (the marker, staging
+    /// files) go. The group keeps the folder. Queued for the running node,
+    /// which applies it within one presence interval.
+    Remove { name: String },
+    /// Turn a folder off on this node: it isn't watched or indexed, fetches
+    /// nothing and serves nothing, and its doc still syncs. Applied by the
+    /// running node within one presence interval.
+    Disable { name: String },
+    /// Turn a disabled folder on again. Its first scan writes what changed
+    /// while it was disabled to the group, deletes included.
+    Enable { name: String },
     /// Show what a folder will look like once every node keeping it has
     /// synced: files to fetch, deletes and conflicts. Written by the running
     /// node whenever the folder's index changes.
@@ -133,6 +157,12 @@ enum MemberCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Remove a member from the group, on every node: no member connects to
+    /// it or syncs with it again. Members it added go too, unless another
+    /// member adds them again. A removed node can't come back with the same
+    /// ID. Queued for the running node, which applies it within one presence
+    /// interval.
+    Remove { id: EndpointId },
 }
 
 #[tokio::main]
@@ -288,6 +318,34 @@ async fn run(args: Args) -> anyhow::Result<()> {
             );
         }
         Command::Folder {
+            command: FolderCommand::Remove { name },
+        } => {
+            folder::queue_remove(&config_dir, &name)?;
+            println!(
+                "queued; the running node removes folder {name} within {}s; its files stay",
+                PRESENCE_INTERVAL.as_secs()
+            );
+        }
+        Command::Folder {
+            command: FolderCommand::Disable { name },
+        } => {
+            folder::set_enabled(&config_dir, &name, false)?;
+            println!(
+                "the running node disables folder {name} within {}s",
+                PRESENCE_INTERVAL.as_secs()
+            );
+        }
+        Command::Folder {
+            command: FolderCommand::Enable { name },
+        } => {
+            folder::set_enabled(&config_dir, &name, true)?;
+            println!(
+                "the running node enables folder {name} within {}s; changes made while it \
+                 was disabled, deletes included, then sync to the group",
+                PRESENCE_INTERVAL.as_secs()
+            );
+        }
+        Command::Folder {
             command: FolderCommand::Show { name, all, entries },
         } => {
             let Some(view) = folder::read_view(&config_dir, &name)? else {
@@ -320,6 +378,33 @@ async fn run(args: Args) -> anyhow::Result<()> {
                     key.public()
                 );
             }
+        }
+        Command::Member {
+            command: MemberCommand::Remove { id },
+        } => {
+            // Queued rather than written, since `run` holds the stores.
+            let group = Group::load(&config_dir)?.ok_or(GroupError::NotInGroup)?;
+            member::check_removable(id, key.public(), group.founder)?;
+            member::queue_remove(&config_dir, id)?;
+            println!(
+                "queued; the running node applies it within {}s",
+                PRESENCE_INTERVAL.as_secs()
+            );
+            println!(
+                "members it added are no longer members, unless another member adds them again"
+            );
+        }
+        Command::Group {
+            command: GroupCommand::Name { name },
+        } => {
+            // Queued rather than written, since `run` holds the stores.
+            Group::load(&config_dir)?.ok_or(GroupError::NotInGroup)?;
+            let name = check_name(&name)?;
+            member::queue_group_name(&config_dir, &name)?;
+            println!(
+                "queued; the running node applies it within {}s",
+                PRESENCE_INTERVAL.as_secs()
+            );
         }
         Command::Status => print_status(&config_dir)?,
         Command::Join { ticket } => {

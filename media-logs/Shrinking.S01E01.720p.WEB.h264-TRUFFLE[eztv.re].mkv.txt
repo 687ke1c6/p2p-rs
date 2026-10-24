@@ -1,0 +1,44 @@
+NAME
+  Id: 2
+  Name: Shrinking.S01E01.720p.WEB.h264-TRUFFLE[eztv.re].mkv
+  Hash: fbacd4cdc46cfdd13be907283c3d735eb159a591
+  Magnet: magnet:?xt=urn:btih:fbacd4cdc46cfdd13be907283c3d735eb159a591&dn=Shrinking.S01E01.720p.WEB.h264-TRUFFLE%5Beztv.re%5D.mkv
+  Labels: 
+
+TRANSFER
+  State: Idle
+  Location: /media/Shows
+  Percent Done: 100%
+  ETA: 0 seconds (0 seconds)
+  Download Speed: 0 kB/s
+  Upload Speed: 0 kB/s
+  Have: 1.02 GB (1.02 GB verified)
+  Availability: 100%
+  Total size: 1.02 GB (1.02 GB wanted)
+  Downloaded: 1.02 GB
+  Uploaded: None
+  Ratio: 0.0
+  Corrupt DL: None
+  Peers: connected to 2, uploading to 0, downloading from 0
+
+HISTORY
+  Date added:       Sun Apr 20 17:01:45 2025
+  Date finished:    Sun Apr 20 17:18:52 2025
+  Date started:     Sun Apr 20 17:02:17 2025
+  Latest activity:  Sun Apr 20 17:17:46 2025
+  Downloading Time: 16 minutes (1005 seconds)
+  Seeding Time:     4 seconds (4 seconds)
+
+ORIGINS
+  Public torrent: Yes
+  Piece Count: 1025
+  Piece Size: 972.0 KiB
+
+LIMITS & BANDWIDTH
+  Download Limit: Unlimited
+  Upload Limit: Unlimited
+  Ratio Limit: Default
+  Honors Session Limits: Yes
+  Peer limit: 50
+  Bandwidth Priority: Normal
+

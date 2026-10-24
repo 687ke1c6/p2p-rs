@@ -10,6 +10,10 @@ id: string, name: string, path: string, files: number, bytes: number,
  */
 paused: boolean, 
 /**
+ * Turned off on this node: not watched, fetched or served.
+ */
+disabled: boolean, 
+/**
  * The other nodes this node syncs the folder's doc with.
  */
 peers: number, };

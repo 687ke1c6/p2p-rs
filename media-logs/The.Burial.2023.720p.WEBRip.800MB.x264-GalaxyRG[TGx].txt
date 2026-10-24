@@ -1,0 +1,44 @@
+NAME
+  Id: 2
+  Name: The.Burial.2023.720p.WEBRip.800MB.x264-GalaxyRG[TGx]
+  Hash: 4090ab1c9cb2384a84bd91763d0159dcbdb90f52
+  Magnet: magnet:?xt=urn:btih:4090ab1c9cb2384a84bd91763d0159dcbdb90f52&dn=The.Burial.2023.720p.WEBRip.800MB.x264-GalaxyRG%5BTGx%5D
+  Labels: 
+
+TRANSFER
+  State: Idle
+  Location: /media/Movies
+  Percent Done: 100%
+  ETA: 0 seconds (0 seconds)
+  Download Speed: 0 kB/s
+  Upload Speed: 0 kB/s
+  Have: 843.0 MB (843.0 MB verified)
+  Availability: 100%
+  Total size: 843.0 MB (843.0 MB wanted)
+  Downloaded: 843.8 MB
+  Uploaded: None
+  Ratio: 0.0
+  Corrupt DL: None
+  Peers: connected to 3, uploading to 0, downloading from 0
+
+HISTORY
+  Date added:       Sat Jul 27 14:48:19 2024
+  Date finished:    Sat Jul 27 15:34:15 2024
+  Date started:     Sat Jul 27 14:48:38 2024
+  Latest activity:  Sat Jul 27 15:34:35 2024
+  Downloading Time: 47 minutes (2870 seconds)
+  Seeding Time:     3 seconds (3 seconds)
+
+ORIGINS
+  Public torrent: Yes
+  Piece Count: 1608
+  Piece Size: 512.0 KiB
+
+LIMITS & BANDWIDTH
+  Download Limit: Unlimited
+  Upload Limit: Unlimited
+  Ratio Limit: Default
+  Honors Session Limits: Yes
+  Peer limit: 50
+  Bandwidth Priority: Normal
+

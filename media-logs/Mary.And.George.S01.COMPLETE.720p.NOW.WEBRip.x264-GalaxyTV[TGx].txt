@@ -1,0 +1,44 @@
+NAME
+  Id: 1
+  Name: Mary.And.George.S01.COMPLETE.720p.NOW.WEBRip.x264-GalaxyTV[TGx]
+  Hash: b86cf4549d6581c0d81ff28edd6f2372043ea711
+  Magnet: magnet:?xt=urn:btih:b86cf4549d6581c0d81ff28edd6f2372043ea711&dn=Mary.And.George.S01.COMPLETE.720p.NOW.WEBRip.x264-GalaxyTV%5BTGx%5D
+  Labels: 
+
+TRANSFER
+  State: Idle
+  Location: /media/Shows
+  Percent Done: 100%
+  ETA: 0 seconds (0 seconds)
+  Download Speed: 120 kB/s
+  Upload Speed: 0 kB/s
+  Have: 1.68 GB (1.68 GB verified)
+  Availability: 100%
+  Total size: 1.68 GB (1.68 GB wanted)
+  Downloaded: 1.69 GB
+  Uploaded: 1.15 MB
+  Ratio: 0.0
+  Corrupt DL: None
+  Peers: connected to 6, uploading to 0, downloading from 0
+
+HISTORY
+  Date added:       Mon Mar 18 13:42:07 2024
+  Date finished:    Mon Mar 18 14:15:21 2024
+  Date started:     Mon Mar 18 13:42:48 2024
+  Latest activity:  Mon Mar 18 14:15:21 2024
+  Downloading Time: 22 minutes (1323 seconds)
+  Seeding Time:     1 second (1 second)
+
+ORIGINS
+  Public torrent: Yes
+  Piece Count: 1604
+  Piece Size: 1.00 MiB
+
+LIMITS & BANDWIDTH
+  Download Limit: Unlimited
+  Upload Limit: Unlimited
+  Ratio Limit: Default
+  Honors Session Limits: Yes
+  Peer limit: 50
+  Bandwidth Priority: Normal
+

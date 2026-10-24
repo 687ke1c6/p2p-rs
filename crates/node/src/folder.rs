@@ -36,13 +36,14 @@ use iroh_docs::{Capability, ContentStatus, NamespaceId, NamespaceSecret};
 use n0_future::task::AbortOnDropHandle;
 use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::content::Content;
 use crate::index::{self, Apply, Entries, FileMeta, FolderIndex, IndexStats};
 use crate::member::{check_name, NameError, Names};
 use crate::peer_wire::{Client, Refusal};
+use crate::presence::View;
 use crate::record::{unix_now, GroupId};
 use crate::view::FolderView;
 
@@ -51,6 +52,10 @@ pub const FOLDERS_FILE: &str = "folders";
 
 /// Directory of queued folder adds inside the config directory.
 pub const FOLDER_ADDS_DIR: &str = "folder-adds";
+
+/// Directory of folder removes `folder remove` queued, one empty file per
+/// folder name.
+pub const FOLDER_REMOVES_DIR: &str = "folder-removes";
 
 /// Prefix of every folder's key in the membership doc: `folders/<doc id>`.
 pub const FOLDERS_PREFIX: &str = "folders/";
@@ -69,6 +74,11 @@ const META_FETCH_TRIES: u32 = 10;
 
 /// Requests waiting for a folder's index task.
 const APPLY_QUEUE: usize = 16;
+
+/// This node's disabled folders, by name, one per line, in the config
+/// directory. A file of its own: the `folders` file is postcard, which can't
+/// take a new field and still read the old files.
+pub const DISABLED_FILE: &str = "disabled-folders";
 
 /// Directory of rendered folder views inside the config directory, one file
 /// per folder name, for `folder show`.
@@ -118,6 +128,58 @@ fn save_local(config_dir: &Path, folders: &[FolderConfig]) -> anyhow::Result<()>
     let tmp = config_dir.join(format!("{FOLDERS_FILE}.tmp"));
     fs::write(&tmp, postcard::to_stdvec(folders)?)?;
     fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
+}
+
+/// The names of this node's disabled folders.
+pub fn load_disabled(config_dir: &Path) -> anyhow::Result<BTreeSet<String>> {
+    let path = config_dir.join(DISABLED_FILE);
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Enables or disables folder `name` on this node, which must keep it. The
+/// running node applies it within one presence interval. A disabled folder
+/// isn't watched or indexed, fetches nothing and serves nothing; its doc
+/// still syncs. Enabled again, its first scan writes what changed while it
+/// was disabled, deletes included.
+pub fn set_enabled(config_dir: &Path, name: &str, enabled: bool) -> anyhow::Result<()> {
+    if !load_local(config_dir)?.iter().any(|f| f.name == name) {
+        bail!("this node doesn't keep folder {name}");
+    }
+    let mut disabled = load_disabled(config_dir)?;
+    if enabled {
+        disabled.remove(name);
+    } else {
+        disabled.insert(name.to_string());
+    }
+    save_disabled(config_dir, &disabled)
+}
+
+fn save_disabled(config_dir: &Path, disabled: &BTreeSet<String>) -> anyhow::Result<()> {
+    let path = config_dir.join(DISABLED_FILE);
+    let tmp = config_dir.join(format!("{DISABLED_FILE}.tmp"));
+    let text: String = disabled.iter().map(|name| format!("{name}\n")).collect();
+    fs::write(&tmp, text)?;
+    fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Queues removing folder `name` from this node, which must keep it, for
+/// the running node to apply (see [`Folders::remove`]).
+pub fn queue_remove(config_dir: &Path, name: &str) -> anyhow::Result<()> {
+    if !load_local(config_dir)?.iter().any(|f| f.name == name) {
+        bail!("this node doesn't keep folder {name}");
+    }
+    let dir = config_dir.join(FOLDER_REMOVES_DIR);
+    DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    fs::write(dir.join(name), b"")?;
+    Ok(())
 }
 
 /// Queues adding a folder named `name` at `path` (absolute, already checked)
@@ -196,6 +258,32 @@ pub(crate) async fn group_folders(
     Ok(out.into_values().collect())
 }
 
+/// Removes the files this node keeps in a folder's root: the marker, and
+/// staging files and the journal (both start with [`index::TEMP_PREFIX`]).
+/// Logs what it can't remove.
+fn remove_own_files(root: &Path) {
+    let marker = root.join(index::MARKER);
+    if let Err(err) = fs::remove_file(&marker) {
+        if err.kind() != io::ErrorKind::NotFound {
+            tracing::warn!("removing {}: {err}", marker.display());
+        }
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let ours = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(index::TEMP_PREFIX));
+        if ours {
+            if let Err(err) = fs::remove_file(entry.path()) {
+                tracing::warn!("removing {}: {err}", entry.path().display());
+            }
+        }
+    }
+}
+
 /// The group's folder called `name`: of several, the one listed first.
 fn canonical<'a>(folders: &'a [GroupFolder], name: &str) -> Option<&'a GroupFolder> {
     folders
@@ -238,6 +326,9 @@ pub(crate) struct Serving {
     pub entries: Entries,
     /// To the folder's index task, to ask it to re-read a file.
     pub apply: Option<mpsc::Sender<Apply>>,
+    /// Closes when the folder stops being served (it is disabled): a
+    /// stream serving it then ends.
+    pub served: watch::Receiver<()>,
 }
 
 /// A folder this node keeps, as `status` shows it.
@@ -247,8 +338,20 @@ pub struct FolderState {
     pub stats: IndexStats,
     /// Not being indexed: the folder's root or its marker is missing.
     pub paused: bool,
+    /// Turned off on this node (`folder disable`).
+    pub disabled: bool,
     /// The other nodes this node syncs the folder's doc with.
     pub peers: usize,
+}
+
+/// A folder the group has that this node doesn't keep: `folder add` with its
+/// name and a directory keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableFolder {
+    pub id: NamespaceId,
+    pub name: String,
+    /// The nodes the membership doc lists as keeping it.
+    pub nodes: usize,
 }
 
 /// What `folder show` reads: a folder's merged view and the names to show
@@ -321,7 +424,12 @@ struct Inner {
     debounce: Duration,
     /// Members' names, for naming conflict copies.
     names: Names,
+    /// The members: only they are synced with and asked for pieces. A
+    /// removed node's entries and `folder-nodes` key stay in the docs.
+    view: View,
     running: Mutex<HashMap<NamespaceId, Running>>,
+    /// The group's folders this node doesn't keep, as of the last `check`.
+    available: Mutex<Vec<AvailableFolder>>,
     /// Held by `add` and `check`, so they never start the same folder twice.
     starting: tokio::sync::Mutex<()>,
 }
@@ -347,11 +455,28 @@ struct Running {
     entries: Entries,
     /// To the index task, while it runs.
     apply: Option<mpsc::Sender<Apply>>,
+    /// Turned off on this node: no index task, nothing served.
+    disabled: bool,
+    /// Dropped and replaced on disable, so the streams serving the folder
+    /// end (see [`Serving::served`]).
+    served: watch::Sender<()>,
 }
 
 impl Running {
+    /// Not indexing: disabled, or its root or marker missing.
     fn paused(&self) -> bool {
         self.task.as_ref().is_none_or(|task| task.is_finished())
+    }
+
+    /// Stops indexing, fetching and serving, and keeps the doc syncing.
+    fn disable(&mut self) {
+        self.disabled = true;
+        if let Some(task) = self.task.take() {
+            // The content task, and its downloads, stop with it.
+            task.abort();
+        }
+        self.apply = None;
+        self.served = watch::channel(()).0;
     }
 
     fn stop(self) {
@@ -359,6 +484,16 @@ impl Running {
             task.abort();
         }
         self.events.abort();
+    }
+
+    /// As [`Running::stop`], and waits until the tasks have ended.
+    async fn stop_and_wait(self) {
+        if let Some(task) = self.task {
+            task.abort();
+            let _ = task.await;
+        }
+        self.events.abort();
+        let _ = self.events.await;
     }
 }
 
@@ -369,6 +504,7 @@ impl Folders {
         self.0.client.fetched()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config_dir: &Path,
         docs: Docs,
@@ -377,6 +513,7 @@ impl Folders {
         debounce: Duration,
         direct_only: bool,
         names: Names,
+        view: View,
     ) -> Self {
         Self(Arc::new(Inner {
             config_dir: config_dir.to_owned(),
@@ -387,7 +524,9 @@ impl Folders {
             me: endpoint.id(),
             debounce,
             names,
+            view,
             running: Mutex::new(HashMap::new()),
+            available: Mutex::new(Vec::new()),
             starting: tokio::sync::Mutex::new(()),
         }))
     }
@@ -427,10 +566,47 @@ impl Folders {
         if moved {
             save_local(&self.0.config_dir, &local)?;
         }
+        self.note_available(group, &listed, &local).await;
+        let disabled = load_disabled(&self.0.config_dir)?;
         for config in local {
-            self.keep_running(group, config).await;
+            let off = disabled.contains(&config.name);
+            self.keep_running(group, config, off).await;
         }
         Ok(())
+    }
+
+    /// Keeps the group's folders that aren't in `local` for
+    /// [`Folders::available`]: one per name, the one nodes settle on.
+    async fn note_available(&self, group: GroupId, listed: &[GroupFolder], local: &[FolderConfig]) {
+        let mut names: Vec<&str> = listed
+            .iter()
+            .map(|f| f.name.as_str())
+            .filter(|name| !local.iter().any(|c| c.name == *name))
+            .collect();
+        names.sort();
+        names.dedup();
+        let mut available = Vec::new();
+        for name in names {
+            let Some(folder) = canonical(listed, name) else {
+                continue;
+            };
+            let nodes = folder_nodes(&self.0.docs, group, folder.id)
+                .await
+                .map(|nodes| nodes.len())
+                .unwrap_or(0);
+            available.push(AvailableFolder {
+                id: folder.id,
+                name: folder.name.clone(),
+                nodes,
+            });
+        }
+        *self.0.available.lock().unwrap() = available;
+    }
+
+    /// The group's folders this node doesn't keep, by name, as of the last
+    /// check (every presence interval).
+    pub fn available(&self) -> Vec<AvailableFolder> {
+        self.0.available.lock().unwrap().clone()
     }
 
     /// Opens a listed folder's doc and lists this node as keeping it.
@@ -462,7 +638,8 @@ impl Folders {
     }
 
     /// Starts what isn't running for `config`, and syncs with new nodes.
-    async fn keep_running(&self, group: GroupId, config: FolderConfig) {
+    /// With `disabled`, stops its index task and keeps only its doc.
+    async fn keep_running(&self, group: GroupId, config: FolderConfig, disabled: bool) {
         let id = config.id;
         let name = config.name.clone();
         let known = self.0.running.lock().unwrap().contains_key(&id);
@@ -483,14 +660,23 @@ impl Folders {
         if let Err(err) = self.fetch_missing_meta(id).await {
             tracing::debug!("folder {name}: fetching index metadata: {err:#}");
         }
-        let was_paused = match self.0.running.lock().unwrap().get(&id) {
+        let (was_paused, enabled) = match self.0.running.lock().unwrap().get_mut(&id) {
+            Some(running) if disabled => {
+                if !running.disabled {
+                    running.disable();
+                    tracing::info!("folder {name} disabled: not watched, fetched or served");
+                }
+                return;
+            }
             Some(running) if !running.paused() => return,
-            Some(_) => known,
+            Some(running) => (known, std::mem::take(&mut running.disabled)),
             None => return,
         };
         match self.start_index(&config).await {
             Ok(task) => {
-                if was_paused {
+                if enabled {
+                    tracing::info!("folder {name} enabled");
+                } else if was_paused {
                     tracing::info!("folder {name} resumed");
                 }
                 if let Some(running) = self.0.running.lock().unwrap().get_mut(&id) {
@@ -589,18 +775,27 @@ impl Folders {
             synced,
             entries: Entries::default(),
             apply: None,
+            disabled: false,
+            served: watch::channel(()).0,
         })
     }
 
-    /// Starts syncing the folder's doc with nodes listed as keeping it that
-    /// it isn't synced with yet.
+    /// Starts syncing the folder's doc with members listed as keeping it that
+    /// it isn't synced with yet, and drops the nodes that are no longer
+    /// members.
     async fn sync_peers(&self, group: GroupId, id: NamespaceId) -> anyhow::Result<()> {
-        let nodes = folder_nodes(&self.0.docs, group, id).await?;
+        let mut nodes = folder_nodes(&self.0.docs, group, id).await?;
+        nodes.retain(|n| self.is_member(*n));
         let new: Vec<EndpointId> = {
-            let running = self.0.running.lock().unwrap();
-            let Some(running) = running.get(&id) else {
+            let mut running = self.0.running.lock().unwrap();
+            let Some(running) = running.get_mut(&id) else {
                 return Ok(());
             };
+            let before = running.peers.len();
+            running.peers.retain(|p| nodes.contains(p));
+            if running.peers.len() != before {
+                running.dirty.store(true, Ordering::Relaxed);
+            }
             nodes
                 .iter()
                 .filter(|n| **n != self.0.me && !running.peers.contains(*n))
@@ -849,14 +1044,93 @@ impl Folders {
             config.name,
             config.path.display()
         );
-        self.keep_running(group, config).await;
+        let disabled = load_disabled(&self.0.config_dir)?.contains(&config.name);
+        self.keep_running(group, config, disabled).await;
         Ok(id)
     }
 
-    /// Applies the folder adds `folder add` queued. A request that fails is
-    /// logged and dropped: the reasons (not a directory, already kept) don't
-    /// go away by retrying.
+    /// Stops keeping folder `name` on this node, back to before `add`: stops
+    /// its tasks, deletes this node's `folder-nodes` key for it (that key
+    /// only: membership is untouched), stops syncing its doc, and forgets it
+    /// locally. In the
+    /// directory, removes only this node's own files (the marker, staging
+    /// files, the journal): the user's files stay. This node's entries stay
+    /// in the folder's doc, as an offline node's do: the other nodes keep
+    /// them, and so its versions, should it keep the folder again.
+    pub(crate) async fn remove(&self, group: GroupId, name: &str) -> anyhow::Result<()> {
+        let _starting = self.0.starting.lock().await;
+        let mut local = load_local(&self.0.config_dir)?;
+        let Some(config) = local.iter().find(|f| f.name == name).cloned() else {
+            bail!("this node doesn't keep folder {name}");
+        };
+        let running = self.0.running.lock().unwrap().remove(&config.id);
+        if let Some(running) = running {
+            // Ended, not only aborted, before the files are touched.
+            running.stop_and_wait().await;
+        }
+        // The membership doc goes on syncing, so the other nodes learn of
+        // it, stop syncing the folder's doc with this node, and stop
+        // counting it.
+        let membership = self
+            .0
+            .docs
+            .open(group)
+            .await?
+            .context("membership doc missing")?;
+        let author = self.0.docs.author_default().await?;
+        membership
+            .del(
+                author,
+                format!("{FOLDER_NODES_PREFIX}{}/{}", config.id, self.0.me),
+            )
+            .await?;
+        // Left, not dropped: iroh-docs drops a doc only once every handle
+        // to it is closed, and handles close only when asked. The copy stays
+        // on disk, and with it this node's entries, should it keep the
+        // folder again.
+        if let Ok(Some(doc)) = self.0.docs.open(config.id).await {
+            doc.leave().await.context("leaving the folder's doc")?;
+        }
+        local.retain(|f| f.id != config.id);
+        save_local(&self.0.config_dir, &local)?;
+        let mut disabled = load_disabled(&self.0.config_dir)?;
+        if disabled.remove(name) {
+            save_disabled(&self.0.config_dir, &disabled)?;
+        }
+        let _ = fs::remove_file(self.0.config_dir.join(VIEWS_DIR).join(name));
+        remove_own_files(&config.path);
+        tracing::info!(
+            "removed folder {name} from this node; its files stay at {}",
+            config.path.display()
+        );
+        Ok(())
+    }
+
+    /// Applies the folder adds `folder add` queued, then the removes
+    /// `folder remove` queued. A request that fails is logged and dropped:
+    /// the reasons (not a directory, already kept, not kept) don't go away
+    /// by retrying.
     pub(crate) async fn apply_queued(&self, group: GroupId) {
+        self.apply_queued_adds(group).await;
+        let dir = self.0.config_dir.join(FOLDER_REMOVES_DIR);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let file = entry.path();
+            let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if let Err(err) = self.remove(group, name).await {
+                tracing::warn!("can't remove folder {name}: {err:#}");
+            }
+            if let Err(err) = fs::remove_file(&file) {
+                tracing::warn!("removing {}: {err}", file.display());
+            }
+        }
+    }
+
+    async fn apply_queued_adds(&self, group: GroupId) {
         let dir = self.0.config_dir.join(FOLDER_ADDS_DIR);
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -999,6 +1273,7 @@ impl Folders {
         let Some(running) = running.get(&id).filter(|r| r.peers.contains(&remote)) else {
             return Err(Refusal::NotKept);
         };
+        // Disabled is paused too: the same answer, which says nothing more.
         if running.paused() {
             return Err(Refusal::NoSuchFile);
         }
@@ -1006,6 +1281,7 @@ impl Folders {
             root: running.config.path.clone(),
             entries: running.entries.clone(),
             apply: running.apply.clone(),
+            served: running.served.subscribe(),
         })
     }
 
@@ -1014,7 +1290,12 @@ impl Folders {
         self.0.client.swarms()
     }
 
-    /// The other nodes that keep folder `id`, as far as this node knows.
+    /// Whether `id` is a member (see [`View::may_be_member`]).
+    pub(crate) fn is_member(&self, id: EndpointId) -> bool {
+        self.0.view.may_be_member(id)
+    }
+
+    /// The other members that keep folder `id`, as far as this node knows.
     pub(crate) fn folder_peers(&self, id: NamespaceId) -> Vec<EndpointId> {
         self.0
             .running
@@ -1036,7 +1317,8 @@ impl Folders {
             .map(|r| FolderState {
                 config: r.config.clone(),
                 stats: *r.stats.lock().unwrap(),
-                paused: r.paused(),
+                paused: r.paused() && !r.disabled,
+                disabled: r.disabled,
                 peers: r.peers.len(),
             })
             .collect();

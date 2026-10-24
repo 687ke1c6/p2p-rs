@@ -1,0 +1,44 @@
+NAME
+  Id: 1
+  Name: Tour.de.France.Unchained.S01.COMPLETE.720p.NF.WEBRip.x264-GalaxyTV[TGx]
+  Hash: dd7bd10e403af2d65bd7c041eb768e80abe65a4c
+  Magnet: magnet:?xt=urn:btih:dd7bd10e403af2d65bd7c041eb768e80abe65a4c&dn=Tour.de.France.Unchained.S01.COMPLETE.720p.NF.WEBRip.x264-GalaxyTV%5BTGx%5D
+  Labels: 
+
+TRANSFER
+  State: Seeding
+  Location: /media/Shows
+  Percent Done: 100%
+  ETA: 0 seconds (0 seconds)
+  Download Speed: 53 kB/s
+  Upload Speed: 0 kB/s
+  Have: 5.17 GB (5.17 GB verified)
+  Availability: 100%
+  Total size: 5.17 GB (5.17 GB wanted)
+  Downloaded: 5.18 GB
+  Uploaded: 92.47 MB
+  Ratio: 0.0
+  Corrupt DL: 12.58 MB
+  Peers: connected to 2, uploading to 1, downloading from 0
+
+HISTORY
+  Date added:       Wed Jul  3 17:40:02 2024
+  Date finished:    Sat Jul 27 15:01:38 2024
+  Date started:     Sat Jul 27 15:00:33 2024
+  Latest activity:  Sat Jul 27 15:01:38 2024
+  Downloading Time: 3 hours, 24 minutes (12280 seconds)
+  Seeding Time:     2 hours, 40 minutes (9613 seconds)
+
+ORIGINS
+  Public torrent: Yes
+  Piece Count: 1234
+  Piece Size: 4.00 MiB
+
+LIMITS & BANDWIDTH
+  Download Limit: Unlimited
+  Upload Limit: Unlimited
+  Ratio Limit: Default
+  Honors Session Limits: Yes
+  Peer limit: 50
+  Bandwidth Priority: Normal
+

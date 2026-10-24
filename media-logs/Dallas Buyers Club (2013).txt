@@ -1,0 +1,44 @@
+NAME
+  Id: 2
+  Name: Dallas Buyers Club (2013)
+  Hash: f18a60db02ec3b55c18924f47955de766dacc537
+  Magnet: magnet:?xt=urn:btih:f18a60db02ec3b55c18924f47955de766dacc537&dn=Dallas%20Buyers%20Club%20%282013%29
+  Labels: 
+
+TRANSFER
+  State: Idle
+  Location: /media/Movies
+  Percent Done: 100%
+  ETA: 0 seconds (0 seconds)
+  Download Speed: 0 kB/s
+  Upload Speed: 0 kB/s
+  Have: 912.1 MB (912.1 MB verified)
+  Availability: 100%
+  Total size: 912.1 MB (912.1 MB wanted)
+  Downloaded: 912.1 MB
+  Uploaded: None
+  Ratio: 0.0
+  Corrupt DL: None
+  Peers: connected to 0, uploading to 0, downloading from 0
+
+HISTORY
+  Date added:       Sun Sep 15 10:30:12 2024
+  Date finished:    Sun Sep 15 12:55:29 2024
+  Date started:     Sun Sep 15 12:17:41 2024
+  Latest activity:  Sun Sep 15 12:55:29 2024
+  Downloading Time: 2 hours, 26 minutes (8814 seconds)
+  Seeding Time:     1 second (1 second)
+
+ORIGINS
+  Public torrent: Yes
+  Piece Count: 435
+  Piece Size: 2.00 MiB
+
+LIMITS & BANDWIDTH
+  Download Limit: Unlimited
+  Upload Limit: Unlimited
+  Ratio Limit: Default
+  Honors Session Limits: Yes
+  Peer limit: 50
+  Bandwidth Priority: Normal
+

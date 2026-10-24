@@ -1,0 +1,44 @@
+NAME
+  Id: 1
+  Name: Wicked.Little.Letters.2023.720p.WEBRip.800MB.x264-GalaxyRG[TGx]
+  Hash: 36e2bf33bdee1d0b674418aebad295aceec6daee
+  Magnet: magnet:?xt=urn:btih:36e2bf33bdee1d0b674418aebad295aceec6daee&dn=Wicked.Little.Letters.2023.720p.WEBRip.800MB.x264-GalaxyRG%5BTGx%5D
+  Labels: 
+
+TRANSFER
+  State: Seeding
+  Location: /media/Movies
+  Percent Done: 100%
+  ETA: 0 seconds (0 seconds)
+  Download Speed: 0 kB/s
+  Upload Speed: 0 kB/s
+  Have: 835.5 MB (835.5 MB verified)
+  Availability: 100%
+  Total size: 835.5 MB (835.5 MB wanted)
+  Downloaded: 836.4 MB
+  Uploaded: 378.5 kB
+  Ratio: 0.0
+  Corrupt DL: None
+  Peers: connected to 3, uploading to 1, downloading from 0
+
+HISTORY
+  Date added:       Sun Sep 15 10:29:02 2024
+  Date finished:    Sun Sep 15 11:09:35 2024
+  Date started:     Sun Sep 15 10:29:40 2024
+  Latest activity:  Sun Sep 15 11:09:35 2024
+  Downloading Time: 35 minutes (2154 seconds)
+  Seeding Time:     1 second (1 second)
+
+ORIGINS
+  Public torrent: Yes
+  Piece Count: 1594
+  Piece Size: 512.0 KiB
+
+LIMITS & BANDWIDTH
+  Download Limit: Unlimited
+  Upload Limit: Unlimited
+  Ratio Limit: Default
+  Honors Session Limits: Yes
+  Peer limit: 50
+  Bandwidth Priority: Normal
+

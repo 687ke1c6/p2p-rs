@@ -12,17 +12,20 @@ use iroh::{EndpointId, SecretKey};
 use iroh_blobs::Hash;
 use iroh_docs::NamespaceId;
 use serde_json::{json, Value};
-use sync_node::folder::{FolderConfig, FolderState, ViewFile, FOLDER_ADDS_DIR};
+use sync_node::folder::{
+    self, AvailableFolder, FolderConfig, FolderState, ViewFile, DISABLED_FILE, FOLDER_ADDS_DIR,
+    FOLDER_REMOVES_DIR,
+};
 use sync_node::index::IndexStats;
 use sync_node::invite::INVITES_DIR;
-use sync_node::member::ADDS_DIR;
+use sync_node::member::{ADDS_DIR, GROUP_NAME_FILE, REMOVES_DIR};
 use sync_node::peer_wire::{
     InSwarm, SwarmPeer, SwarmPeerState, SwarmSnapshot, Transfers, UploadSnapshot,
 };
 use sync_node::peers::{LinkKind, PeerSnapshot, Traffic};
 use sync_node::presence::LinkState;
 use sync_node::record::GroupId;
-use sync_node::status::{Link, MemberStatus};
+use sync_node::status::{Link, MemberStatus, RemovedStatus};
 use sync_node::ui::topics::{ClientMessage, Topics};
 use sync_node::ui::{self, BoxFuture, UiBackend, UiConfig};
 use sync_node::view::{Candidate, FolderView, NodeState, Outcome, PathView};
@@ -122,6 +125,11 @@ fn new_group() -> GroupId {
     NamespaceId::from(&[9u8; 32])
 }
 
+/// The node `in_group` lists as removed.
+fn removed() -> EndpointId {
+    SecretKey::from_bytes(&[7u8; 32]).public()
+}
+
 fn id() -> EndpointId {
     SecretKey::generate().public()
 }
@@ -160,8 +168,8 @@ async fn send_json(app: Router, request: Request<Body>) -> (StatusCode, Value) {
     (status, value)
 }
 
-/// A group of two: this node (the founder) and a member it is connected to
-/// directly, keeping one folder.
+/// A group of two named `home`: this node (the founder) and a member it is
+/// connected to directly, keeping one folder. One node was removed.
 fn in_group(this: EndpointId, other: EndpointId) -> Status {
     let traffic = Traffic {
         direct_sent: 10,
@@ -172,6 +180,7 @@ fn in_group(this: EndpointId, other: EndpointId) -> Status {
     Status {
         node: this,
         group: NamespaceId::from(&[1u8; 32]),
+        group_name: Some("home".to_string()),
         founder: this,
         generated_at: 1_700_000_000,
         members: vec![
@@ -201,6 +210,11 @@ fn in_group(this: EndpointId, other: EndpointId) -> Status {
                 }),
             },
         ],
+        removed: vec![RemovedStatus {
+            id: removed(),
+            removed_by: this,
+            removed_at: 1_699_999_000,
+        }],
         links: vec![Link {
             a: this,
             b: other,
@@ -217,7 +231,13 @@ fn in_group(this: EndpointId, other: EndpointId) -> Status {
                 bytes: 1234,
             },
             paused: false,
+            disabled: false,
             peers: 1,
+        }],
+        available: vec![AvailableFolder {
+            id: NamespaceId::from(&[3u8; 32]),
+            name: "music".to_string(),
+            nodes: 2,
         }],
     }
 }
@@ -251,6 +271,7 @@ async fn status_in_a_group() {
             "node": this,
             "group": {
                 "id": status.group.to_string(),
+                "name": "home",
                 "founder": this,
                 "generated_at": 1_700_000_000,
                 "members": [
@@ -286,6 +307,11 @@ async fn status_in_a_group() {
                         },
                     },
                 ],
+                "removed": [{
+                    "id": removed().to_string(),
+                    "removed_by": this,
+                    "removed_at": 1_699_999_000,
+                }],
                 "links": [{ "a": this, "b": other, "state": "Direct" }],
                 "folders": [{
                     "id": NamespaceId::from(&[2u8; 32]).to_string(),
@@ -294,7 +320,13 @@ async fn status_in_a_group() {
                     "files": 5,
                     "bytes": 1234,
                     "paused": false,
+                    "disabled": false,
                     "peers": 1,
+                }],
+                "available": [{
+                    "id": NamespaceId::from(&[3u8; 32]).to_string(),
+                    "name": "music",
+                    "nodes": 2,
                 }],
             },
         })
@@ -467,6 +499,7 @@ async fn folders_list_the_kept_folders() {
             "files": 5,
             "bytes": 1234,
             "paused": false,
+            "disabled": false,
             "peers": 1,
         }])
     );
@@ -990,6 +1023,14 @@ fn post(path: &str, body: Value) -> Request<Body> {
         .unwrap()
 }
 
+/// A fake in the group of `in_group` with member `other`.
+fn grouped_with(this: EndpointId, other: EndpointId) -> Fake {
+    Fake {
+        status: Mutex::new(Some(in_group(this, other))),
+        ..Fake::new(this)
+    }
+}
+
 /// A fake in the group of `in_group`, keeping `photos`.
 fn grouped(this: EndpointId) -> Fake {
     Fake {
@@ -1177,6 +1218,192 @@ async fn members_are_queued() {
     let (code, _) = send_json(
         no_group(config.path()),
         post("/api/members", json!({ "id": new.to_string() })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn removals_are_queued() {
+    let config = tempfile::tempdir().unwrap();
+    let (this, other) = (id(), id());
+    let (code, body) = send_json(
+        app(grouped_with(this, other), config.path(), config.path()),
+        post("/api/members/remove", json!({ "id": other.to_string() })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    assert_eq!(body, json!({ "queued": true, "within_secs": 5 }));
+    assert!(config
+        .path()
+        .join(REMOVES_DIR)
+        .join(other.to_string())
+        .is_file());
+    // Refusals. This node is the founder in `in_group`.
+    let stranger = id();
+    for (request, error) in [
+        (json!({ "id": "nope" }), "not a node ID: nope".to_string()),
+        (
+            json!({ "id": this.to_string() }),
+            "the founder can't be removed".to_string(),
+        ),
+        (
+            json!({ "id": stranger.to_string() }),
+            format!("{} is not a member", stranger.fmt_short()),
+        ),
+    ] {
+        let (got, body) = send_json(
+            app(grouped_with(this, other), config.path(), config.path()),
+            post("/api/members/remove", request.clone()),
+        )
+        .await;
+        assert_eq!(got, StatusCode::BAD_REQUEST, "{request}");
+        assert_eq!(body, json!({ "error": error }), "{request}");
+    }
+    // As a member that isn't the founder: not itself.
+    let mut status = in_group(other, this);
+    status.node = this;
+    status.founder = other;
+    let fake = Fake {
+        status: Mutex::new(Some(status)),
+        ..Fake::new(this)
+    };
+    let (got, body) = send_json(
+        app(fake, config.path(), config.path()),
+        post("/api/members/remove", json!({ "id": this.to_string() })),
+    )
+    .await;
+    assert_eq!(got, StatusCode::BAD_REQUEST);
+    assert_eq!(body, json!({ "error": "a node can't remove itself" }));
+    let (code, _) = send_json(
+        no_group(config.path()),
+        post("/api/members/remove", json!({ "id": other.to_string() })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read_dir(config.path().join(REMOVES_DIR))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn group_names_are_queued() {
+    let config = tempfile::tempdir().unwrap();
+    let (code, body) = send_json(
+        app(grouped(id()), config.path(), config.path()),
+        post("/api/group/name", json!({ "name": "  family " })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    assert_eq!(body, json!({ "queued": true, "within_secs": 5 }));
+    let queued = config.path().join(GROUP_NAME_FILE);
+    assert_eq!(std::fs::read_to_string(&queued).unwrap(), "family");
+    let (code, body) = send_json(
+        app(grouped(id()), config.path(), config.path()),
+        post("/api/group/name", json!({ "name": " " })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(body, json!({ "error": "name is empty" }));
+    let (code, _) = send_json(
+        no_group(config.path()),
+        post("/api/group/name", json!({ "name": "x" })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_to_string(&queued).unwrap(), "family");
+}
+
+#[tokio::test]
+async fn folders_are_disabled_and_enabled() {
+    let config = tempfile::tempdir().unwrap();
+    // The `folders` file `folder add` writes: this node keeps "photos".
+    let kept = FolderConfig {
+        id: NamespaceId::from(&[2u8; 32]),
+        name: "photos".to_string(),
+        path: "/home/g/photos".into(),
+    };
+    std::fs::write(
+        config.path().join(folder::FOLDERS_FILE),
+        postcard::to_stdvec(&vec![kept]).unwrap(),
+    )
+    .unwrap();
+    let disabled = || std::fs::read_to_string(config.path().join(DISABLED_FILE)).unwrap();
+    let (code, body) = send_json(
+        app(grouped(id()), config.path(), config.path()),
+        post("/api/folders/photos/enabled", json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    assert_eq!(body, json!({ "queued": true, "within_secs": 5 }));
+    assert_eq!(disabled(), "photos\n");
+    let (code, _) = send_json(
+        app(grouped(id()), config.path(), config.path()),
+        post("/api/folders/photos/enabled", json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    assert_eq!(disabled(), "");
+    // A folder this node doesn't keep.
+    let (code, body) = send_json(
+        app(grouped(id()), config.path(), config.path()),
+        post("/api/folders/music/enabled", json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body,
+        json!({ "error": "this node doesn't keep folder music" })
+    );
+    let (code, _) = send_json(
+        no_group(config.path()),
+        post("/api/folders/photos/enabled", json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn folder_removes_are_queued() {
+    let config = tempfile::tempdir().unwrap();
+    let kept = FolderConfig {
+        id: NamespaceId::from(&[2u8; 32]),
+        name: "photos".to_string(),
+        path: "/home/g/photos".into(),
+    };
+    std::fs::write(
+        config.path().join(folder::FOLDERS_FILE),
+        postcard::to_stdvec(&vec![kept]).unwrap(),
+    )
+    .unwrap();
+    let (code, body) = send_json(
+        app(grouped(id()), config.path(), config.path()),
+        post("/api/folders/photos/remove", json!({})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    assert_eq!(body, json!({ "queued": true, "within_secs": 5 }));
+    assert!(config
+        .path()
+        .join(FOLDER_REMOVES_DIR)
+        .join("photos")
+        .is_file());
+    let (code, body) = send_json(
+        app(grouped(id()), config.path(), config.path()),
+        post("/api/folders/music/remove", json!({})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body,
+        json!({ "error": "this node doesn't keep folder music" })
+    );
+    let (code, _) = send_json(
+        no_group(config.path()),
+        post("/api/folders/photos/remove", json!({})),
     )
     .await;
     assert_eq!(code, StatusCode::CONFLICT);

@@ -1,7 +1,5 @@
-import { Link } from "@tanstack/solid-router";
-import { createSignal, type JSX, Show } from "solid-js";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Button, buttonVariants } from "@/components/ui/button";
+import { createSignal, Show } from "solid-js";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   TextField,
@@ -10,12 +8,13 @@ import {
   TextFieldLabel,
   TextFieldTextArea,
 } from "@/components/ui/text-field";
-import { type ActionState, action } from "@/lib/action";
-import { addFolder, addMember, createGroup, createInvite, join } from "@/lib/api";
+import { action } from "@/lib/action";
+import { addMember, createGroup, createInvite, join } from "@/lib/api";
 import { live } from "@/lib/socket";
+import { Failed, Form, Queued } from "./Forms";
 import { LiveError } from "./LiveError";
 
-/** The setup the CLI does: create or join a group; then invites, members and folders. */
+/** The setup the CLI does: create or join a group; then invites and members. Folders are on the dashboard. */
 export function Setup() {
   const status = live("status", "Status");
   return (
@@ -83,13 +82,10 @@ function NoGroup(props: { node: string }) {
 function InGroup(props: { node: string }) {
   const [invite, startInvite] = action(createInvite);
   const [member, startMember] = action(addMember);
-  const [folder, startFolder] = action(addFolder);
   const [hours, setHours] = createSignal("24");
   const [inviteName, setInviteName] = createSignal("");
   const [memberId, setMemberId] = createSignal("");
   const [memberName, setMemberName] = createSignal("");
-  const [folderName, setFolderName] = createSignal("");
-  const [folderPath, setFolderPath] = createSignal("");
   const [copied, setCopied] = createSignal(false);
   const optional = (text: string) => (text.trim() === "" ? undefined : text.trim());
   const copy = async (ticket: string) => {
@@ -179,85 +175,6 @@ function InGroup(props: { node: string }) {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Add a folder</CardTitle>
-          <CardDescription>
-            Keeps a folder on this node: joins the group's folder of that name, or creates it.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Form
-            onSubmit={() => void startFolder({ name: folderName(), path: folderPath() })}
-          >
-            <TextField value={folderName()} onChange={setFolderName}>
-              <TextFieldLabel>Folder name</TextFieldLabel>
-              <TextFieldInput required />
-              <TextFieldDescription>The same on every node.</TextFieldDescription>
-            </TextField>
-            <TextField value={folderPath()} onChange={setFolderPath}>
-              <TextFieldLabel>Directory on this node</TextFieldLabel>
-              <TextFieldInput class="font-mono" placeholder="/home/…" required />
-            </TextField>
-            <Button type="submit" class="w-fit" disabled={folder().busy}>
-              Add folder
-            </Button>
-            <Failed state={folder()} />
-            <Show when={folder().answer}>
-              {(answer) => (
-                <Queued within={answer().within_secs}>
-                  See it under{" "}
-                  <Link to="/folders" class={buttonVariants({ variant: "link", class: "h-auto p-0" })}>
-                    Folders
-                  </Link>
-                  .
-                </Queued>
-              )}
-            </Show>
-          </Form>
-        </CardContent>
-      </Card>
     </>
-  );
-}
-
-/** A form that runs `onSubmit` instead of sending itself. */
-function Form(props: { onSubmit: () => void; children: JSX.Element }) {
-  return (
-    <form
-      class="grid gap-4"
-      onSubmit={(event) => {
-        event.preventDefault();
-        props.onSubmit();
-      }}
-    >
-      {props.children}
-    </form>
-  );
-}
-
-function Failed(props: { state: ActionState<unknown> }) {
-  return (
-    <Show when={props.state.error}>
-      {(error) => (
-        <Alert variant="destructive">
-          <AlertTitle>Not done</AlertTitle>
-          <AlertDescription>{error()}</AlertDescription>
-        </Alert>
-      )}
-    </Show>
-  );
-}
-
-function Queued(props: { within: number; children: JSX.Element }) {
-  return (
-    <Alert>
-      <AlertTitle>Queued</AlertTitle>
-      <AlertDescription>
-        <p>
-          The node applies it within {props.within} s. {props.children}
-        </p>
-      </AlertDescription>
-    </Alert>
   );
 }

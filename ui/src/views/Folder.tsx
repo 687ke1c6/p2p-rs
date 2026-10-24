@@ -1,8 +1,11 @@
+import { Link } from "@tanstack/solid-router";
+import ArrowLeft from "lucide-solid/icons/arrow-left";
 import { createSignal, For, Show } from "solid-js";
 import type { FolderViewAnswer } from "@/api/FolderViewAnswer";
 import type { PathClass } from "@/api/PathClass";
 import type { PathInfo } from "@/api/PathInfo";
 import { Badge, type BadgeProps } from "@/components/ui/badge";
+import { buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Switch,
@@ -30,6 +33,10 @@ export function Folder(props: { name: string }) {
   const view = live(`folders/${props.name}`, "Folder");
   return (
     <div class="space-y-4">
+      <Link to="/" class={buttonVariants({ variant: "ghost", size: "sm" })}>
+        <ArrowLeft class="size-4" />
+        Dashboard
+      </Link>
       <LiveError error={view().error} />
       <Show when={view().value}>{(answer) => <FolderDetails view={answer()} />}</Show>
     </div>

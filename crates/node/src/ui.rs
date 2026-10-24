@@ -147,9 +147,13 @@ pub fn router(backend: Arc<dyn UiBackend>, config: UiConfig) -> (Router, Topics)
         .route("/group", post(actions::create_group))
         .route("/join", post(actions::join))
         .route("/invites", post(actions::create_invite))
+        .route("/group/name", post(actions::name_group))
         .route("/members", post(actions::add_member))
+        .route("/members/remove", post(actions::remove_member))
         .route("/folders", get(folders).post(actions::add_folder))
         .route("/folders/{name}", get(folder))
+        .route("/folders/{name}/enabled", post(actions::set_folder_enabled))
+        .route("/folders/{name}/remove", post(actions::remove_folder))
         .route("/transfers", get(transfers))
         .route("/ws", get(socket))
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "no such API route") });
@@ -227,8 +231,11 @@ async fn socket(
 /// side closes or the node stops.
 async fn socket_loop(mut socket: WebSocket, topics: Topics) {
     let (out, mut outbox) = mpsc::channel::<topics::Message>(8);
-    // One task per subscription, forwarding its messages to `out`.
-    let mut subscriptions: HashMap<String, JoinHandle<()>> = HashMap::new();
+    // One task per topic, forwarding its messages to `out`, and how many
+    // subscribes it has had that no unsubscribe has matched yet: a page can
+    // subscribe to a topic twice (a view mounting before the one it replaces
+    // goes), and its first unsubscribe must not end the other's.
+    let mut subscriptions: HashMap<String, (JoinHandle<()>, usize)> = HashMap::new();
     loop {
         tokio::select! {
             _ = topics.stopped() => {
@@ -247,7 +254,8 @@ async fn socket_loop(mut socket: WebSocket, topics: Topics) {
             received = socket.recv() => match received {
                 Some(Ok(WsMessage::Text(text))) => match serde_json::from_str(&text) {
                     Ok(ClientMessage::Subscribe(name)) => {
-                        if subscriptions.contains_key(&name) {
+                        if let Some((_, count)) = subscriptions.get_mut(&name) {
+                            *count += 1;
                             continue;
                         }
                         match topics.subscribe(&name) {
@@ -260,7 +268,7 @@ async fn socket_loop(mut socket: WebSocket, topics: Topics) {
                                         }
                                     }
                                 });
-                                subscriptions.insert(name, task);
+                                subscriptions.insert(name, (task, 1));
                             }
                             Err(error) => {
                                 if socket.send(WsMessage::Text(error.as_ref().into())).await.is_err() {
@@ -270,8 +278,13 @@ async fn socket_loop(mut socket: WebSocket, topics: Topics) {
                         }
                     }
                     Ok(ClientMessage::Unsubscribe(name)) => {
-                        if let Some(task) = subscriptions.remove(&name) {
-                            task.abort();
+                        if let Some((_, count)) = subscriptions.get_mut(&name) {
+                            *count -= 1;
+                            if *count == 0 {
+                                if let Some((task, _)) = subscriptions.remove(&name) {
+                                    task.abort();
+                                }
+                            }
                         }
                     }
                     Err(err) => tracing::warn!("web UI: bad WebSocket message: {err}"),
@@ -281,7 +294,7 @@ async fn socket_loop(mut socket: WebSocket, topics: Topics) {
             },
         }
     }
-    for task in subscriptions.into_values() {
+    for (task, _) in subscriptions.into_values() {
         task.abort();
     }
 }
@@ -375,14 +388,38 @@ pub struct StatusAnswer {
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct GroupStatus {
     pub id: String,
+    pub name: Option<String>,
     pub founder: String,
     /// Unix seconds.
     pub generated_at: u64,
     /// Founder first, then by when they joined.
     pub members: Vec<MemberInfo>,
+    /// Nodes removed from the group, oldest removal first.
+    pub removed: Vec<RemovedInfo>,
     /// Every pair of members, each once.
     pub links: Vec<LinkInfo>,
     pub folders: Vec<FolderInfo>,
+    /// The group's folders this node doesn't keep, by name.
+    pub available: Vec<AvailableInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct AvailableInfo {
+    /// The folder's doc.
+    pub id: String,
+    pub name: String,
+    /// The nodes that keep it.
+    pub nodes: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct RemovedInfo {
+    pub id: String,
+    pub removed_by: String,
+    /// Unix seconds, by the remover's clock.
+    pub removed_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -433,6 +470,8 @@ pub struct FolderInfo {
     pub bytes: u64,
     /// Not being indexed: the folder's root or its marker is missing.
     pub paused: bool,
+    /// Turned off on this node: not watched, fetched or served.
+    pub disabled: bool,
     /// The other nodes this node syncs the folder's doc with.
     pub peers: usize,
 }
@@ -441,6 +480,7 @@ impl From<&Status> for GroupStatus {
     fn from(status: &Status) -> Self {
         Self {
             id: status.group.to_string(),
+            name: status.group_name.clone(),
             founder: status.founder.to_string(),
             generated_at: status.generated_at,
             members: status
@@ -448,8 +488,26 @@ impl From<&Status> for GroupStatus {
                 .iter()
                 .map(|member| MemberInfo::new(member, status.display(member.id)))
                 .collect(),
+            removed: status
+                .removed
+                .iter()
+                .map(|r| RemovedInfo {
+                    id: r.id.to_string(),
+                    removed_by: r.removed_by.to_string(),
+                    removed_at: r.removed_at,
+                })
+                .collect(),
             links: status.links.iter().map(LinkInfo::from).collect(),
             folders: status.folders.iter().map(FolderInfo::from).collect(),
+            available: status
+                .available
+                .iter()
+                .map(|f| AvailableInfo {
+                    id: f.id.to_string(),
+                    name: f.name.clone(),
+                    nodes: f.nodes,
+                })
+                .collect(),
         }
     }
 }
@@ -500,6 +558,7 @@ impl From<&FolderState> for FolderInfo {
             files: folder.stats.files,
             bytes: folder.stats.bytes,
             paused: folder.paused,
+            disabled: folder.disabled,
             peers: folder.peers,
         }
     }
@@ -716,7 +775,8 @@ pub struct SwarmPeerInfo {
 pub enum SwarmPeerKind {
     /// Not in the swarm; asked again every 2 s.
     Out,
-    /// Not asked again during this download.
+    /// Not asked again during this download: it sent a bad piece, no longer
+    /// has the file, or is no longer a member.
     Banned,
     Joining,
     In,
@@ -933,7 +993,10 @@ mod tests {
         actions::InviteRequest::export_all(&config).unwrap();
         actions::InviteAnswer::export_all(&config).unwrap();
         actions::MemberRequest::export_all(&config).unwrap();
+        actions::RemoveRequest::export_all(&config).unwrap();
+        actions::GroupNameRequest::export_all(&config).unwrap();
         actions::FolderRequest::export_all(&config).unwrap();
+        actions::FolderEnabledRequest::export_all(&config).unwrap();
         actions::QueuedAnswer::export_all(&config).unwrap();
         ErrorAnswer::export_all(&config).unwrap();
     }

@@ -62,6 +62,10 @@ JSON under `/api`. Every other path is a file from the UI dir; an unknown path t
 | `POST /api/join` | `{ "ticket": <invite ticket or member ID> }` | 200 `{ "group": <id>, "founder": <id> }`. Waits until the join is done (`Node::join`), at most 60 s (then 504; the join goes on). 409 if in a group. |
 | `POST /api/invites` | `{ "hours": <n, default 24>, "name": <optional> }` | 200 `{ "ticket": <text> }`, as `invite create`. |
 | `POST /api/members` | `{ "id": <node ID>, "name": <optional> }` | 202 `{ "queued": true, "within_secs": 5 }`. Validated first (`check_name`, in a group), then queued with `member::queue_add`, as `member add`. |
+| `POST /api/members/remove` | `{ "id": <node ID> }` | 202, as above. Validated first (in a group, `check_removable`: not the founder, not this node; a member in this node's view), then queued with `member::queue_remove`, as `member remove` (ADR 0006). |
+| `POST /api/group/name` | `{ "name": <name> }` | 202, as above. Validated first (`check_name`, in a group), then queued with `member::queue_group_name`, as `group name`. |
+| `POST /api/folders/{name}/enabled` | `{ "enabled": <bool> }` | 202, as above. Validated first (in a group, a folder this node keeps), then written to the `disabled-folders` file with `folder::set_enabled`, as `folder enable|disable`, for the running node to apply. |
+| `POST /api/folders/{name}/remove` | `{}` | 202, as above. Validated first (in a group, a folder this node keeps), then queued with `folder::queue_remove`, as `folder remove`. The running node stops the folder's tasks, deletes this node's `folder-nodes` key for it (membership is untouched), leaves its doc (kept on disk, with this node's entries), forgets it locally, and removes only its own files from the directory (the marker, staging files, the journal). |
 | `POST /api/folders` | `{ "name": <folder name>, "path": <directory on this node> }` | 202 `{ "queued": true, "within_secs": 5 }`. Validated first (`check_folder_name`, path absolute (unlike the CLI: the node's working directory means nothing on the page), canonicalized and a directory, in a group), then queued with `folder::queue_add`, as `folder add`. |
 
 Queued actions apply within one presence interval (5 s). The page says so; the UI topics show the result.
@@ -94,14 +98,14 @@ The handlers take a `UiBackend` trait object, not a `Node`:
 
 #### 6. Views
 
-One page, four views, a nav bar to move between them:
+One page: a sticky header (app icon and `sync-node`) and a rail on the left to move between the views. The rail collapses to its icons and expands to icons and labels (kept per browser in `localStorage`). Changed 2026-10-24 from four views in a nav bar.
 
-1. **Group:** this node, the members (name or short ID, online, last heard), each pair's link, traffic per peer split into direct and relay. The data of `status`. Members carry a `label` (name or short ID), as the CLI shows them.
-2. **Folders:** each folder with its file count, size and paused state; open one (`/folders/<name>`) to see its merged view (to fetch, deletes, conflicts; in sync with a switch). The detail lines say what `folder show` says.
-3. **Transfers:** the developer view of §4 `GET /api/transfers` (UI topic `transfers`). One card per swarm with a Progress bar of verified pieces and a table of its peers; one table of uploads.
-4. **Setup:** in no group: create a group, or join with a ticket or member ID. In a group: make an invite (hours, name) and show the ticket to copy; add a member (ID, name); add a folder (name, path).
-
-The node's state decides the first view: Setup when in no group, Group otherwise.
+1. **Dashboard** (`/`): in no group, a link to Setup. In a group: stat tiles (members online, members connected and how many direct or relay, bytes sent and received in total), then the group's card: name (rename in a dialog), this node and the group ID, and its sections:
+    * **Members:** name or short ID, online, connection (direct or relay), traffic in total (the direct and relay split on hover), added by. Rename and remove each open a dialog; removing names the members that go with it (ADR 0006).
+    * **Removed**, if any, and **Links:** each pair's link.
+    * **Folders:** the folders this node keeps (open one at `/folders/<name>` for its merged view) and the group's folders it doesn't keep yet (`available` in `/api/status`). "Keep here" turns an available folder's row into a directory input; "New folder" adds a row with a name and a directory. Both queue `POST /api/folders`. A switch in each kept folder's row enables or disables it on this node (`POST /api/folders/{name}/enabled`, as `folder enable|disable`); it shows the asked-for state until the node applies it. A remove button opens a dialog and queues `POST /api/folders/{name}/remove` (as `folder remove`): this node stops keeping the folder, as before it was added; its files stay.
+2. **Transfers:** the developer view of §4 `GET /api/transfers` (UI topic `transfers`). One card per swarm with a Progress bar of verified pieces and a table of its peers; one table of uploads.
+3. **Setup:** in no group: create a group, or join with a ticket or member ID. In a group: make an invite (hours, name) and show the ticket to copy; add a member (ID, name).
 
 **Live data:** each view subscribes to its UI topics while shown, and unsubscribes when it goes. While the socket is down, the view keeps its last data and shows that the node can't be reached; the page connects again every 2 s and subscribes again.
 
@@ -114,7 +118,8 @@ The node's state decides the first view: Setup when in no group, Group otherwise
     * There is no CLI: copy a component from `apps/docs/src/registry/ui/` when a view first needs it, into `ui/src/components/ui/`, and change `@/registry/lib/` to `@/lib/`. Helpers from `registry/lib/` go to `ui/src/lib/`. Keep the copied files as they are (their own code style); changes go in the view.
     * Copied from commit `4c75b89` (2026-02-13). The theme in `ui/src/index.css` is the port's installation style (Tailwind v4, `tw-animate-css`, dark mode by `data-kb-theme="dark"`).
     * Packages: `@kobalte/core`, `cva` (`1.0.0-beta.4`, as the port uses), `tailwind-merge`, `tw-animate-css`. `@/` is `ui/src/` (tsconfig `paths` and a Vite alias).
-* **rxjs** for the UI topics: one `webSocket` subject from `rxjs/webSocket` for the page, one `multiplex` per topic, `retry` with a 2 s delay to connect again; `live` turns a topic into a signal (the last data, and the error since, if any) and unsubscribes when the view goes. A clean close (the node stopping, code 1001) completes the stream, a failure errors it; both connect again after 2 s.
+* Icons: `lucide-solid`, one import per icon (`lucide-solid/icons/<name>`), so the build holds only those used. Added 2026-10-24.
+* **rxjs** for the UI topics: one `webSocket` subject from `rxjs/webSocket` for the page, one `multiplex` per topic, `retry` with a 2 s delay to connect again; `live` turns a topic into a store (the last data, and the error since, if any), updated with `reconcile` by `id` so rows keep their identity and their state across updates, and it unsubscribes when the view goes. A clean close (the node stopping, code 1001) completes the stream, a failure errors it; both connect again after 2 s.
 * The dev container gets bun as a devcontainer feature (the developer rebuilds the container).
 * `just ui`: `bun install` and `vite build` into `ui/dist/`.
 * `just ui-dev`: the Vite dev server, with a proxy from `/api` to a running `sync-node run --ui-addr …` (the proxy rewrites `Host`, `changeOrigin`; for the WebSocket, `ws: true` and `Origin` set to the node's UI address). The usual workflow in the dev container.

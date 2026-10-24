@@ -1,0 +1,44 @@
+NAME
+  Id: 2
+  Name: Martha.2024.720p.NF.WEBRip.800MB.x264-GalaxyRG[TGx]
+  Hash: 31855bc253cd8875eeda1e8f496949409c978d19
+  Magnet: magnet:?xt=urn:btih:31855bc253cd8875eeda1e8f496949409c978d19&dn=Martha.2024.720p.NF.WEBRip.800MB.x264-GalaxyRG%5BTGx%5D
+  Labels: 
+
+TRANSFER
+  State: Idle
+  Location: /media/Movies
+  Percent Done: 100%
+  ETA: 0 seconds (0 seconds)
+  Download Speed: 0 kB/s
+  Upload Speed: 0 kB/s
+  Have: 842.6 MB (842.6 MB verified)
+  Availability: 100%
+  Total size: 842.6 MB (842.6 MB wanted)
+  Downloaded: 842.6 MB
+  Uploaded: 243.7 kB
+  Ratio: 0.0
+  Corrupt DL: None
+  Peers: connected to 0, uploading to 0, downloading from 0
+
+HISTORY
+  Date added:       Sun Dec  8 18:14:39 2024
+  Date finished:    Sun Dec  8 18:25:04 2024
+  Date started:     Sun Dec  8 18:15:05 2024
+  Latest activity:  Sun Dec  8 18:25:04 2024
+  Downloading Time: 10 minutes (612 seconds)
+  Seeding Time:     2 seconds (2 seconds)
+
+ORIGINS
+  Public torrent: Yes
+  Piece Count: 1608
+  Piece Size: 512.0 KiB
+
+LIMITS & BANDWIDTH
+  Download Limit: Unlimited
+  Upload Limit: Unlimited
+  Ratio Limit: Default
+  Honors Session Limits: Yes
+  Peer limit: 50
+  Bandwidth Priority: Normal
+

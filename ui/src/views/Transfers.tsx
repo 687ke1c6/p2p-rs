@@ -149,7 +149,7 @@ const peerText: Record<SwarmPeerKind, string> = {
   In: "in",
   Joining: "joining",
   Out: "out, asked again",
-  Banned: "banned for this download",
+  Banned: "dropped for this download",
 };
 
 const peerVariant: Record<SwarmPeerKind, BadgeProps["variant"]> = {

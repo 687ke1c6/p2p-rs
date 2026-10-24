@@ -11,6 +11,7 @@ use iroh::{EndpointId, SecretKey};
 use iroh_blobs::Hash;
 use iroh_docs::NamespaceId;
 use sync_node::view::{FolderView, NodeState, Outcome};
+use sync_node::{folder, member};
 use sync_node::{Config, Network, Node};
 
 const INTERVAL: Duration = Duration::from_millis(200);
@@ -303,6 +304,249 @@ async fn three_nodes_agree() {
             );
         }
     }
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_folder_kept_elsewhere_is_available() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+
+    let id = a.add_folder("music", pa.path()).await.unwrap();
+    eventually("b to list music as available", || async {
+        b.status().is_some_and(|s| {
+            s.available
+                .iter()
+                .any(|f| f.id == id && f.name == "music" && f.nodes == 1)
+        })
+    })
+    .await;
+    assert!(a.status().unwrap().available.is_empty());
+    assert!(b
+        .status()
+        .unwrap()
+        .render()
+        .contains("music  kept by 1 nodes"));
+
+    // Kept: no longer available.
+    b.add_folder("music", pb.path()).await.unwrap();
+    eventually("music to leave b's available list", || async {
+        b.status().is_some_and(|s| s.available.is_empty())
+    })
+    .await;
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_removed_node_is_left_out_of_syncs_and_swarms() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let mut nodes = group(&dirs, &book).await;
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+
+    // b and c keep the folder; c writes a file and b fetches it, so both
+    // are seeders of it.
+    let id = nodes[1].add_folder("f", roots[1].path()).await.unwrap();
+    eventually("c to see the folder listed", || async {
+        nodes[2]
+            .group_folders()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(f, _)| *f == id)
+    })
+    .await;
+    nodes[2].add_folder("f", roots[2].path()).await.unwrap();
+    let content: String = "x".repeat(16 << 20);
+    write(roots[2].path(), "big.bin", &content);
+    eventually("b to fetch big.bin from c", || async {
+        read(roots[1].path(), "big.bin").as_deref() == Some(content.as_str())
+    })
+    .await;
+
+    // a removes c, and c goes offline. Its entries and `folder-nodes` key
+    // stay in the docs.
+    let c = nodes.pop().unwrap();
+    let c_id = c.id();
+    member::queue_remove(dirs[0].path(), c_id).unwrap();
+    for node in &nodes {
+        eventually("c to be removed", || async {
+            node.status()
+                .is_some_and(|s| s.removed.iter().any(|r| r.id == c_id))
+        })
+        .await;
+    }
+    eventually("c to be gone from b's folder peers", || async {
+        nodes[1].folders().first().is_some_and(|f| f.peers == 0)
+    })
+    .await;
+    c.shutdown().await.unwrap();
+
+    // a keeps the folder now, and fetches big.bin: from b, never from c.
+    let (a, b) = (&nodes[0], &nodes[1]);
+    a.add_folder("f", roots[0].path()).await.unwrap();
+    let (mut saw_b, mut saw_c) = (false, false);
+    let start = Instant::now();
+    while read(roots[0].path(), "big.bin").as_deref() != Some(content.as_str()) {
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "timed out waiting for a to fetch big.bin"
+        );
+        for swarm in a.transfers().swarms {
+            saw_b |= swarm.peers.iter().any(|p| p.id == b.id());
+            saw_c |= swarm.peers.iter().any(|p| p.id == c_id);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(saw_b, "never saw the download running");
+    assert!(!saw_c, "the download asked the removed node");
+    assert_eq!(a.folders()[0].peers, 1);
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_disabled_folder_stops_and_catches_up_when_enabled() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ra, rb) = (pa.path(), pb.path());
+    write(ra, "keep.txt", "keep");
+    write(ra, "gone.txt", "gone");
+    let id = a.add_folder("f", ra).await.unwrap();
+    eventually("b to see the folder listed", || async {
+        b.group_folders()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(f, _)| *f == id)
+    })
+    .await;
+    b.add_folder("f", rb).await.unwrap();
+    eventually("b to fetch both files", || async {
+        read(rb, "keep.txt").is_some() && read(rb, "gone.txt").is_some()
+    })
+    .await;
+
+    // Disabled on b: nothing moves either way.
+    folder::set_enabled(dirs[1].path(), "f", false).unwrap();
+    eventually("b to disable the folder", || async {
+        b.folders().first().is_some_and(|f| f.disabled)
+    })
+    .await;
+    assert!(b
+        .status()
+        .unwrap()
+        .render()
+        .contains("disabled (`folder enable f` turns it on)"));
+    write(ra, "from-a.txt", "a");
+    write(rb, "from-b.txt", "b");
+    fs::remove_file(rb.join("gone.txt")).unwrap();
+    tokio::time::sleep(INTERVAL * 6).await;
+    assert_eq!(read(rb, "from-a.txt"), None);
+    assert_eq!(read(ra, "from-b.txt"), None);
+    assert_eq!(read(ra, "gone.txt").as_deref(), Some("gone"));
+
+    // Enabled: b's scan writes its changes, the delete too, and b fetches
+    // what it missed.
+    folder::set_enabled(dirs[1].path(), "f", true).unwrap();
+    eventually("both sides to catch up", || async {
+        read(rb, "from-a.txt").as_deref() == Some("a")
+            && read(ra, "from-b.txt").as_deref() == Some("b")
+            && read(ra, "gone.txt").is_none()
+    })
+    .await;
+    assert_eq!(read(ra, "keep.txt").as_deref(), Some("keep"));
+    assert!(!b.folders()[0].disabled);
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_removed_folder_is_as_before_it_was_added() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ra, rb) = (pa.path(), pb.path());
+    write(ra, "keep.txt", "keep");
+    let id = a.add_folder("f", ra).await.unwrap();
+    eventually("b to see the folder listed", || async {
+        b.group_folders()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(f, _)| *f == id)
+    })
+    .await;
+    b.add_folder("f", rb).await.unwrap();
+    eventually("b to fetch keep.txt", || async {
+        read(rb, "keep.txt").is_some()
+    })
+    .await;
+    // Disabled first: the remove forgets that too.
+    folder::set_enabled(dirs[1].path(), "f", false).unwrap();
+    eventually("b to disable the folder", || async {
+        b.folders().first().is_some_and(|f| f.disabled)
+    })
+    .await;
+    fs::write(rb.join(".sync-node-tmp-stale"), "staging").unwrap();
+
+    folder::queue_remove(dirs[1].path(), "f").unwrap();
+    // The marker goes last.
+    eventually("b to remove the folder", || async {
+        b.folders().is_empty() && !rb.join(".syncfolder").exists()
+    })
+    .await;
+    // The user's files stay; this node's own go.
+    assert_eq!(read(rb, "keep.txt").as_deref(), Some("keep"));
+    assert!(!rb.join(".syncfolder").exists());
+    assert!(!rb.join(".sync-node-tmp-stale").exists());
+    assert!(folder::load_local(dirs[1].path()).unwrap().is_empty());
+    assert!(folder::load_disabled(dirs[1].path()).unwrap().is_empty());
+    // Its membership is untouched: only its `folder-nodes` key went.
+    for node in [a, b] {
+        let members = node.members().await.unwrap();
+        assert!(members.iter().any(|m| m.record.member == b.id()));
+        assert!(node.membership().await.unwrap().removed.is_empty());
+    }
+    // Available again on b; a no longer counts b.
+    eventually("b to list f as available", || async {
+        b.status()
+            .is_some_and(|s| s.available.iter().any(|f| f.id == id && f.nodes == 1))
+    })
+    .await;
+    eventually("a to stop syncing f with b", || async {
+        a.folders().first().is_some_and(|f| f.peers == 0)
+    })
+    .await;
+    write(ra, "later.txt", "later");
+    tokio::time::sleep(INTERVAL * 6).await;
+    assert_eq!(read(rb, "later.txt"), None);
+
+    // Kept again: the same folder, enabled, and in sync.
+    assert_eq!(b.add_folder("f", rb).await.unwrap(), id);
+    eventually("b to fetch later.txt", || async {
+        read(rb, "later.txt").as_deref() == Some("later")
+    })
+    .await;
+    assert!(!b.folders()[0].disabled);
 
     for node in nodes {
         node.shutdown().await.unwrap();

@@ -1,5 +1,15 @@
-import { type Accessor, createSignal, onCleanup } from "solid-js";
-import { firstValueFrom, map, type Observable, repeat, retry, timer } from "rxjs";
+import { type Accessor, onCleanup } from "solid-js";
+import { createStore, reconcile } from "solid-js/store";
+import {
+  firstValueFrom,
+  map,
+  type Observable,
+  ReplaySubject,
+  repeat,
+  retry,
+  share,
+  timer,
+} from "rxjs";
 import { webSocket } from "rxjs/webSocket";
 import type { ClientMessage } from "@/api/ClientMessage";
 import type { ServerMessage } from "@/api/ServerMessage";
@@ -13,16 +23,40 @@ const socket = webSocket<ServerMessage>(
   `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws`,
 );
 
-/** UI topic `name`'s updates: subscribing subscribes to the topic on the socket. */
+/** Each UI topic's shared updates, by name. */
+const topics = new Map<string, Observable<Update>>();
+
+/**
+ * UI topic `name`'s updates: the first subscriber subscribes to the topic on
+ * the socket, and the last one to go unsubscribes. Views share it, so a view
+ * that mounts before the one it replaces goes doesn't subscribe twice (the
+ * server keeps one subscription per topic). A later subscriber gets the last
+ * update at once: the server sends only changes.
+ */
 export function updates(name: string): Observable<Update> {
-  const send = (message: ClientMessage) => message;
-  return socket
-    .multiplex(
-      () => send({ subscribe: name }),
-      () => send({ unsubscribe: name }),
-      (message) => message.topic === name,
-    )
-    .pipe(map((message) => message.update));
+  let topic = topics.get(name);
+  if (!topic) {
+    const send = (message: ClientMessage) => message;
+    topic = socket
+      .multiplex(
+        () => send({ subscribe: name }),
+        () => send({ unsubscribe: name }),
+        (message) => message.topic === name,
+      )
+      .pipe(
+        map((message) => message.update),
+        // Reset on every end, so a new subscriber starts afresh on the socket
+        // rather than getting old data from a closed one.
+        share({
+          connector: () => new ReplaySubject<Update>(1),
+          resetOnError: true,
+          resetOnComplete: true,
+          resetOnRefCountZero: true,
+        }),
+      );
+    topics.set(name, topic);
+  }
+  return topic;
 }
 
 /** The latest data of a UI topic, and the error since, if any. */
@@ -36,8 +70,11 @@ type DataOf<K extends Kind> = Extract<Update, { kind: K }>["data"];
  * fails, the last data stays beside the error and the page connects again.
  */
 export function live<K extends Kind>(name: string, kind: K): Accessor<Live<DataOf<K>>> {
-  const [state, setState] = createSignal<Live<unknown>>({});
-  const fail = (error: string) => setState((last) => ({ value: last.value, error }));
+  // A store, updated in place: rows keep their identity from one update to
+  // the next (matched by `id`), so a view's `<For>` doesn't remake them and
+  // lose what they hold, such as a half-typed input.
+  const [state, setState] = createStore<Live<unknown>>({});
+  const fail = (error: string) => setState("error", error);
   const again = () => {
     fail("can't reach the node");
     return timer(RECONNECT_MS);
@@ -47,11 +84,14 @@ export function live<K extends Kind>(name: string, kind: K): Accessor<Live<DataO
     .pipe(repeat({ delay: again }), retry({ delay: again }))
     .subscribe((update) => {
       if (update.kind === "Error") fail(update.data.error);
-      else if (update.kind === kind) setState({ value: update.data });
+      else if (update.kind === kind) {
+        setState("error", undefined);
+        setState("value", reconcile(update.data, { key: "id" }));
+      }
     });
   onCleanup(() => subscription.unsubscribe());
   // Only data of `kind` is set.
-  return state as Accessor<Live<DataOf<K>>>;
+  return (() => state) as Accessor<Live<DataOf<K>>>;
 }
 
 /** UI topic `name`'s first data, once. */
