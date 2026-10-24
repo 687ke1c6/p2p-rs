@@ -48,6 +48,8 @@ struct Fake {
     /// `join` never finishes.
     join_hangs: bool,
     transfers: Mutex<Transfers>,
+    /// The name `create_group` was last called with.
+    created: Arc<Mutex<Option<Option<String>>>>,
 }
 
 impl Fake {
@@ -59,6 +61,7 @@ impl Fake {
             reads: AtomicUsize::new(0),
             join_hangs: false,
             transfers: Mutex::default(),
+            created: Arc::default(),
         }
     }
 
@@ -101,7 +104,8 @@ impl UiBackend for Fake {
         }
     }
 
-    fn create_group(&self) -> BoxFuture<'_, anyhow::Result<GroupId>> {
+    fn create_group(&self, name: Option<String>) -> BoxFuture<'_, anyhow::Result<GroupId>> {
+        *self.created.lock().unwrap() = Some(name);
         Box::pin(async { Ok(new_group()) })
     }
 
@@ -1045,6 +1049,26 @@ async fn create_group() {
     let (code, body) = send_json(no_group(dir.path()), post("/api/group", json!({}))).await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(body, json!({ "group": new_group().to_string() }));
+    // With a name: checked, trimmed and passed on.
+    let fake = Fake::new(id());
+    let created = fake.created.clone();
+    let (code, _) = send_json(
+        app(fake, dir.path(), dir.path()),
+        post("/api/group", json!({ "name": " home " })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(*created.lock().unwrap(), Some(Some("home".to_string())));
+    let fake = Fake::new(id());
+    let created = fake.created.clone();
+    let (code, body) = send_json(
+        app(fake, dir.path(), dir.path()),
+        post("/api/group", json!({ "name": "" })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(body, json!({ "error": "name is empty" }));
+    assert_eq!(*created.lock().unwrap(), None);
     // In a group already.
     let fake = grouped(id());
     let (code, body) = send_json(
@@ -1407,6 +1431,36 @@ async fn folder_removes_are_queued() {
     )
     .await;
     assert_eq!(code, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_kept_folder_name_is_refused_at_once() {
+    let config = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let kept = FolderConfig {
+        id: NamespaceId::from(&[2u8; 32]),
+        name: "photos".to_string(),
+        path: "/home/g/photos".into(),
+    };
+    std::fs::write(
+        config.path().join(folder::FOLDERS_FILE),
+        postcard::to_stdvec(&vec![kept]).unwrap(),
+    )
+    .unwrap();
+    let (code, body) = send_json(
+        app(grouped(id()), config.path(), config.path()),
+        post(
+            "/api/folders",
+            json!({ "name": " photos ", "path": root.path() }),
+        ),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body,
+        json!({ "error": "this node already keeps folder photos at /home/g/photos" })
+    );
+    assert!(!config.path().join(FOLDER_ADDS_DIR).exists());
 }
 
 #[tokio::test]

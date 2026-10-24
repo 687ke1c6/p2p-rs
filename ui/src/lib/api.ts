@@ -1,4 +1,5 @@
 import type { CreateAnswer } from "@/api/CreateAnswer";
+import type { CreateRequest } from "@/api/CreateRequest";
 import type { ErrorAnswer } from "@/api/ErrorAnswer";
 import type { FolderEnabledRequest } from "@/api/FolderEnabledRequest";
 import type { FolderRequest } from "@/api/FolderRequest";
@@ -25,7 +26,7 @@ async function post<T>(route: string, body: unknown): Promise<T> {
   return answer as T;
 }
 
-export const createGroup = () => post<CreateAnswer>("/group", {});
+export const createGroup = (request: CreateRequest) => post<CreateAnswer>("/group", request);
 export const join = (request: JoinRequest) => post<JoinAnswer>("/join", request);
 export const createInvite = (request: InviteRequest) => post<InviteAnswer>("/invites", request);
 export const addMember = (request: MemberRequest) => post<QueuedAnswer>("/members", request);

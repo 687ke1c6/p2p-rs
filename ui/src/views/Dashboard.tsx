@@ -1,14 +1,21 @@
-import { Link } from "@tanstack/solid-router";
+import { Link, Navigate } from "@tanstack/solid-router";
 import ArrowDown from "lucide-solid/icons/arrow-down";
 import ArrowUp from "lucide-solid/icons/arrow-up";
 import Cable from "lucide-solid/icons/cable";
 import FolderInput from "lucide-solid/icons/folder-input";
 import FolderPlus from "lucide-solid/icons/folder-plus";
 import Pencil from "lucide-solid/icons/pencil";
+import CircleCheck from "lucide-solid/icons/circle-check";
+import Clock from "lucide-solid/icons/clock";
+import PartyPopper from "lucide-solid/icons/party-popper";
+import Ticket from "lucide-solid/icons/ticket";
 import Trash from "lucide-solid/icons/trash";
+import UserPlus from "lucide-solid/icons/user-plus";
 import Users from "lucide-solid/icons/users";
-import { createEffect, createMemo, createSignal, For, type JSX, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, type JSX, on, Show } from "solid-js";
+import type { AvailableInfo } from "@/api/AvailableInfo";
 import type { FolderInfo } from "@/api/FolderInfo";
+import type { RemovedInfo } from "@/api/RemovedInfo";
 import type { GroupStatus } from "@/api/GroupStatus";
 import type { LinkState } from "@/api/LinkState";
 import type { MemberInfo } from "@/api/MemberInfo";
@@ -28,15 +35,20 @@ import {
 } from "@/components/ui/dialog";
 import { Switch, SwitchControl, SwitchInput, SwitchLabel, SwitchThumb } from "@/components/ui/switch";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { TextField, TextFieldInput, TextFieldLabel } from "@/components/ui/text-field";
+  HoverCard,
+  HoverCardContent,
+  HoverCardPortal,
+  HoverCardTrigger,
+} from "@/components/ui/hover-card";
+import { TableCell, TableRow } from "@/components/ui/table";
+import {
+  TextField,
+  TextFieldErrorMessage,
+  TextFieldInput,
+  TextFieldLabel,
+} from "@/components/ui/text-field";
 import { action } from "@/lib/action";
+import { cx } from "@/lib/cva";
 import {
   addFolder,
   addMember,
@@ -47,40 +59,23 @@ import {
 } from "@/lib/api";
 import { bytes } from "@/lib/format";
 import { live } from "@/lib/socket";
-import { Failed, Form, Queued } from "./Forms";
+import { setWelcome, welcome } from "@/lib/welcome";
+import { columnsOf, DataTable, dense } from "./DataTable";
+import { Banner } from "./Banner";
+import { Failed, Form } from "./Forms";
+import { AddMemberDialog, InviteDialog } from "./Invite";
 import { LiveError } from "./LiveError";
 
-/** The landing view: the state at a glance, then the group (`sync-node status`). */
+/** The landing view: the group, the state at a glance, its members and its folders (`sync-node status`). */
 export function Dashboard() {
   const status = live("status", "Status");
   return (
-    <div class="space-y-4">
+    <div class="space-y-3">
       <LiveError error={status().error} />
       <Show when={status().value}>
         {(answer) => (
-          <Show
-            when={answer().group}
-            fallback={
-              <Alert>
-                <AlertTitle>In no group</AlertTitle>
-                <AlertDescription>
-                  <p>
-                    This node ({answer().node}) is in no group yet.{" "}
-                    <Link to="/setup" class={buttonVariants({ variant: "link", class: "h-auto p-0" })}>
-                      Create a group
-                    </Link>{" "}
-                    or join one.
-                  </p>
-                </AlertDescription>
-              </Alert>
-            }
-          >
-            {(group) => (
-              <>
-                <Stats group={group()} />
-                <GroupDetails node={answer().node} group={group()} />
-              </>
-            )}
+          <Show when={answer().group} fallback={<Navigate to="/start" />}          >
+            {(group) => <GroupDetails node={answer().node} group={group()} />}
           </Show>
         )}
       </Show>
@@ -92,25 +87,34 @@ export function Dashboard() {
 const sent = (peer: PeerInfo) => peer.traffic.direct_sent + peer.traffic.relay_sent;
 const received = (peer: PeerInfo) => peer.traffic.direct_recv + peer.traffic.relay_recv;
 
-function Stats(props: { group: GroupStatus }) {
+function Stats(props: { group: GroupStatus; label: (id: string) => string }) {
   const others = () => props.group.members.filter((m) => !m.this_node);
   const connected = () => others().filter((m) => (m.peer?.connections ?? 0) > 0);
   const kind = (k: string) => connected().filter((m) => m.peer?.kind === k).length;
   const peers = () => props.group.members.flatMap((m) => (m.peer ? [m.peer] : []));
   const total = (of: (peer: PeerInfo) => number) => peers().reduce((sum, p) => sum + of(p), 0);
   return (
-    <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
+    <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
       <Stat
         icon={<Users class="size-4" />}
         label="Members online"
         value={`${props.group.members.filter((m) => m.online).length} / ${props.group.members.length}`}
       />
-      <Stat
-        icon={<Cable class="size-4" />}
-        label="Connected"
-        value={String(connected().length)}
-        detail={`${kind("Direct")} direct, ${kind("Relay")} relay`}
-      />
+      <HoverCard openDelay={150} closeDelay={100}>
+        <HoverCardTrigger as="div" class="cursor-default">
+          <Stat
+            icon={<Cable class="size-4" />}
+            label="Connected"
+            value={String(connected().length)}
+            detail={`${kind("Direct")} direct, ${kind("Relay")} relay · hover for links`}
+          />
+        </HoverCardTrigger>
+        <HoverCardPortal>
+          <HoverCardContent class="w-80 p-3">
+            <Links group={props.group} label={props.label} />
+          </HoverCardContent>
+        </HoverCardPortal>
+      </HoverCard>
       <Stat
         icon={<ArrowUp class="size-4" />}
         label="Sent"
@@ -129,15 +133,15 @@ function Stats(props: { group: GroupStatus }) {
 
 function Stat(props: { icon: JSX.Element; label: string; value: string; detail?: string }) {
   return (
-    <Card class="gap-2 py-4">
-      <CardHeader class="px-4">
+    <Card class="h-full gap-1 py-3">
+      <CardHeader class="px-3">
         <CardDescription class="flex items-center gap-2">
           {props.icon}
           {props.label}
         </CardDescription>
       </CardHeader>
-      <CardContent class="px-4">
-        <div class="text-2xl font-semibold tabular-nums">{props.value}</div>
+      <CardContent class="px-3">
+        <div class="text-xl font-semibold tabular-nums">{props.value}</div>
         <Show when={props.detail}>
           <div class="text-muted-foreground text-xs">{props.detail}</div>
         </Show>
@@ -146,21 +150,99 @@ function Stat(props: { icon: JSX.Element; label: string; value: string; detail?:
   );
 }
 
-/** A part of the group's card, under its own heading. */
-function Section(props: { title: string; description?: string; action?: JSX.Element; children: JSX.Element }) {
+/** Each pair's link, as the group reports it: the hover of the Connected tile. */
+function Links(props: { group: GroupStatus; label: (id: string) => string }) {
   return (
-    <section class="space-y-3 border-t pt-4">
-      <div class="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <h3 class="font-medium">{props.title}</h3>
-          <Show when={props.description}>
-            <p class="text-muted-foreground text-sm">{props.description}</p>
-          </Show>
+    <div class="space-y-2">
+      <p class="text-sm font-medium">Links</p>
+      <Show
+        when={props.group.links.length > 0}
+        fallback={<p class="text-muted-foreground text-sm">No other member yet.</p>}
+      >
+        <ul class="space-y-1 text-sm">
+          <For each={props.group.links}>
+            {(link) => (
+              <li class="flex items-center justify-between gap-2">
+                <span class="truncate">
+                  {props.label(link.a)} ↔ {props.label(link.b)}
+                </span>
+                <Badge variant={linkVariant[link.state]}>{linkText[link.state]}</Badge>
+              </li>
+            )}
+          </For>
+        </ul>
+      </Show>
+    </div>
+  );
+}
+
+/** A card of the dashboard: a title, a line on it, an action, and its content. */
+function SectionCard(props: {
+  title: string;
+  description?: string;
+  action?: JSX.Element;
+  children: JSX.Element;
+}) {
+  return (
+    <Card class="gap-3 py-3">
+      <CardHeader class="px-4">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="space-y-1">
+            <CardTitle>{props.title}</CardTitle>
+            <Show when={props.description}>
+              <CardDescription>{props.description}</CardDescription>
+            </Show>
+          </div>
+          {props.action}
         </div>
-        {props.action}
+      </CardHeader>
+      <CardContent class="px-4">{props.children}</CardContent>
+    </Card>
+  );
+}
+
+/** The group's name and founder, above its cards; its IDs on hover. */
+function GroupHeader(props: {
+  node: string;
+  group: GroupStatus;
+  label: (id: string) => string;
+  onRename: () => void;
+}) {
+  return (
+    <div class="space-y-0.5">
+      <div class="flex items-center gap-1">
+        <h1 class="text-lg font-semibold tracking-tight">{props.group.name ?? "Unnamed group"}</h1>
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          title={props.group.name === null ? "Name the group" : "Rename the group"}
+          aria-label={props.group.name === null ? "Name the group" : "Rename the group"}
+          onClick={() => props.onRename()}
+        >
+          <Pencil class="size-4" />
+        </Button>
       </div>
-      {props.children}
-    </section>
+      <p class="text-muted-foreground flex flex-wrap gap-x-4 gap-y-0.5 text-xs">
+        <span>Founded by {props.label(props.group.founder)}</span>
+        <HoverCard openDelay={150} closeDelay={100}>
+          <HoverCardTrigger as="span" class="cursor-default underline decoration-dotted underline-offset-2">
+            IDs
+          </HoverCardTrigger>
+          <HoverCardPortal>
+            <HoverCardContent class="w-96 space-y-2 p-3 text-sm">
+              <div>
+                <p class="text-muted-foreground text-xs">This node</p>
+                <p class="font-mono break-all select-all">{props.node}</p>
+              </div>
+              <div>
+                <p class="text-muted-foreground text-xs">Group</p>
+                <p class="font-mono break-all select-all">{props.group.id}</p>
+              </div>
+            </HoverCardContent>
+          </HoverCardPortal>
+        </HoverCard>
+      </p>
+    </div>
   );
 }
 
@@ -172,170 +254,235 @@ function GroupDetails(props: { node: string; group: GroupStatus }) {
   const [renaming, setRenaming] = createSignal<string>();
   const [removing, setRemoving] = createSignal<string>();
   const [naming, setNaming] = createSignal(false);
+  const [inviting, setInviting] = createSignal(false);
+  const [adding, setAdding] = createSignal(false);
+  // Bumped by the welcome banner's "Add a folder".
+  const [newFolder, setNewFolder] = createSignal(0);
+  // The folder last queued on this page, for its banner; cleared by its X.
+  const [queued, setQueued] = createSignal<{ name: string; within: number }>();
+  const arrived = () => {
+    const folder = queued();
+    return folder !== undefined && props.group.folders.some((f) => f.name === folder.name);
+  };
   // The member a dialog shows stays while it closes.
   const lastRenamed = createMemo<string | undefined>((last) => renaming() ?? last);
   const lastRemoved = createMemo<string | undefined>((last) => removing() ?? last);
-  return (
-    <Card>
-      <CardHeader>
-        <div class="flex items-start justify-between gap-2">
-          <div class="space-y-1.5">
-            <CardTitle>{props.group.name ?? "Group"}</CardTitle>
-            <CardDescription>Founded by {label(props.group.founder)}</CardDescription>
+  const memberHelper = columnsOf<MemberInfo>();
+  const memberColumns = memberHelper.columns([
+    memberHelper.accessor((m) => m.label, {
+      id: "member",
+      header: "Member",
+      cell: (info) => <span title={info.row.original.id}>{info.getValue()}</span>,
+    }),
+    // This node, then online, then offline.
+    memberHelper.accessor((m) => (m.this_node ? 0 : m.online ? 1 : 2), {
+      id: "state",
+      header: "State",
+      cell: (info) => <MemberState member={info.row.original} />,
+    }),
+    memberHelper.accessor((m) => connectionRank(m.peer), {
+      id: "connection",
+      header: "Connection",
+      cell: (info) => (
+        <Show when={info.row.original.peer} fallback="–">
+          {(peer) => <Connection peer={peer()} />}
+        </Show>
+      ),
+    }),
+    memberHelper.accessor((m) => (m.peer ? sent(m.peer) + received(m.peer) : -1), {
+      id: "traffic",
+      header: "Sent / received",
+      meta: { class: "text-right tabular-nums" },
+      cell: (info) => (
+        <Show when={info.row.original.peer} fallback="–">
+          {(peer) => (
+            <span
+              title={`direct ↑${bytes(peer().traffic.direct_sent)} ↓${bytes(
+                peer().traffic.direct_recv,
+              )}, relay ↑${bytes(peer().traffic.relay_sent)} ↓${bytes(peer().traffic.relay_recv)}`}
+            >
+              ↑{bytes(sent(peer()))} ↓{bytes(received(peer()))}
+            </span>
+          )}
+        </Show>
+      ),
+    }),
+    // The value sorts; the cell reads the name again, so a rename shows.
+    // eslint-disable-next-line solid/reactivity
+    memberHelper.accessor((m) => (m.id === props.group.founder ? "founder" : label(m.added_by)), {
+      id: "added_by",
+      header: "Added by",
+      cell: (info) => {
+        const m = info.row.original;
+        return m.id === props.group.founder ? "founder" : label(m.added_by);
+      },
+    }),
+    memberHelper.display({
+      id: "actions",
+      header: "",
+      cell: (info) => {
+        const m = info.row.original;
+        return (
+          <div class="flex justify-end gap-1">
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              title="Rename"
+              aria-label={`Rename ${m.label}`}
+              onClick={() => setRenaming(m.id)}
+            >
+              <Pencil class="size-4" />
+            </Button>
+            <Show when={!m.this_node && m.id !== props.group.founder}>
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                title="Remove from the group"
+                aria-label={`Remove ${m.label}`}
+                onClick={() => setRemoving(m.id)}
+              >
+                <Trash class="size-4" />
+              </Button>
+            </Show>
           </div>
-          <Button size="sm" variant="outline" onClick={() => setNaming(true)}>
-            <Pencil class="size-4" />
-            {props.group.name === null ? "Name" : "Rename"}
-          </Button>
+        );
+      },
+    }),
+  ]);
+  const removedHelper = columnsOf<RemovedInfo>();
+  const removedColumns = removedHelper.columns([
+    removedHelper.accessor((r) => r.id, {
+      id: "node",
+      header: "Node",
+      meta: { class: "font-mono" },
+      cell: (info) => <span title={info.getValue()}>{info.getValue().slice(0, 10)}</span>,
+    }),
+    // eslint-disable-next-line solid/reactivity
+    removedHelper.accessor((r) => label(r.removed_by), {
+      id: "removed_by",
+      header: "Removed by",
+      cell: (info) => label(info.row.original.removed_by),
+    }),
+    removedHelper.accessor((r) => r.removed_at, {
+      id: "when",
+      header: "When",
+      cell: (info) => new Date(info.getValue() * 1000).toLocaleString(),
+    }),
+  ]);
+  return (
+    <>
+      <GroupHeader node={props.node} group={props.group} label={label} onRename={() => setNaming(true)} />
+      {/* The page's banners: news of what was just done, each closed with its X. */}
+      <Show when={welcome() || queued()}>
+        <div class="space-y-2">
+          <Show when={welcome()}>
+            {(how) => (
+              <Banner
+                tone="success"
+                icon={<PartyPopper />}
+                title={`${how() === "created" ? "Group created" : "Joined the group"}${
+                  props.group.name === null ? "" : `: ${props.group.name}`
+                }.`}
+                actions={
+                  <>
+                    <Button size="sm" onClick={() => setInviting(true)}>
+                      <Ticket class="size-4" />
+                      Invite a node
+                    </Button>
+                    <Button size="sm" variant="outline" onClick={() => setNewFolder((n) => n + 1)}>
+                      <FolderPlus class="size-4" />
+                      Add a folder
+                    </Button>
+                  </>
+                }
+                onClose={() => setWelcome(undefined)}
+              >
+                {how() === "created"
+                  ? "This node is its only member: bring in another node, or start keeping a folder."
+                  : "Keep one of the group's folders here, or invite another node."}
+              </Banner>
+            )}
+          </Show>
+          <Show when={queued()}>
+            {(folder) => (
+              <Show
+                when={arrived()}
+                fallback={
+                  <Banner
+                    tone="info"
+                    icon={<Clock />}
+                    title={`Folder ${folder().name} queued.`}
+                    onClose={() => setQueued(undefined)}
+                  >
+                    The node adds it within {folder().within} s; it then shows under Folders.
+                  </Banner>
+                }
+              >
+                <Banner
+                  tone="success"
+                  icon={<CircleCheck />}
+                  title={`Folder ${folder().name} is added.`}
+                  onClose={() => setQueued(undefined)}
+                >
+                  It syncs with the other nodes that keep it.
+                </Banner>
+              </Show>
+            )}
+          </Show>
         </div>
-      </CardHeader>
-      <CardContent class="space-y-4">
-        <div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-          <span class="text-muted-foreground">node</span>
-          <span class="font-mono break-all">{props.node}</span>
-          <span class="text-muted-foreground">group</span>
-          <span class="font-mono break-all">{props.group.id}</span>
-        </div>
+      </Show>
+      <Stats group={props.group} label={label} />
 
-        <Section
-          title="Members"
-          description={`${props.group.members.length} members, ${
-            props.group.members.filter((m) => m.online).length
-          } online. Traffic is this node's, since it started.`}
-        >
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Member</TableHead>
-                <TableHead>State</TableHead>
-                <TableHead>Connection</TableHead>
-                <TableHead class="text-right">Sent / received</TableHead>
-                <TableHead>Added by</TableHead>
-                <TableHead />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              <For each={props.group.members}>
-                {(m) => (
-                  <TableRow>
-                    <TableCell title={m.id}>{m.label}</TableCell>
-                    <TableCell>
-                      <MemberState member={m} />
-                    </TableCell>
-                    <TableCell>
-                      <Show when={m.peer} fallback="–">
-                        {(peer) => <Connection peer={peer()} />}
-                      </Show>
-                    </TableCell>
-                    <TableCell class="text-right tabular-nums">
-                      <Show when={m.peer} fallback="–">
-                        {(peer) => (
-                          <span
-                            title={`direct ↑${bytes(peer().traffic.direct_sent)} ↓${bytes(
-                              peer().traffic.direct_recv,
-                            )}, relay ↑${bytes(peer().traffic.relay_sent)} ↓${bytes(
-                              peer().traffic.relay_recv,
-                            )}`}
-                          >
-                            ↑{bytes(sent(peer()))} ↓{bytes(received(peer()))}
-                          </span>
-                        )}
-                      </Show>
-                    </TableCell>
-                    <TableCell>
-                      {m.id === props.group.founder ? "founder" : label(m.added_by)}
-                    </TableCell>
-                    <TableCell>
-                      <div class="flex justify-end gap-1">
-                        <Button
-                          size="icon-sm"
-                          variant="ghost"
-                          title="Rename"
-                          aria-label={`Rename ${m.label}`}
-                          onClick={() => setRenaming(m.id)}
-                        >
-                          <Pencil class="size-4" />
-                        </Button>
-                        <Show when={!m.this_node && m.id !== props.group.founder}>
-                          <Button
-                            size="icon-sm"
-                            variant="ghost"
-                            title="Remove from the group"
-                            aria-label={`Remove ${m.label}`}
-                            onClick={() => setRemoving(m.id)}
-                          >
-                            <Trash class="size-4" />
-                          </Button>
-                        </Show>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                )}
-              </For>
-            </TableBody>
-          </Table>
-        </Section>
+      <SectionCard
+        title="Members"
+        description={`${props.group.members.length} members, ${
+          props.group.members.filter((m) => m.online).length
+        } online. Traffic is this node's, since it started.`}
+        action={
+          <div class="flex gap-2">
+            <Button size="sm" variant="outline" onClick={() => setInviting(true)}>
+              <Ticket class="size-4" />
+              Invite
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setAdding(true)}>
+              <UserPlus class="size-4" />
+              Add by ID
+            </Button>
+          </div>
+        }
+      >
+        <DataTable
+          class={dense}
+          data={props.group.members}
+          columns={memberColumns}
+          rowId={(m) => m.id}
+        />
 
         <Show when={props.group.removed.length > 0}>
-          <Section
-            title="Removed"
-            description="No member connects to these nodes or syncs with them. They can't come back with the same ID."
-          >
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Node</TableHead>
-                  <TableHead>Removed by</TableHead>
-                  <TableHead>When</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                <For each={props.group.removed}>
-                  {(r) => (
-                    <TableRow>
-                      <TableCell class="font-mono" title={r.id}>
-                        {r.id.slice(0, 10)}
-                      </TableCell>
-                      <TableCell>{label(r.removed_by)}</TableCell>
-                      <TableCell>{new Date(r.removed_at * 1000).toLocaleString()}</TableCell>
-                    </TableRow>
-                  )}
-                </For>
-              </TableBody>
-            </Table>
-          </Section>
+          <div class="mt-4 space-y-1">
+            <h3 class="text-sm font-medium">Removed</h3>
+            <p class="text-muted-foreground text-sm">
+              No member connects to these nodes or syncs with them. They can't come back with the
+              same ID.
+            </p>
+            <DataTable
+              class={dense}
+              data={props.group.removed}
+              columns={removedColumns}
+              rowId={(r) => r.id}
+            />
+          </div>
         </Show>
+      </SectionCard>
 
-        <Show when={props.group.links.length > 0}>
-          <Section title="Links" description="Each pair's connection, as the group reports it.">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Pair</TableHead>
-                  <TableHead>Connection</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                <For each={props.group.links}>
-                  {(link) => (
-                    <TableRow>
-                      <TableCell>
-                        {label(link.a)} ↔ {label(link.b)}
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant={linkVariant[link.state]}>{linkText[link.state]}</Badge>
-                      </TableCell>
-                    </TableRow>
-                  )}
-                </For>
-              </TableBody>
-            </Table>
-          </Section>
-        </Show>
+      <FoldersSection
+        group={props.group}
+        newFolder={newFolder()}
+        onQueued={(name, within) => setQueued({ name, within })}
+      />
 
-        <FoldersSection group={props.group} />
-      </CardContent>
-
+      <InviteDialog open={inviting()} onClose={() => setInviting(false)} />
+      <AddMemberDialog open={adding()} node={props.node} onClose={() => setAdding(false)} />
       <NameGroupDialog
         open={naming()}
         name={props.group.name}
@@ -353,15 +500,24 @@ function GroupDetails(props: { node: string; group: GroupStatus }) {
         label={label}
         onClose={() => setRemoving(undefined)}
       />
-    </Card>
+    </>
   );
 }
+
+/** A row of the folders table: a folder this node keeps, or one it could keep. */
+type FolderRow = { id: string; name: string; kept?: FolderInfo; available?: AvailableInfo };
 
 /** A row being edited in the folders table: a new folder, or keeping an available one. */
 type Editing = { kind: "new" } | { kind: "map"; name: string };
 
 /** The folders this node keeps, those it could keep, and a row to add one. */
-function FoldersSection(props: { group: GroupStatus }) {
+function FoldersSection(props: {
+  group: GroupStatus;
+  newFolder: number;
+  /** A folder was queued from here: for the page's banner. */
+  onQueued: (name: string, withinSecs: number) => void;
+}) {
+  const [card, setCard] = createSignal<HTMLDivElement>();
   const [editing, setEditing] = createSignal<Editing>();
   // Outside the rows, by name, as the member dialogs.
   const [removing, setRemoving] = createSignal<string>();
@@ -378,147 +534,253 @@ function FoldersSection(props: { group: GroupStatus }) {
     const now = editing();
     return now?.kind === "map" && now.name === folder;
   };
+  // The folder a new folder's name is already taken by, kept here or
+  // available: names are unique in the group. (Two nodes creating the same
+  // name while apart settle on one doc, as ever.)
+  const taken = createMemo(() => {
+    if (editing()?.kind !== "new") return undefined;
+    const typed = name().trim();
+    if (typed === "") return undefined;
+    if (props.group.folders.some((f) => f.name === typed)) return { name: typed, kept: true };
+    if (props.group.available.some((f) => f.name === typed)) return { name: typed, kept: false };
+    return undefined;
+  });
   const save = async () => {
-    await startAdd({ name: name(), path: path() });
-    if (added().answer) setEditing(undefined);
+    if (taken()) return;
+    const folder = name().trim();
+    await startAdd({ name: folder, path: path() });
+    if (added().answer) {
+      setEditing(undefined);
+      props.onQueued(folder, added().answer?.within_secs ?? 5);
+    }
   };
   const empty = () =>
     props.group.folders.length === 0 && props.group.available.length === 0 && !editing();
-  return (
-    <Section
-      title="Folders"
-      description="Kept on this node, and kept by other nodes of the group: keep one here by giving it a directory."
-      action={
-        <Button size="sm" variant="outline" disabled={editing()?.kind === "new"} onClick={() => edit({ kind: "new" })}>
-          <FolderPlus class="size-4" />
-          New folder
-        </Button>
-      }
-    >
-      <Show
-        when={!empty()}
-        fallback={<p class="text-muted-foreground text-sm">The group has no folders yet.</p>}
-      >
-        <Form onSubmit={() => void save()}>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Folder</TableHead>
-                <TableHead>Directory on this node</TableHead>
-                <TableHead class="text-right">Files</TableHead>
-                <TableHead class="text-right">Size</TableHead>
-                <TableHead>State</TableHead>
-                <TableHead class="text-right">On this node</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              <For each={props.group.folders}>
-                {(folder) => (
-                  <TableRow>
-                    <TableCell>
-                      <Link
-                        to="/folders/$name"
-                        params={{ name: folder.name }}
-                        class={buttonVariants({ variant: "link", class: "h-auto p-0" })}
-                      >
-                        {folder.name}
-                      </Link>
-                    </TableCell>
-                    <TableCell class="font-mono">{folder.path}</TableCell>
-                    <TableCell class="text-right tabular-nums">{folder.files}</TableCell>
-                    <TableCell class="text-right tabular-nums">{bytes(folder.bytes)}</TableCell>
-                    <TableCell>
-                      <FolderState folder={folder} />
-                    </TableCell>
-                    <TableCell>
-                      <div class="flex items-center justify-end gap-1">
-                        <FolderSwitch folder={folder} />
-                        <Button
-                          size="icon-sm"
-                          variant="ghost"
-                          type="button"
-                          title="Remove from this node"
-                          aria-label={`Remove ${folder.name} from this node`}
-                          onClick={() => setRemoving(folder.name)}
-                        >
-                          <Trash class="size-4" />
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                )}
-              </For>
-              <For each={props.group.available}>
-                {(folder) => (
-                  <TableRow class="text-muted-foreground">
-                    <TableCell>{folder.name}</TableCell>
-                    <Show
-                      when={mapping(folder.name)}
-                      fallback={
-                        <>
-                          <TableCell>not kept here</TableCell>
-                          <TableCell class="text-right">–</TableCell>
-                          <TableCell class="text-right">–</TableCell>
-                          <TableCell>
-                            <Badge variant="outline">available, kept by {folder.nodes} nodes</Badge>
-                          </TableCell>
-                          <TableCell>
-                            <div class="flex justify-end">
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                type="button"
-                                onClick={() => edit({ kind: "map", name: folder.name })}
-                              >
-                                <FolderInput class="size-4" />
-                                Keep here
-                              </Button>
-                            </div>
-                          </TableCell>
-                        </>
-                      }
-                    >
-                      <TableCell colSpan={4}>
-                        <PathInput value={path()} onChange={setPath} />
-                      </TableCell>
-                      <TableCell>
-                        <EditButtons busy={added().busy} onCancel={() => setEditing(undefined)} />
-                      </TableCell>
-                    </Show>
-                  </TableRow>
-                )}
-              </For>
-              <Show when={editing()?.kind === "new"}>
-                <TableRow>
-                  <TableCell>
-                    <TextField value={name()} onChange={setName}>
-                      <TextFieldLabel class="sr-only">Folder name</TextFieldLabel>
-                      <TextFieldInput class="h-8" placeholder="name, the same on every node" required />
-                    </TextField>
-                  </TableCell>
-                  <TableCell colSpan={4}>
-                    <PathInput value={path()} onChange={setPath} />
-                  </TableCell>
-                  <TableCell>
-                    <EditButtons busy={added().busy} onCancel={() => setEditing(undefined)} />
-                  </TableCell>
-                </TableRow>
-              </Show>
-            </TableBody>
-          </Table>
-        </Form>
-      </Show>
-      <Failed state={added()} />
-      <Show when={added().answer}>
-        {(answer) => <Queued within={answer().within_secs}>The folder then shows above.</Queued>}
-      </Show>
-      <RemoveFolderDialog
-        open={removing() !== undefined}
-        folder={props.group.folders.find((f) => f.name === lastRemoved())}
-        onClose={() => setRemoving(undefined)}
-      />
-    </Section>
+  // "Add a folder" elsewhere on the page: the new folder row, in view.
+  createEffect(
+    on(
+      () => props.newFolder,
+      () => {
+        edit({ kind: "new" });
+        card()?.scrollIntoView({ behavior: "smooth", block: "start" });
+      },
+      { defer: true },
+    ),
   );
+  // Kept folders, then the available ones: one table.
+  const rows = createMemo<FolderRow[]>(() => [
+    ...props.group.folders.map((kept) => ({ id: kept.id, name: kept.name, kept })),
+    ...props.group.available.map((available) => ({
+      id: `available:${available.id}`,
+      name: available.name,
+      available,
+    })),
+  ]);
+  const helper = columnsOf<FolderRow>();
+  const columns = helper.columns([
+    helper.accessor((row) => row.name, {
+      id: "folder",
+      header: "Folder",
+      cell: (info) => (
+        <Show when={info.row.original.kept} fallback={info.getValue()}>
+          {(kept) => (
+            <Link
+              to="/folders/$name"
+              params={{ name: kept().name }}
+              class={buttonVariants({ variant: "link", class: "h-auto p-0" })}
+            >
+              {kept().name}
+            </Link>
+          )}
+        </Show>
+      ),
+    }),
+    helper.accessor((row) => row.kept?.path ?? "", {
+      id: "directory",
+      header: "Directory on this node",
+      cell: (info) => (
+        <Show
+          when={info.row.original.kept}
+          fallback={
+            <Show when={mapping(info.row.original.name)} fallback="not kept here">
+              <PathInput value={path()} onChange={setPath} />
+            </Show>
+          }
+        >
+          {(kept) => <span class="font-mono">{kept().path}</span>}
+        </Show>
+      ),
+    }),
+    helper.accessor((row) => row.kept?.files ?? -1, {
+      id: "files",
+      header: "Files",
+      meta: { class: "text-right tabular-nums" },
+      cell: (info) => (info.getValue() < 0 ? "–" : info.getValue()),
+    }),
+    helper.accessor((row) => row.kept?.bytes ?? -1, {
+      id: "size",
+      header: "Size",
+      meta: { class: "text-right tabular-nums" },
+      cell: (info) => (info.getValue() < 0 ? "–" : bytes(info.getValue())),
+    }),
+    helper.accessor((row) => (row.kept ? folderStateText(row.kept) : "available"), {
+      id: "state",
+      header: "State",
+      cell: (info) => (
+        <Show
+          when={info.row.original.kept}
+          fallback={
+            <Badge variant="outline">
+              available, kept by {info.row.original.available?.nodes ?? 0} nodes
+            </Badge>
+          }
+        >
+          {(kept) => <FolderState folder={kept()} />}
+        </Show>
+      ),
+    }),
+    helper.display({
+      id: "actions",
+      header: "On this node",
+      meta: { class: "text-right" },
+      cell: (info) => (
+        <Show
+          when={info.row.original.kept}
+          fallback={
+            <Show
+              when={mapping(info.row.original.name)}
+              fallback={
+                <div class="flex justify-end">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    type="button"
+                    onClick={() => edit({ kind: "map", name: info.row.original.name })}
+                  >
+                    <FolderInput class="size-4" />
+                    Keep here
+                  </Button>
+                </div>
+              }
+            >
+              <EditButtons busy={added().busy} onCancel={() => setEditing(undefined)} />
+            </Show>
+          }
+        >
+          {(kept) => (
+            <div class="flex items-center justify-end gap-1">
+              <FolderSwitch folder={kept()} />
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                type="button"
+                title="Remove from this node"
+                aria-label={`Remove ${kept().name} from this node`}
+                onClick={() => setRemoving(kept().name)}
+              >
+                <Trash class="size-4" />
+              </Button>
+            </div>
+          )}
+        </Show>
+      ),
+    }),
+  ]);
+  return (
+    <div ref={setCard}>
+      <SectionCard
+        title="Folders"
+        description="Kept here, and available from the group: keep one here by giving it a directory."
+        action={
+          <Button size="sm" variant="outline" disabled={editing()?.kind === "new"} onClick={() => edit({ kind: "new" })}>
+            <FolderPlus class="size-4" />
+            New folder
+          </Button>
+        }
+      >
+        <Show
+          when={!empty()}
+          fallback={<p class="text-muted-foreground text-sm">The group has no folders yet.</p>}
+        >
+          <Form onSubmit={() => void save()}>
+            <DataTable
+              class={dense}
+              data={rows()}
+              columns={columns}
+              rowId={(row) => row.id}
+              rowClass={(row) =>
+                cx(
+                  row.available && "text-muted-foreground",
+                  // The folder a new folder's name is taken by.
+                  row.name === taken()?.name &&
+                    "bg-amber-50 text-foreground ring-1 ring-amber-300 ring-inset hover:bg-amber-50 dark:bg-amber-950/40 dark:ring-amber-800 dark:hover:bg-amber-950/40",
+                )
+              }
+              after={
+                <Show when={editing()?.kind === "new"}>
+                  <TableRow>
+                    <TableCell class="align-top whitespace-normal">
+                      <TextField
+                        value={name()}
+                        onChange={setName}
+                        validationState={taken() ? "invalid" : "valid"}
+                      >
+                        <TextFieldLabel class="sr-only">Folder name</TextFieldLabel>
+                        <TextFieldInput class="h-8" placeholder="name, the same on every node" required />
+                        <TextFieldErrorMessage class="max-w-56">
+                          <Show
+                            when={taken()?.kept}
+                            fallback={
+                              <>
+                                The group has a folder {taken()?.name} (highlighted).{" "}
+                                <button
+                                  type="button"
+                                  class="underline underline-offset-2"
+                                  onClick={() => edit({ kind: "map", name: taken()?.name ?? "" })}
+                                >
+                                  Keep it here
+                                </button>{" "}
+                                instead.
+                              </>
+                            }
+                          >
+                            This node keeps {taken()?.name} already (highlighted).
+                          </Show>
+                        </TextFieldErrorMessage>
+                      </TextField>
+                    </TableCell>
+                    <TableCell colSpan={4} class="align-top">
+                      <PathInput value={path()} onChange={setPath} />
+                    </TableCell>
+                    <TableCell class="align-top">
+                      <EditButtons
+                        busy={added().busy}
+                        disabled={taken() !== undefined}
+                        onCancel={() => setEditing(undefined)}
+                      />
+                    </TableCell>
+                  </TableRow>
+                </Show>
+              }
+            />
+          </Form>
+        </Show>
+        <Failed state={added()} />
+        <RemoveFolderDialog
+          open={removing() !== undefined}
+          folder={props.group.folders.find((f) => f.name === lastRemoved())}
+          onClose={() => setRemoving(undefined)}
+        />
+      </SectionCard>
+    </div>
+  );
+}
+
+/** A kept folder's state in words, to sort by. */
+function folderStateText(folder: FolderInfo): string {
+  if (folder.disabled) return "disabled";
+  if (folder.paused) return "paused";
+  return "synced";
 }
 
 function FolderState(props: { folder: FolderInfo }) {
@@ -630,10 +892,10 @@ function PathInput(props: { value: string; onChange: (value: string) => void }) 
   );
 }
 
-function EditButtons(props: { busy: boolean; onCancel: () => void }) {
+function EditButtons(props: { busy: boolean; disabled?: boolean; onCancel: () => void }) {
   return (
     <div class="flex justify-end gap-1">
-      <Button size="sm" type="submit" disabled={props.busy}>
+      <Button size="sm" type="submit" disabled={props.busy || props.disabled}>
         Save
       </Button>
       <Button size="sm" variant="ghost" type="button" onClick={() => props.onCancel()}>
@@ -826,6 +1088,13 @@ function MemberState(props: { member: MemberInfo }) {
       </Show>
     </Show>
   );
+}
+
+/** Direct first, then relay, then not connected, then never connected: to sort by. */
+function connectionRank(peer: PeerInfo | null): number {
+  if (!peer) return 3;
+  if (peer.connections === 0) return 2;
+  return peer.kind === "Direct" ? 0 : 1;
 }
 
 /** This node's connection to a peer: its kind, and the path as `status` shows it. */

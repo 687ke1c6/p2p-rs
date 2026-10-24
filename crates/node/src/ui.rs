@@ -59,7 +59,8 @@ pub trait UiBackend: Send + Sync + 'static {
     /// How to show node `id`: its name, or its short ID.
     fn label(&self, id: EndpointId) -> String;
     /// Founds a new group with this node as its only member.
-    fn create_group(&self) -> BoxFuture<'_, anyhow::Result<GroupId>>;
+    /// Founds a group, named `name` if given (already checked).
+    fn create_group(&self, name: Option<String>) -> BoxFuture<'_, anyhow::Result<GroupId>>;
     /// Joins a group through `ticket`: the group and its founder.
     fn join(&self, ticket: Ticket) -> BoxFuture<'_, anyhow::Result<(GroupId, EndpointId)>>;
 }
@@ -91,8 +92,8 @@ impl UiBackend for Node {
         Node::display(self, id)
     }
 
-    fn create_group(&self) -> BoxFuture<'_, anyhow::Result<GroupId>> {
-        Box::pin(Node::create_group(self))
+    fn create_group(&self, name: Option<String>) -> BoxFuture<'_, anyhow::Result<GroupId>> {
+        Box::pin(async move { Node::create_named_group(self, name.as_deref()).await })
     }
 
     fn join(&self, ticket: Ticket) -> BoxFuture<'_, anyhow::Result<(GroupId, EndpointId)>> {
@@ -987,6 +988,7 @@ mod tests {
         TransfersAnswer::export_all(&config).unwrap();
         topics::ClientMessage::export_all(&config).unwrap();
         topics::ServerMessage::export_all(&config).unwrap();
+        actions::CreateRequest::export_all(&config).unwrap();
         actions::CreateAnswer::export_all(&config).unwrap();
         actions::JoinRequest::export_all(&config).unwrap();
         actions::JoinAnswer::export_all(&config).unwrap();

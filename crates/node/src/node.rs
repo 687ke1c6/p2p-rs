@@ -29,6 +29,7 @@ use crate::group::{Group, GroupError};
 use crate::index::{self, FileMeta, DEBOUNCE};
 use crate::invite::{self, InviteTicket};
 use crate::join::{self, JoinProtocol, JoinReply, Ticket};
+use crate::lock::{self, DirLock};
 use crate::member::{self, Names};
 use crate::monitor::Monitor;
 use crate::peer_wire::{self, PeerWireProtocol, Transfers};
@@ -104,6 +105,9 @@ pub struct Node {
     blobs: FsStore,
     gossip: Gossip,
     docs: Docs,
+    /// Held for as long as the node lives: one node per config directory.
+    /// Last, so it is let go of after the stores close.
+    _lock: DirLock,
 }
 
 impl Node {
@@ -124,6 +128,8 @@ impl Node {
         secret_key: SecretKey,
         config: Config,
     ) -> anyhow::Result<Self> {
+        // First: the stores below are this process's alone.
+        let lock = lock::acquire(config_dir)?;
         let builder = match config.network {
             Network::N0 => Endpoint::builder(presets::N0),
             Network::Local => Endpoint::builder(presets::Minimal),
@@ -213,6 +219,7 @@ impl Node {
             blobs,
             gossip,
             docs,
+            _lock: lock,
         };
         if let Some(group) = node.group() {
             node.resume_membership_sync(&group).await?;
@@ -226,6 +233,13 @@ impl Node {
 
     /// Founds a new group with this node as its only member.
     pub async fn create_group(&self) -> anyhow::Result<GroupId> {
+        self.create_named_group(None).await
+    }
+
+    /// Founds a new group, as [`Node::create_group`], named `name` if given
+    /// (checked first, as `group name` checks it).
+    pub async fn create_named_group(&self, name: Option<&str>) -> anyhow::Result<GroupId> {
+        let name = name.map(member::check_name).transpose()?;
         if let Some(group) = self.group() {
             bail!(GroupError::AlreadyInGroup(group.id));
         }
@@ -239,6 +253,11 @@ impl Node {
         let record = member::write_record(&self.docs, doc.id(), key, self.id()).await?;
         let group = Group::founded(record);
         group.save_new(&self.config_dir)?;
+        if let Some(name) = &name {
+            // The node holds the doc here: written at once, not queued.
+            member::write_group_name(&self.docs, doc.id(), name).await?;
+            self.names.set_group(Some(name.clone()));
+        }
         self.gate.set_group(group.clone());
         self.start_monitor(group);
         Ok(doc.id())

@@ -6,16 +6,9 @@ import type { UploadInfo } from "@/api/UploadInfo";
 import { Badge, type BadgeProps } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress, ProgressGroup, ProgressLabel, ProgressValueLabel } from "@/components/ui/progress";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { bytes } from "@/lib/format";
 import { live } from "@/lib/socket";
+import { columnsOf, DataTable, dense } from "./DataTable";
 import { LiveError } from "./LiveError";
 
 /** The developer view: this node's downloads (swarms, pieces, peers) and uploads (choking, rates). */
@@ -77,52 +70,41 @@ function Swarm(props: { swarm: SwarmInfo }) {
             <ProgressValueLabel />
           </ProgressGroup>
         </Progress>
-        <Show
-          when={swarm().peers.length > 0}
-          fallback={<p class="text-sm text-muted-foreground">No node to ask yet.</p>}
-        >
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Peer</TableHead>
-                <TableHead>Swarm</TableHead>
-                <TableHead>Choking</TableHead>
-                <TableHead class="text-right">Rate ↓</TableHead>
-                <TableHead class="text-right">Open requests</TableHead>
-                <TableHead class="text-right">Its pieces</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              <For each={swarm().peers}>{(peer) => <SwarmPeer peer={peer} pieces={swarm().pieces} />}</For>
-            </TableBody>
-          </Table>
-        </Show>
+        <DataTable
+          class={dense}
+          data={swarm().peers}
+          columns={peerColumns(swarm().pieces)}
+          rowId={(peer) => peer.id}
+          empty="No node to ask yet."
+        />
       </CardContent>
     </Card>
   );
 }
 
-function SwarmPeer(props: { peer: SwarmPeerInfo; pieces: number }) {
-  return (
-    <TableRow>
-      <TableCell title={props.peer.id}>{props.peer.label}</TableCell>
-      <TableCell>
-        <Badge variant={peerVariant[props.peer.state]}>{peerText[props.peer.state]}</Badge>
-      </TableCell>
-      <Show
-        when={props.peer.in_swarm}
-        fallback={
-          <>
-            <TableCell>–</TableCell>
-            <TableCell class="text-right">–</TableCell>
-            <TableCell class="text-right">–</TableCell>
-            <TableCell class="text-right">–</TableCell>
-          </>
-        }
-      >
-        {(wire) => (
-          <>
-            <TableCell class="space-x-1">
+/** The peers of a swarm of `pieces` pieces. */
+function peerColumns(pieces: number) {
+  const helper = columnsOf<SwarmPeerInfo>();
+  return helper.columns([
+    helper.accessor((peer) => peer.label, {
+      id: "peer",
+      header: "Peer",
+      cell: (info) => <span title={info.row.original.id}>{info.getValue()}</span>,
+    }),
+    helper.accessor((peer) => peerText[peer.state], {
+      id: "swarm",
+      header: "Swarm",
+      cell: (info) => (
+        <Badge variant={peerVariant[info.row.original.state]}>{info.getValue()}</Badge>
+      ),
+    }),
+    helper.display({
+      id: "choking",
+      header: "Choking",
+      cell: (info) => (
+        <Show when={info.row.original.in_swarm} fallback="–">
+          {(wire) => (
+            <span class="space-x-1">
               <Show when={wire().unchoked} fallback={<Badge variant="outline">choked</Badge>}>
                 <Badge variant="secondary">unchoked</Badge>
               </Show>
@@ -132,17 +114,30 @@ function SwarmPeer(props: { peer: SwarmPeerInfo; pieces: number }) {
               <Show when={wire().snubbed}>
                 <Badge variant="destructive">snubbed</Badge>
               </Show>
-            </TableCell>
-            <TableCell class="text-right">{bytes(wire().rate)}/s</TableCell>
-            <TableCell class="text-right">{wire().open}</TableCell>
-            <TableCell class="text-right">
-              {wire().pieces} of {props.pieces}
-            </TableCell>
-          </>
-        )}
-      </Show>
-    </TableRow>
-  );
+            </span>
+          )}
+        </Show>
+      ),
+    }),
+    helper.accessor((peer) => peer.in_swarm?.rate ?? -1, {
+      id: "rate",
+      header: "Rate ↓",
+      meta: { class: "text-right tabular-nums" },
+      cell: (info) => (info.getValue() < 0 ? "–" : `${bytes(info.getValue())}/s`),
+    }),
+    helper.accessor((peer) => peer.in_swarm?.open ?? -1, {
+      id: "open",
+      header: "Open requests",
+      meta: { class: "text-right tabular-nums" },
+      cell: (info) => (info.getValue() < 0 ? "–" : info.getValue()),
+    }),
+    helper.accessor((peer) => peer.in_swarm?.pieces ?? -1, {
+      id: "pieces",
+      header: "Its pieces",
+      meta: { class: "text-right tabular-nums" },
+      cell: (info) => (info.getValue() < 0 ? "–" : `${info.getValue()} of ${pieces}`),
+    }),
+  ]);
 }
 
 const peerText: Record<SwarmPeerKind, string> = {
@@ -173,40 +168,56 @@ function Uploads(props: { uploads: UploadInfo[] }) {
       </CardHeader>
       <Show when={props.uploads.length > 0}>
         <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Peer</TableHead>
-                <TableHead class="text-right">Swarms</TableHead>
-                <TableHead>Choker</TableHead>
-                <TableHead class="text-right">Rate ↑</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              <For each={props.uploads}>
-                {(upload) => (
-                  <TableRow>
-                    <TableCell title={upload.id}>{upload.label}</TableCell>
-                    <TableCell class="text-right">{upload.streams}</TableCell>
-                    <TableCell class="space-x-1">
-                      <Show when={upload.unchoked} fallback={<Badge variant="outline">choked</Badge>}>
-                        <Badge variant="secondary">unchoked</Badge>
-                      </Show>
-                      <Show when={upload.optimistic}>
-                        <Badge>optimistic</Badge>
-                      </Show>
-                      <Show when={!upload.interested}>
-                        <Badge variant="outline">not interested</Badge>
-                      </Show>
-                    </TableCell>
-                    <TableCell class="text-right">{bytes(upload.rate)}/s</TableCell>
-                  </TableRow>
-                )}
-              </For>
-            </TableBody>
-          </Table>
+          <DataTable
+            class={dense}
+            data={props.uploads}
+            columns={uploadColumns}
+            rowId={(upload) => upload.id}
+          />
         </CardContent>
       </Show>
     </Card>
   );
 }
+
+const uploadHelper = columnsOf<UploadInfo>();
+
+const uploadColumns = uploadHelper.columns([
+  uploadHelper.accessor((upload) => upload.label, {
+    id: "peer",
+    header: "Peer",
+    cell: (info) => <span title={info.row.original.id}>{info.getValue()}</span>,
+  }),
+  uploadHelper.accessor((upload) => upload.streams, {
+    id: "swarms",
+    header: "Swarms",
+    meta: { class: "text-right tabular-nums" },
+  }),
+  // Unchoked first, the optimistic unchoke among them.
+  uploadHelper.accessor((upload) => (upload.unchoked ? 2 : 0) + (upload.optimistic ? 1 : 0), {
+    id: "choker",
+    header: "Choker",
+    cell: (info) => {
+      const upload = info.row.original;
+      return (
+        <span class="space-x-1">
+          <Show when={upload.unchoked} fallback={<Badge variant="outline">choked</Badge>}>
+            <Badge variant="secondary">unchoked</Badge>
+          </Show>
+          <Show when={upload.optimistic}>
+            <Badge>optimistic</Badge>
+          </Show>
+          <Show when={!upload.interested}>
+            <Badge variant="outline">not interested</Badge>
+          </Show>
+        </span>
+      );
+    },
+  }),
+  uploadHelper.accessor((upload) => upload.rate, {
+    id: "rate",
+    header: "Rate ↑",
+    meta: { class: "text-right tabular-nums" },
+    cell: (info) => `${bytes(info.getValue())}/s`,
+  }),
+]);

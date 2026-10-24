@@ -1,6 +1,6 @@
 import { Link } from "@tanstack/solid-router";
 import ArrowLeft from "lucide-solid/icons/arrow-left";
-import { createSignal, For, Show } from "solid-js";
+import { createSignal, Show } from "solid-js";
 import type { FolderViewAnswer } from "@/api/FolderViewAnswer";
 import type { PathClass } from "@/api/PathClass";
 import type { PathInfo } from "@/api/PathInfo";
@@ -14,16 +14,9 @@ import {
   SwitchLabel,
   SwitchThumb,
 } from "@/components/ui/switch";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { bytes, secondsSince } from "@/lib/format";
 import { live } from "@/lib/socket";
+import { columnsOf, DataTable, dense } from "./DataTable";
 import { LiveError } from "./LiveError";
 
 /** A folder's merged view: the data of `sync-node folder show`. */
@@ -51,6 +44,36 @@ function FolderDetails(props: { view: FolderViewAnswer }) {
       (p) => all() || (p.class !== "InSync" && p.class !== "DeletedEverywhere"),
     );
   const c = () => props.view.counts;
+  const helper = columnsOf<PathInfo>();
+  const columns = helper.columns([
+    helper.accessor((p) => p.path, {
+      id: "path",
+      header: "Path",
+      meta: { class: "font-mono" },
+    }),
+    helper.accessor((p) => classText[p.class], {
+      id: "state",
+      header: "State",
+      cell: (info) => (
+        <Badge variant={classVariant[info.row.original.class]}>{info.getValue()}</Badge>
+      ),
+    }),
+    helper.accessor((p) => p.size ?? -1, {
+      id: "size",
+      header: "Size",
+      meta: { class: "text-right tabular-nums" },
+      cell: (info) => (info.getValue() < 0 ? "–" : bytes(info.getValue())),
+    }),
+    // The value sorts and filters; the cell reads the names again, so a
+    // rename shows.
+    // eslint-disable-next-line solid/reactivity
+    helper.accessor((p) => detail(p, label), {
+      id: "detail",
+      header: "Detail",
+      meta: { class: "whitespace-normal" },
+      cell: (info) => detail(info.row.original, label),
+    }),
+  ]);
   return (
     <Card>
       <CardHeader>
@@ -79,32 +102,15 @@ function FolderDetails(props: { view: FolderViewAnswer }) {
           when={shown().length > 0}
           fallback={<p class="text-muted-foreground text-sm">Every file is in sync.</p>}
         >
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Path</TableHead>
-                <TableHead>State</TableHead>
-                <TableHead class="text-right">Size</TableHead>
-                <TableHead>Detail</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              <For each={shown()}>
-                {(path) => (
-                  <TableRow>
-                    <TableCell class="font-mono">{path.path}</TableCell>
-                    <TableCell>
-                      <Badge variant={classVariant[path.class]}>{classText[path.class]}</Badge>
-                    </TableCell>
-                    <TableCell class="text-right">
-                      {path.size === null ? "–" : bytes(path.size)}
-                    </TableCell>
-                    <TableCell class="whitespace-normal">{detail(path, label)}</TableCell>
-                  </TableRow>
-                )}
-              </For>
-            </TableBody>
-          </Table>
+          <DataTable
+            class={dense}
+            data={shown()}
+            columns={columns}
+            rowId={(p) => p.path}
+            filter="Filter paths and details"
+            pageSize={50}
+            empty="No path matches."
+          />
         </Show>
       </CardContent>
     </Card>

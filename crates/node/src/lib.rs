@@ -9,6 +9,7 @@ pub mod index;
 pub mod invite;
 pub mod join;
 pub mod key;
+pub mod lock;
 pub mod member;
 pub(crate) mod monitor;
 pub mod node;

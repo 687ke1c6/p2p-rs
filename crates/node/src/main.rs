@@ -12,6 +12,7 @@ use iroh::{EndpointAddr, EndpointId};
 use sync_node::folder;
 use sync_node::group::GroupError;
 use sync_node::key::{self, KEY_FILE};
+use sync_node::lock;
 use sync_node::member::{self, check_name};
 use sync_node::presence::PRESENCE_INTERVAL;
 use sync_node::status::STATUS_FILE;
@@ -54,7 +55,11 @@ enum Command {
         ui_dir: Option<PathBuf>,
     },
     /// Found a new group with this node as its only member.
-    Create,
+    Create {
+        /// The group's name, shown with its ID on every node.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Manage invites to this node's group.
     Invite {
         #[command(subcommand)]
@@ -275,9 +280,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 .map_err(|_| anyhow::anyhow!("the web UI still holds the node"))?;
             node.shutdown().await?;
         }
-        Command::Create => {
+        Command::Create { name } => {
+            let name = name.as_deref().map(check_name).transpose()?;
             let node = Node::spawn(&config_dir, key, Network::N0).await?;
-            let result = node.create_group().await;
+            let result = node.create_named_group(name.as_deref()).await;
             node.shutdown().await?;
             println!("created group {}", result?);
         }
@@ -304,6 +310,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
             // Queued rather than applied, since `run` holds the stores.
             Group::load(&config_dir)?.ok_or(GroupError::NotInGroup)?;
             let name = folder::check_folder_name(&name)?;
+            // As the running node would, but now rather than once it applies it.
+            if let Some(kept) = folder::load_local(&config_dir)?
+                .into_iter()
+                .find(|f| f.name == name)
+            {
+                bail!(
+                    "this node already keeps folder {name} at {}",
+                    kept.path.display()
+                );
+            }
             let path = path
                 .canonicalize()
                 .with_context(|| format!("resolving {}", path.display()))?;
@@ -448,7 +464,7 @@ fn print_status(config_dir: &std::path::Path) -> anyhow::Result<()> {
 
 /// Deletes the config directory once the user confirms. Refuses a directory
 /// without a key file, so a mistyped `--config-dir` can't delete something
-/// else, and one whose status file is fresh, since `run` is using it.
+/// else, and one a node is using (it holds the directory's lock).
 fn clear_config(config_dir: &std::path::Path) -> anyhow::Result<()> {
     if !config_dir.exists() {
         println!("{} doesn't exist; nothing to clear", config_dir.display());
@@ -461,13 +477,9 @@ fn clear_config(config_dir: &std::path::Path) -> anyhow::Result<()> {
             config_dir.display()
         );
     }
-    let status_age = std::fs::metadata(config_dir.join(STATUS_FILE))
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok());
-    if status_age.is_some_and(|age| age <= PRESENCE_INTERVAL * 3) {
+    if lock::is_held(config_dir)? {
         bail!(
-            "`run` seems to be using {}: stop it first",
+            "a sync-node process (`run`, `create` or `join`) is using {}: stop it first",
             config_dir.display()
         );
     }

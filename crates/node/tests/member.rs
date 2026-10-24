@@ -350,3 +350,32 @@ async fn idle_join_connection_does_not_block_joins() {
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_group_named_at_creation_has_its_name_everywhere() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let a = spawn(dirs[0].path()).await;
+    let b = spawn(dirs[1].path()).await;
+    learn_addrs(&[&a, &b]);
+
+    // A bad name founds nothing.
+    assert!(a.create_named_group(Some("  ")).await.is_err());
+    assert!(a.group().is_none());
+
+    let group = a.create_named_group(Some(" home ")).await.unwrap();
+    // At once on the founder, not after an interval.
+    assert_eq!(a.group_name().as_deref(), Some("home"));
+    assert!(a
+        .status()
+        .unwrap()
+        .render()
+        .contains(&format!("group   home ({group})")));
+    b.join(&a.create_invite(HOUR, None).unwrap()).await.unwrap();
+    eventually("b to know the group's name", || async {
+        b.group_name().as_deref() == Some("home")
+    })
+    .await;
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}

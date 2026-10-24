@@ -29,6 +29,15 @@ use crate::{folder, invite, member, Ticket};
 pub const JOIN_LIMIT: Duration = Duration::from_secs(60);
 
 /// `POST /api/group`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct CreateRequest {
+    /// The group's name, shown with its ID on every node.
+    #[serde(default)]
+    #[cfg_attr(test, ts(optional))]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct CreateAnswer {
@@ -140,12 +149,15 @@ impl QueuedAnswer {
 
 pub(super) async fn create_group(
     State(state): State<AppState>,
+    body: Result<Json<CreateRequest>, JsonRejection>,
 ) -> Result<Json<CreateAnswer>, ApiError> {
+    let request = parse(body)?;
+    let name = checked_name(request.name.as_deref())?;
     not_in_group(&*state.backend)?;
     let backend = state.backend.clone();
     let task = state
         .topics
-        .spawn(async move { backend.create_group().await });
+        .spawn(async move { backend.create_group(name).await });
     let group = finish(task).await?;
     Ok(Json(CreateAnswer {
         group: group.to_string(),
@@ -258,6 +270,16 @@ pub(super) async fn add_folder(
     in_group(&*state.backend)?;
     let bad = |text: String| ApiError::new(StatusCode::BAD_REQUEST, text);
     let name = folder::check_folder_name(&request.name).map_err(|err| bad(err.to_string()))?;
+    // As `Folders::add` would, but now rather than once the queue runs.
+    if let Some(kept) = folder::load_local(&state.config.config_dir)?
+        .into_iter()
+        .find(|f| f.name == name)
+    {
+        return Err(bad(format!(
+            "this node already keeps folder {name} at {}",
+            kept.path.display()
+        )));
+    }
     let path = PathBuf::from(&request.path);
     // The node's working directory means nothing on the page.
     if !path.is_absolute() {
