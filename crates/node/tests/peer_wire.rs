@@ -12,9 +12,11 @@ use iroh::endpoint::Connection;
 use iroh::SecretKey;
 use iroh_blobs::Hash;
 use iroh_docs::NamespaceId;
+use sync_node::folder;
 use sync_node::index::FileMeta;
 use sync_node::peer_wire::{
-    self, holds, Block, Handshake, Message, Refusal, Why, Wire, BLOCK_LENGTH, MAX_BLOCK_LENGTH,
+    self, holds, Block, Handshake, Message, Refusal, SwarmPeerState, Why, Wire, BLOCK_LENGTH,
+    MAX_BLOCK_LENGTH,
 };
 use sync_node::picker::Holds;
 use sync_node::pieces::{staging_path, MIN_PIECE_LENGTH};
@@ -450,6 +452,15 @@ async fn a_leecher_serves_from_its_staging_file() {
         b.fetched().get(&a.id()).copied().unwrap_or(0) > 2 << 20
     })
     .await;
+    // The seeder's choker uploads to b, as its next published rows show.
+    eventually("a's rows to show b unchoked", || async {
+        a.transfers()
+            .uploads
+            .iter()
+            .any(|u| u.id == b.id() && u.unchoked && u.interested)
+    })
+    .await;
+    let a_id = a.id();
     a.shutdown().await.unwrap();
 
     let swarm = handshake(id, "big.bin", hash);
@@ -498,6 +509,22 @@ async fn a_leecher_serves_from_its_staging_file() {
     };
     assert!(!have[bad as usize] && have[good as usize]);
 
+    // b's download goes on without a, with the pieces it has.
+    eventually("b's snapshot to show a out of the swarm", || async {
+        b.transfers().swarms.iter().any(|s| {
+            s.folder == id
+                && s.path == "big.bin"
+                && s.content == hash
+                && s.pieces == meta.pieces.len() as u32
+                && s.have > 0
+                && s.have < s.pieces
+                && s.peers
+                    .iter()
+                    .any(|p| p.id == a_id && !matches!(p.state, SwarmPeerState::In(_)))
+        })
+    })
+    .await;
+
     b.shutdown().await.unwrap();
     c.shutdown().await.unwrap();
 }
@@ -519,4 +546,70 @@ async fn a_non_member_cant_connect() {
     }
     a.shutdown().await.unwrap();
     outsider.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_disabled_folder_serves_nothing() {
+    let book = MemoryLookup::new();
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (a, b) = (
+        spawn(dirs[0].path(), &book).await,
+        spawn(dirs[1].path(), &book).await,
+    );
+    a.create_group().await.unwrap();
+    b.join(&a.create_invite(HOUR, None).unwrap()).await.unwrap();
+    let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    fs::write(pa.path().join("data.bin"), data(MIN_PIECE_LENGTH as usize)).unwrap();
+    let id = a.add_folder("docs", pa.path()).await.unwrap();
+    eventually("b to see the folder", || async {
+        b.group_folders()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(f, _)| *f == id)
+    })
+    .await;
+    b.add_folder("docs", pb.path()).await.unwrap();
+    eventually("a to index data.bin", || async {
+        entry(&a, id, "data.bin").await.is_some()
+    })
+    .await;
+    let meta = entry(&a, id, "data.bin").await.unwrap();
+    let swarm = handshake(id, "data.bin", meta.content.unwrap());
+    let conn = b.endpoint().connect(a.id(), peer_wire::ALPN).await.unwrap();
+    eventually("a to serve b", || async {
+        answer(&conn, &swarm).await == Message::HaveAll
+    })
+    .await;
+    let mut wire = unchoked(&conn, &swarm).await;
+
+    // Disabled on a: the open stream ends, and a new one is refused.
+    folder::set_enabled(dirs[0].path(), "docs", false).unwrap();
+    eventually("a to disable the folder", || async {
+        a.folders().first().is_some_and(|f| f.disabled && !f.paused)
+    })
+    .await;
+    let ended = tokio::time::timeout(TIMEOUT, wire.recv())
+        .await
+        .expect("stream still open");
+    assert!(matches!(ended, Ok(None) | Err(_)), "{ended:?}");
+    assert_eq!(
+        answer(&conn, &swarm).await,
+        Message::Refused(Refusal::NoSuchFile)
+    );
+    // Its entry stays in the doc.
+    assert_eq!(
+        a.folder_index(id).await.unwrap().get("data.bin"),
+        Some(&meta)
+    );
+
+    // Enabled again: served again.
+    folder::set_enabled(dirs[0].path(), "docs", true).unwrap();
+    eventually("a to serve b again", || async {
+        answer(&conn, &swarm).await == Message::HaveAll
+    })
+    .await;
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }

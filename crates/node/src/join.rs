@@ -159,6 +159,10 @@ impl JoinProtocol {
                 if wanted != group.id {
                     bail!("invite is for another group");
                 }
+                // Before the invite is used up: it stays good for another node.
+                if self.gate.is_removed(joiner) {
+                    bail!("{} was removed from the group", joiner.fmt_short());
+                }
                 let name = invite::redeem(&self.config_dir, &secret)?;
                 let record =
                     member::write_record(&self.docs, group.id, &self.secret_key, joiner).await?;

@@ -81,6 +81,25 @@ pub fn safe_path(rel: &str) -> bool {
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
+/// The doc key of `path`: the path and a NUL byte, which no path holds.
+///
+/// iroh-docs treats keys as a hierarchy by bytes (the Willow model): a new
+/// entry removes its author's older entries whose keys start with its key.
+/// With the path alone as the key, a write of `notes` would remove the
+/// entry of `notes.md`. With the terminator no key starts with another.
+pub fn doc_key(path: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(path.len() + 1);
+    key.extend_from_slice(path.as_bytes());
+    key.push(0);
+    key
+}
+
+/// The path a doc key names; `None` for a key that isn't a [`doc_key`]
+/// (an older version's).
+pub fn key_path(key: &[u8]) -> Option<&str> {
+    std::str::from_utf8(key.strip_suffix(&[0])?).ok()
+}
+
 /// Checks that `root` is a folder root: a directory holding the marker.
 pub fn check_root(root: &Path) -> anyhow::Result<()> {
     if !root.join(MARKER).is_file() {
@@ -733,7 +752,7 @@ impl FolderIndex {
         let mut version = old.version.clone();
         let others = self
             .doc
-            .get_many(Query::key_exact(path))
+            .get_many(Query::key_exact(doc_key(path)))
             .await?
             .collect::<Vec<_>>()
             .await;
@@ -756,7 +775,7 @@ impl FolderIndex {
 
     async fn write(&mut self, path: &str, meta: FileMeta) -> anyhow::Result<()> {
         self.doc
-            .set_bytes(self.author, path.as_bytes().to_vec(), meta.to_bytes())
+            .set_bytes(self.author, doc_key(path), meta.to_bytes())
             .await?;
         tracing::debug!("indexed {path}: {meta:?}");
         self.entries.insert(path, meta);
@@ -779,7 +798,8 @@ async fn read_entries(
     let mut unreadable = 0;
     for entry in entries {
         let entry = entry?;
-        let Ok(path) = std::str::from_utf8(entry.key()) else {
+        let Some(path) = key_path(entry.key()) else {
+            unreadable += 1;
             continue;
         };
         let Ok(bytes) = blobs.get_bytes(entry.content_hash()).await else {
@@ -829,7 +849,7 @@ pub async fn read_path(
     id: NamespaceId,
     path: &str,
 ) -> anyhow::Result<BTreeMap<EndpointId, FileMeta>> {
-    let mut out = read_query(docs, blobs, id, Query::key_exact(path)).await?;
+    let mut out = read_query(docs, blobs, id, Query::key_exact(doc_key(path))).await?;
     Ok(out.remove(path).unwrap_or_default())
 }
 
@@ -844,7 +864,7 @@ async fn read_query(
     let mut out: BTreeMap<String, BTreeMap<EndpointId, FileMeta>> = BTreeMap::new();
     for entry in entries {
         let entry = entry?;
-        let Ok(path) = std::str::from_utf8(entry.key()) else {
+        let Some(path) = key_path(entry.key()) else {
             continue;
         };
         let Ok(bytes) = blobs.get_bytes(entry.content_hash()).await else {

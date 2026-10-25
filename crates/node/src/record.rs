@@ -4,6 +4,9 @@
 //! `added_by`. The founder's record is self-signed. A member's record is valid
 //! if its chain of signers leads back to the founder, each link signed by the
 //! key it names.
+//!
+//! A removal says "`removed_by` removed `member` from `group`", signed by
+//! `removed_by`. See `node::read_membership` for when one counts.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,9 +17,15 @@ use serde::{Deserialize, Serialize};
 /// Prefix of every record's key in the membership doc: `members/<id>`.
 pub const MEMBERS_PREFIX: &str = "members/";
 
+/// Prefix of every removal's key in the membership doc: `removed/<id>`.
+pub const REMOVED_PREFIX: &str = "removed/";
+
 /// Signed bytes start with this, so a record signature can't be replayed as
 /// anything else the node key signs.
 const SIGNING_TAG: &[u8] = b"sync-node membership record v0\0";
+
+/// The same for a removal.
+const REMOVAL_SIGNING_TAG: &[u8] = b"sync-node membership removal v0\0";
 
 /// The group is the membership doc's namespace.
 pub type GroupId = NamespaceId;
@@ -84,6 +93,62 @@ impl SignedRecord {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_stdvec(self).expect("record serializes")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Removal {
+    pub group: GroupId,
+    pub member: EndpointId,
+    pub removed_by: EndpointId,
+    /// Unix seconds.
+    pub removed_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedRemoval {
+    pub removal: Removal,
+    pub signature: Signature,
+}
+
+impl Removal {
+    /// The key this removal is stored under in the membership doc.
+    pub fn doc_key(member: EndpointId) -> String {
+        format!("{REMOVED_PREFIX}{member}")
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = REMOVAL_SIGNING_TAG.to_vec();
+        bytes.extend(postcard::to_stdvec(self).expect("removal serializes"));
+        bytes
+    }
+
+    /// Signs the removal with `key`, which must be `removed_by`'s.
+    pub fn sign(self, key: &SecretKey) -> SignedRemoval {
+        assert_eq!(key.public(), self.removed_by, "signer must be removed_by");
+        let signature = key.sign(&self.signing_bytes());
+        SignedRemoval {
+            removal: self,
+            signature,
+        }
+    }
+}
+
+impl SignedRemoval {
+    /// Checks the signature only, not that the signer is a member.
+    pub fn verify_signature(&self) -> bool {
+        self.removal
+            .removed_by
+            .verify(&self.removal.signing_bytes(), &self.signature)
+            .is_ok()
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_stdvec(self).expect("removal serializes")
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {

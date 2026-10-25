@@ -12,6 +12,7 @@ use iroh::{EndpointAddr, EndpointId};
 use sync_node::folder;
 use sync_node::group::GroupError;
 use sync_node::key::{self, KEY_FILE};
+use sync_node::lock;
 use sync_node::member::{self, check_name};
 use sync_node::presence::PRESENCE_INTERVAL;
 use sync_node::status::STATUS_FILE;
@@ -54,7 +55,11 @@ enum Command {
         ui_dir: Option<PathBuf>,
     },
     /// Found a new group with this node as its only member.
-    Create,
+    Create {
+        /// The group's name, shown with its ID on every node.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Manage invites to this node's group.
     Invite {
         #[command(subcommand)]
@@ -64,6 +69,11 @@ enum Command {
     Folder {
         #[command(subcommand)]
         command: FolderCommand,
+    },
+    /// Manage the group.
+    Group {
+        #[command(subcommand)]
+        command: GroupCommand,
     },
     /// Manage the group's members.
     Member {
@@ -96,6 +106,13 @@ enum InviteCommand {
 }
 
 #[derive(Subcommand)]
+enum GroupCommand {
+    /// Name the group, or rename it, on every node. Queued for the running
+    /// node, which applies it within one presence interval.
+    Name { name: String },
+}
+
+#[derive(Subcommand)]
 enum FolderCommand {
     /// Keep a folder at `path` on this node: joins the group's folder of that
     /// name, or creates it. Queued for the running node, which applies it
@@ -106,6 +123,18 @@ enum FolderCommand {
         /// The directory on this node.
         path: PathBuf,
     },
+    /// Stop keeping a folder on this node, as before `folder add`. Its files
+    /// stay on disk; only this node's own files in it (the marker, staging
+    /// files) go. The group keeps the folder. Queued for the running node,
+    /// which applies it within one presence interval.
+    Remove { name: String },
+    /// Turn a folder off on this node: it isn't watched or indexed, fetches
+    /// nothing and serves nothing, and its doc still syncs. Applied by the
+    /// running node within one presence interval.
+    Disable { name: String },
+    /// Turn a disabled folder on again. Its first scan writes what changed
+    /// while it was disabled to the group, deletes included.
+    Enable { name: String },
     /// Show what a folder will look like once every node keeping it has
     /// synced: files to fetch, deletes and conflicts. Written by the running
     /// node whenever the folder's index changes.
@@ -133,6 +162,12 @@ enum MemberCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Remove a member from the group, on every node: no member connects to
+    /// it or syncs with it again. Members it added go too, unless another
+    /// member adds them again. A removed node can't come back with the same
+    /// ID. Queued for the running node, which applies it within one presence
+    /// interval.
+    Remove { id: EndpointId },
 }
 
 #[tokio::main]
@@ -212,7 +247,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                             .context("finding the UI dir next to the executable")?,
                     };
                     tracing::info!("web UI at http://{addr}/ from {}", ui_dir.display());
-                    let app = ui::router(
+                    let (app, topics) = ui::router(
                         node.clone(),
                         ui::UiConfig {
                             addr,
@@ -223,7 +258,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                     let serve = axum::serve(listener, app).with_graceful_shutdown(async {
                         let _ = ui_stopped.await;
                     });
-                    Some(tokio::spawn(serve.into_future()))
+                    Some((topics, tokio::spawn(serve.into_future())))
                 }
                 None => None,
             };
@@ -235,7 +270,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 result = tokio::signal::ctrl_c() => result?,
             }
             tracing::info!("shutting down");
-            if let Some(server) = server {
+            if let Some((topics, server)) = server {
+                // The WebSockets first: graceful shutdown waits for them.
+                topics.stop().await;
                 let _ = stop_ui.send(());
                 server.await?.context("web UI server")?;
             }
@@ -243,9 +280,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 .map_err(|_| anyhow::anyhow!("the web UI still holds the node"))?;
             node.shutdown().await?;
         }
-        Command::Create => {
+        Command::Create { name } => {
+            let name = name.as_deref().map(check_name).transpose()?;
             let node = Node::spawn(&config_dir, key, Network::N0).await?;
-            let result = node.create_group().await;
+            let result = node.create_named_group(name.as_deref()).await;
             node.shutdown().await?;
             println!("created group {}", result?);
         }
@@ -272,6 +310,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
             // Queued rather than applied, since `run` holds the stores.
             Group::load(&config_dir)?.ok_or(GroupError::NotInGroup)?;
             let name = folder::check_folder_name(&name)?;
+            // As the running node would, but now rather than once it applies it.
+            if let Some(kept) = folder::load_local(&config_dir)?
+                .into_iter()
+                .find(|f| f.name == name)
+            {
+                bail!(
+                    "this node already keeps folder {name} at {}",
+                    kept.path.display()
+                );
+            }
             let path = path
                 .canonicalize()
                 .with_context(|| format!("resolving {}", path.display()))?;
@@ -282,6 +330,34 @@ async fn run(args: Args) -> anyhow::Result<()> {
             println!(
                 "queued; the running node adds folder {name} at {} within {}s",
                 path.display(),
+                PRESENCE_INTERVAL.as_secs()
+            );
+        }
+        Command::Folder {
+            command: FolderCommand::Remove { name },
+        } => {
+            folder::queue_remove(&config_dir, &name)?;
+            println!(
+                "queued; the running node removes folder {name} within {}s; its files stay",
+                PRESENCE_INTERVAL.as_secs()
+            );
+        }
+        Command::Folder {
+            command: FolderCommand::Disable { name },
+        } => {
+            folder::set_enabled(&config_dir, &name, false)?;
+            println!(
+                "the running node disables folder {name} within {}s",
+                PRESENCE_INTERVAL.as_secs()
+            );
+        }
+        Command::Folder {
+            command: FolderCommand::Enable { name },
+        } => {
+            folder::set_enabled(&config_dir, &name, true)?;
+            println!(
+                "the running node enables folder {name} within {}s; changes made while it \
+                 was disabled, deletes included, then sync to the group",
                 PRESENCE_INTERVAL.as_secs()
             );
         }
@@ -318,6 +394,33 @@ async fn run(args: Args) -> anyhow::Result<()> {
                     key.public()
                 );
             }
+        }
+        Command::Member {
+            command: MemberCommand::Remove { id },
+        } => {
+            // Queued rather than written, since `run` holds the stores.
+            let group = Group::load(&config_dir)?.ok_or(GroupError::NotInGroup)?;
+            member::check_removable(id, key.public(), group.founder)?;
+            member::queue_remove(&config_dir, id)?;
+            println!(
+                "queued; the running node applies it within {}s",
+                PRESENCE_INTERVAL.as_secs()
+            );
+            println!(
+                "members it added are no longer members, unless another member adds them again"
+            );
+        }
+        Command::Group {
+            command: GroupCommand::Name { name },
+        } => {
+            // Queued rather than written, since `run` holds the stores.
+            Group::load(&config_dir)?.ok_or(GroupError::NotInGroup)?;
+            let name = check_name(&name)?;
+            member::queue_group_name(&config_dir, &name)?;
+            println!(
+                "queued; the running node applies it within {}s",
+                PRESENCE_INTERVAL.as_secs()
+            );
         }
         Command::Status => print_status(&config_dir)?,
         Command::Join { ticket } => {
@@ -361,7 +464,7 @@ fn print_status(config_dir: &std::path::Path) -> anyhow::Result<()> {
 
 /// Deletes the config directory once the user confirms. Refuses a directory
 /// without a key file, so a mistyped `--config-dir` can't delete something
-/// else, and one whose status file is fresh, since `run` is using it.
+/// else, and one a node is using (it holds the directory's lock).
 fn clear_config(config_dir: &std::path::Path) -> anyhow::Result<()> {
     if !config_dir.exists() {
         println!("{} doesn't exist; nothing to clear", config_dir.display());
@@ -374,13 +477,9 @@ fn clear_config(config_dir: &std::path::Path) -> anyhow::Result<()> {
             config_dir.display()
         );
     }
-    let status_age = std::fs::metadata(config_dir.join(STATUS_FILE))
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok());
-    if status_age.is_some_and(|age| age <= PRESENCE_INTERVAL * 3) {
+    if lock::is_held(config_dir)? {
         bail!(
-            "`run` seems to be using {}: stop it first",
+            "a sync-node process (`run`, `create` or `join`) is using {}: stop it first",
             config_dir.display()
         );
     }

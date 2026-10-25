@@ -13,8 +13,15 @@ One running instance, identified by its public key.
 _Avoid_: Device, client. A node is a **peer** only in a swarm (see Content).
 
 **Member**:
-A node holding a valid signed record in its group.
+A node holding a valid signed record in its group, whose chain of records reaches the founder through no removed node.
 _Avoid_: User, participant
+
+**Removal**:
+A member's signed statement that a node is no longer in the group. It always wins: the removed ID can't come back. Members whose chain goes through the removed node are no longer members either, unless another member adds them again (ADR 0006).
+_Avoid_: Revocation, ban, kick
+
+**Group name**:
+The group's display name, set by any member, the same on every node. Cosmetic: the group ID identifies the group.
 
 ## Folders
 
@@ -24,6 +31,10 @@ _Avoid_: Share, repo, sync root
 
 **Document/doc**
 The iroh-doc document that is replicated across the group
+
+**Disabled folder**:
+A folder turned off on one node (`folder disable`): not watched or indexed, fetches nothing and serves nothing, while its doc still syncs and its entries stay. Enabled again, it catches up as a node coming back online does: its first scan writes what changed meanwhile, deletes included.
+_Avoid_: Paused (that's a folder whose root or marker is missing), muted, unmapped
 
 **Entry**:
 One members description of one path in a folder: its content, size, modification time and version, stored in the 'folder' iroh-doc document
@@ -93,6 +104,13 @@ A peer doesn't serve the other end's requests now. **Unchoke** ends it. Upload s
 **Optimistic unchoke**:
 An unchoke that rotates to another interested peer, so its speed can be measured.
 
+**Snubbed**:
+A peer that has requests open but sent no block for 60 s. It is asked for one block at a time until it sends.
+
+**Stuck**:
+A download with no peer in its swarm that both unchokes this node and has a piece it lacks. With no peer in the swarm for 30 s, the download stops, for a later try.
+_Avoid_: Stalled, hung
+
 **Rarest first**:
 Pieces held by the fewest peers are asked for first.
 
@@ -112,6 +130,10 @@ _Avoid_: Dashboard, front end, metrics page, console
 **UI address**:
 The address the web UI's server listens on, set by `--ui-addr` / `SYNC_NODE_UI_ADDR`. No UI address, no server.
 _Avoid_: Port, bind (alone)
+
+**UI topic**:
+One read the web UI subscribes to over its WebSocket, named as its read route (`status`, `folders`, `folders/<name>`, `transfers`); the node sends its data whenever it changes (ADR 0005).
+_Avoid_: Topic (alone: that's the gossip presence topic), channel, feed, subscription
 
 **UI dir**:
 The directory of the built page that the server sends, set by `--ui-dir` / `SYNC_NODE_UI_DIR`; `ui/` next to the executable by default. Built from the `ui/` source directory into `ui/dist/`.

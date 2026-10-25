@@ -10,6 +10,10 @@
 //! * a node that redeems an invite here is admitted by the join protocol;
 //! * any other node presents its chain over the members ALPN.
 //!
+//! A node removed from the group is never admitted, whatever chain it
+//! presents: the monitor tells the gate who is removed (`set_removed`), and
+//! the gate forgets them and refuses them from then on.
+//!
 //! The side that dials presents first. On every outgoing connection the hook
 //! opens a members connection, sends this node's chain and gets the remote's
 //! back, even if it already knows the remote: the remote may have restarted
@@ -56,6 +60,7 @@ struct Inner {
     group: RwLock<Option<Group>>,
     admitted: Mutex<HashSet<EndpointId>>,
     admitted_changed: Notify,
+    removed: Mutex<HashSet<EndpointId>>,
     names: Names,
     /// Set once the endpoint is bound, and cleared on shutdown: the endpoint
     /// holds the hooks, which hold this.
@@ -83,8 +88,11 @@ impl Gate {
         *self.0.group.write().unwrap() = Some(group);
     }
 
-    /// Admits `id`; `how` says why, for the log.
+    /// Admits `id`, unless it is removed; `how` says why, for the log.
     pub fn admit(&self, id: EndpointId, how: &str) {
+        if self.is_removed(id) {
+            return;
+        }
         if self.0.admitted.lock().unwrap().insert(id) {
             tracing::info!("admitted {} ({how})", self.0.names.display(id));
             self.0.admitted_changed.notify_waiters();
@@ -95,6 +103,24 @@ impl Gate {
         self.0.admitted.lock().unwrap().contains(&id)
     }
 
+    pub fn is_removed(&self, id: EndpointId) -> bool {
+        self.0.removed.lock().unwrap().contains(&id)
+    }
+
+    /// Replaces the removed nodes and stops admitting them. Returns the
+    /// nodes that are newly removed, whose connections the caller closes.
+    pub fn set_removed(&self, removed: HashSet<EndpointId>) -> Vec<EndpointId> {
+        let mut admitted = self.0.admitted.lock().unwrap();
+        let mut current = self.0.removed.lock().unwrap();
+        let mut new: Vec<EndpointId> = removed.difference(&current).copied().collect();
+        new.sort();
+        for id in &removed {
+            admitted.remove(id);
+        }
+        *current = removed;
+        new
+    }
+
     pub(crate) fn set_endpoint(&self, endpoint: Option<Endpoint>) {
         *self.0.endpoint.lock().unwrap() = endpoint;
     }
@@ -103,6 +129,12 @@ impl Gate {
     fn check_presented(&self, id: EndpointId, chain: &[SignedRecord]) -> anyhow::Result<()> {
         let group = self.group().context("not in a group")?;
         validate_chain(group.id, group.founder, id, chain)?;
+        if let Some(link) = chain.iter().find(|s| self.is_removed(s.record.member)) {
+            anyhow::bail!(
+                "{} was removed from the group",
+                self.0.names.display(link.record.member)
+            );
+        }
         self.admit(id, "presented chain");
         Ok(())
     }

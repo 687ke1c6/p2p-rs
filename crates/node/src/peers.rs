@@ -13,7 +13,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, PathEvent, PathId, PathStats, WeakConnectionHandle};
+use iroh::endpoint::{Connection, PathEvent, PathId, PathStats, VarInt, WeakConnectionHandle};
 use iroh::{EndpointId, TransportAddr};
 use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ use crate::member::Names;
 
 /// How a peer is reached: the kind of the selected path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub enum LinkKind {
     Direct,
     Relay,
@@ -48,6 +49,7 @@ impl LinkKind {
 /// Bytes sent and received, split by path kind. UDP payload bytes, so they
 /// include QUIC overhead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Traffic {
     pub direct_sent: u64,
     pub direct_recv: u64,
@@ -215,6 +217,25 @@ impl Peers {
         Self {
             state: Arc::default(),
             names,
+        }
+    }
+
+    /// Closes every connection to `id` with `code`.
+    pub fn close(&self, id: EndpointId, code: u32, reason: &[u8]) {
+        let conns: Vec<Connection> = self
+            .state
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|peer| {
+                peer.conns
+                    .values()
+                    .filter_map(|conn| conn.handle.upgrade())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for conn in conns {
+            conn.close(VarInt::from_u32(code), reason);
         }
     }
 

@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+arc-swap.workspace = true
 axum.workspace = true
 bytes.workspace = true
 blake3.workspace = true
@@ -23,6 +24,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
@@ -30,3 +32,5 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+ts-rs.workspace = true

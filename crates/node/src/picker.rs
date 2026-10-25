@@ -145,6 +145,14 @@ impl Picker {
             .collect()
     }
 
+    /// How many pieces this node has, verified.
+    pub fn have_count(&self) -> u32 {
+        self.pieces
+            .iter()
+            .filter(|p| matches!(p, Piece::Have))
+            .count() as u32
+    }
+
     /// Whether `holds` has a piece this node lacks.
     pub fn wants(&self, holds: &Holds) -> bool {
         let peer = Peer {
@@ -211,6 +219,23 @@ impl Picker {
     /// Requests open to peer `p`.
     pub fn open(&self, p: usize) -> usize {
         self.peers[p].open
+    }
+
+    /// How many pieces peer `p` has.
+    pub fn held(&self, p: usize) -> u32 {
+        match &self.peers[p].holds {
+            Holds::All => self.piece_count(),
+            Holds::These(have) => have.iter().filter(|h| **h).count() as u32,
+        }
+    }
+
+    /// How many pieces are started but not verified yet: blocks asked for or
+    /// arrived, or the hash check pending.
+    pub fn active(&self) -> u32 {
+        self.pieces
+            .iter()
+            .filter(|p| matches!(p, Piece::Active(_) | Piece::Checking))
+            .count() as u32
     }
 
     pub fn is_complete(&self) -> bool {

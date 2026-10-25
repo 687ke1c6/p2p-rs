@@ -11,7 +11,8 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+arc-swap = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
 blake3 = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -33,6 +34,8 @@ serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+ts-rs = "12"
+tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"

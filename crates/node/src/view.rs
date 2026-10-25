@@ -82,6 +82,7 @@ pub enum Outcome {
 
 /// Where one node stands on a path, against the outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub enum NodeState {
     /// Has the version the path ends up with (or agrees it's deleted).
     Current,

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use iroh::EndpointId;
 
-use crate::folder::FolderState;
+use crate::folder::{AvailableFolder, FolderState};
 use crate::group::Group;
 use crate::member::Names;
 use crate::peers::{bytes, PeerSnapshot};
@@ -26,14 +26,19 @@ pub const STATUS_FILE: &str = "status";
 pub struct Status {
     pub node: EndpointId,
     pub group: GroupId,
+    pub group_name: Option<String>,
     pub founder: EndpointId,
     /// Unix seconds.
     pub generated_at: u64,
     pub members: Vec<MemberStatus>,
+    /// Nodes removed from the group, oldest removal first.
+    pub removed: Vec<RemovedStatus>,
     /// Every pair of members, each once.
     pub links: Vec<Link>,
     /// The folders this node syncs.
     pub folders: Vec<FolderState>,
+    /// The group's folders this node doesn't keep.
+    pub available: Vec<AvailableFolder>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +52,14 @@ pub struct MemberStatus {
     pub last_heard: Option<Duration>,
     /// This node's own connection to it, if it ever had one.
     pub peer: Option<PeerSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedStatus {
+    pub id: EndpointId,
+    pub removed_by: EndpointId,
+    /// Unix seconds, by the remover's clock.
+    pub removed_at: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +77,7 @@ impl Status {
         peers: &[PeerSnapshot],
         names: &Names,
         folders: &[FolderState],
+        available: &[AvailableFolder],
     ) -> Self {
         let mut records = view.members();
         // Founder first, then by when they joined.
@@ -99,14 +113,26 @@ impl Status {
                 });
             }
         }
+        let removed = view
+            .removed()
+            .iter()
+            .map(|s| RemovedStatus {
+                id: s.removal.member,
+                removed_by: s.removal.removed_by,
+                removed_at: s.removal.removed_at,
+            })
+            .collect();
         Self {
             node,
             group: group.id,
+            group_name: names.group(),
             founder: group.founder,
             generated_at: unix_now(),
             members,
+            removed,
             links,
             folders: folders.to_vec(),
+            available: available.to_vec(),
         }
     }
 
@@ -139,7 +165,14 @@ impl Status {
         let mut out = String::new();
         let online = self.members.iter().filter(|m| m.online).count();
         let _ = writeln!(out, "node    {}", self.node);
-        let _ = writeln!(out, "group   {}", self.group);
+        match &self.group_name {
+            Some(name) => {
+                let _ = writeln!(out, "group   {name} ({})", self.group);
+            }
+            None => {
+                let _ = writeln!(out, "group   {}", self.group);
+            }
+        }
         let _ = writeln!(out, "founder {}", short(self.founder));
         let _ = writeln!(out, "\nmembers ({}, {online} online):", self.members.len());
         for m in &self.members {
@@ -166,6 +199,17 @@ impl Status {
                 let _ = writeln!(out, "      {}", peer_line(peer));
             }
         }
+        if !self.removed.is_empty() {
+            let _ = writeln!(out, "\nremoved ({}):", self.removed.len());
+            for r in &self.removed {
+                let _ = writeln!(
+                    out,
+                    "  {}  removed by {}",
+                    r.id.fmt_short(),
+                    short(r.removed_by)
+                );
+            }
+        }
         if !self.links.is_empty() {
             let _ = writeln!(out, "\nlinks (as the group reports them):");
             for link in &self.links {
@@ -181,7 +225,9 @@ impl Status {
         if !self.folders.is_empty() {
             let _ = writeln!(out, "\nfolders:");
             for f in &self.folders {
-                let state = if f.paused {
+                let state = if f.disabled {
+                    format!("disabled (`folder enable {}` turns it on)", f.config.name)
+                } else if f.paused {
                     "paused (root or its marker missing)".to_string()
                 } else {
                     format!(
@@ -197,6 +243,15 @@ impl Status {
                     f.config.name,
                     f.config.path.display()
                 );
+            }
+        }
+        if !self.available.is_empty() {
+            let _ = writeln!(
+                out,
+                "\navailable folders (`folder add <name> <path>` keeps one):"
+            );
+            for f in &self.available {
+                let _ = writeln!(out, "  {}  kept by {} nodes", f.name, f.nodes);
             }
         }
         let _ = writeln!(out, "\nids:");
