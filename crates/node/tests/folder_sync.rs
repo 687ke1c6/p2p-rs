@@ -552,3 +552,62 @@ async fn a_removed_folder_is_as_before_it_was_added() {
         node.shutdown().await.unwrap();
     }
 }
+
+/// Open gossip connections between `node` and its peers.
+fn gossip_conns(node: &Node) -> usize {
+    node.peers()
+        .iter()
+        .flat_map(|p| &p.conns)
+        .filter(|c| c.protocol == "gossip")
+        .count()
+}
+
+#[tokio::test]
+async fn removing_a_folder_leaves_no_gossip_connection_behind() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let book = MemoryLookup::new();
+    let nodes = group(&dirs, &book).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let (pa, pb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ra, rb) = (pa.path(), pb.path());
+    write(ra, "keep.txt", "keep");
+    let id = a.add_folder("f", ra).await.unwrap();
+    eventually("b to see the folder listed", || async {
+        b.group_folders()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(f, _)| *f == id)
+    })
+    .await;
+    b.add_folder("f", rb).await.unwrap();
+    eventually("b to fetch keep.txt", || async {
+        read(rb, "keep.txt").is_some()
+    })
+    .await;
+    tokio::time::sleep(INTERVAL * 5).await;
+    let before = (gossip_conns(a), gossip_conns(b));
+    assert!(before.0 > 0 && before.1 > 0, "{before:?}");
+
+    // Leaving the folder's doc quits its gossip topic. With iroh-gossip
+    // 0.101.0 unpatched, each quit dropped the peer for every topic, and the
+    // connection it dialed again on top of the old one, which never closed.
+    for _ in 0..3 {
+        folder::queue_remove(dirs[1].path(), "f").unwrap();
+        eventually("b to remove the folder", || async {
+            b.folders().is_empty()
+        })
+        .await;
+        tokio::time::sleep(INTERVAL * 5).await;
+        b.add_folder("f", rb).await.unwrap();
+        tokio::time::sleep(INTERVAL * 5).await;
+    }
+    eventually("no gossip connection left behind", || async {
+        gossip_conns(a) <= before.0 && gossip_conns(b) <= before.1
+    })
+    .await;
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}

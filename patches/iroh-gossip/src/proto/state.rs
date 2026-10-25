@@ -317,13 +317,16 @@ fn handle_out_event<PI: PeerIdentity>(
             outbox.push(OutEvent::ScheduleTimer(delay, Timer { topic, timer }))
         }
         topic::OutEvent::DisconnectPeer(peer) => {
-            let empty = conns
-                .get_mut(&peer)
-                .map(|list| list.remove(&topic) || list.is_empty())
-                .unwrap_or(false);
-            if empty {
-                conns.remove(&peer);
-                outbox.push(OutEvent::DisconnectPeer(peer));
+            // sync-node patch (from upstream main): the connection is shared
+            // by every topic that uses the peer, so disconnect only once no
+            // topic uses it. 0.101.0 disconnected as soon as any topic that
+            // used it let it go.
+            if let Some(topics) = conns.get_mut(&peer) {
+                topics.remove(&topic);
+                if topics.is_empty() {
+                    conns.remove(&peer);
+                    outbox.push(OutEvent::DisconnectPeer(peer));
+                }
             }
         }
         topic::OutEvent::PeerData(peer, data) => outbox.push(OutEvent::PeerData(peer, data)),

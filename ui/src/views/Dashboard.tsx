@@ -16,7 +16,9 @@ import { createEffect, createMemo, createSignal, For, type JSX, on, Show } from 
 import type { AvailableInfo } from "@/api/AvailableInfo";
 import type { FolderInfo } from "@/api/FolderInfo";
 import type { RemovedInfo } from "@/api/RemovedInfo";
+import type { Traffic } from "@/api/Traffic";
 import type { GroupStatus } from "@/api/GroupStatus";
+import type { LinkKind } from "@/api/LinkKind";
 import type { LinkState } from "@/api/LinkState";
 import type { MemberInfo } from "@/api/MemberInfo";
 import type { PeerInfo } from "@/api/PeerInfo";
@@ -1102,19 +1104,72 @@ function Connection(props: { peer: PeerInfo }) {
   const rtt = () => (props.peer.rtt_ms === null ? "" : `, rtt ${props.peer.rtt_ms} ms`);
   return (
     <Show when={props.peer.connections > 0} fallback={<Badge variant="outline">not connected</Badge>}>
-      <span class="flex items-center gap-2" title={`${props.peer.path ?? "no path selected"}${rtt()}`}>
-        <Show when={props.peer.kind} fallback={<Badge variant="outline">no path yet</Badge>}>
-          {(kind) => (
-            <Badge variant={kind() === "Direct" ? "secondary" : "outline"}>
-              {kind() === "Direct" ? "direct" : "relay"}
-            </Badge>
-          )}
-        </Show>
-        <span class="text-muted-foreground text-xs">
-          {props.peer.connections} conn{rtt()}
-        </span>
-      </span>
+      <HoverCard openDelay={150} closeDelay={100}>
+        <HoverCardTrigger as="span" class="flex cursor-default items-center gap-2">
+          <Show when={props.peer.kind} fallback={<Badge variant="outline">no path yet</Badge>}>
+            {(kind) => <KindBadge kind={kind()} />}
+          </Show>
+          <span class="text-muted-foreground text-xs underline decoration-dotted underline-offset-2">
+            {props.peer.connections} conn{rtt()}
+          </span>
+        </HoverCardTrigger>
+        <HoverCardPortal>
+          <HoverCardContent class="w-96 space-y-2 p-3">
+            <Conns peer={props.peer} />
+          </HoverCardContent>
+        </HoverCardPortal>
+      </HoverCard>
     </Show>
+  );
+}
+
+function KindBadge(props: { kind: LinkKind }) {
+  return (
+    <Badge variant={props.kind === "Direct" ? "secondary" : "outline"}>
+      {props.kind === "Direct" ? "direct" : "relay"}
+    </Badge>
+  );
+}
+
+/** A peer's open connections, one per protocol and side that dialed it. */
+function Conns(props: { peer: PeerInfo }) {
+  const traffic = (t: Traffic) =>
+    `↑${bytes(t.direct_sent + t.relay_sent)} ↓${bytes(t.direct_recv + t.relay_recv)}`;
+  return (
+    <>
+      <div>
+        <p class="text-sm font-medium">Connections</p>
+        <p class="text-muted-foreground font-mono text-xs break-all">
+          {props.peer.path ?? "no path selected"}
+        </p>
+      </div>
+      <ul class="space-y-1.5 text-sm">
+        <For each={props.peer.conns}>
+          {(conn) => (
+            <li class="space-y-0.5">
+              <div class="flex items-center justify-between gap-2">
+                <span>
+                  <span class="font-medium">{conn.protocol}</span>{" "}
+                  <span class="text-muted-foreground text-xs">
+                    {conn.outgoing ? "dialed by this node" : "dialed by the peer"}
+                  </span>
+                </span>
+                <Show when={conn.kind} fallback={<Badge variant="outline">no path yet</Badge>}>
+                  {(kind) => <KindBadge kind={kind()} />}
+                </Show>
+              </div>
+              <div class="text-muted-foreground flex justify-between gap-2 text-xs">
+                <span class="truncate font-mono">{conn.alpn}</span>
+                <span class="shrink-0">
+                  {conn.rtt_ms === null ? "" : `${conn.rtt_ms} ms · `}
+                  {traffic(conn.traffic)}
+                </span>
+              </div>
+            </li>
+          )}
+        </For>
+      </ul>
+    </>
   );
 }
 

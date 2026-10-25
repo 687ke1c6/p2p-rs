@@ -41,8 +41,14 @@ tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# iroh-gossip 0.101.0 never redials a peer whose first dial failed; the copy
-# in patches/ forgets such a peer so the next message dials it again. Remove
-# once a release fixes it. See plans/sync-plan.md, step 6a.
+# iroh-gossip 0.101.0, patched in patches/ (each change marked "sync-node
+# patch"); remove once a release fixes them:
+# - it never redials a peer whose first dial failed; the copy forgets such a
+#   peer so the next message dials it again. See plans/sync-plan.md, step 6a.
+# - it leaks a connection per peer disconnect: a dropped connection's send
+#   loop never ended, and nothing closed a connection neither side used. The
+#   copy ends the send loop and closes such a connection.
+# - one topic letting a peer go disconnected it for every topic (fixed on
+#   upstream main), so leaving a folder's doc dropped the peer.
 [patch.crates-io]
 iroh-gossip = { path = "patches/iroh-gossip" }

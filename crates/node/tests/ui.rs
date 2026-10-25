@@ -22,7 +22,7 @@ use sync_node::member::{ADDS_DIR, GROUP_NAME_FILE, REMOVES_DIR};
 use sync_node::peer_wire::{
     InSwarm, SwarmPeer, SwarmPeerState, SwarmSnapshot, Transfers, UploadSnapshot,
 };
-use sync_node::peers::{LinkKind, PeerSnapshot, Traffic};
+use sync_node::peers::{ConnSnapshot, LinkKind, PeerSnapshot, Traffic};
 use sync_node::presence::LinkState;
 use sync_node::record::GroupId;
 use sync_node::status::{Link, MemberStatus, RemovedStatus};
@@ -211,6 +211,14 @@ fn in_group(this: EndpointId, other: EndpointId) -> Status {
                     path: Some("192.168.1.5:4433".to_string()),
                     rtt: Some(Duration::from_millis(12)),
                     traffic,
+                    conns: vec![ConnSnapshot {
+                        protocol: "docs".to_string(),
+                        alpn: "/iroh-sync/1".to_string(),
+                        outgoing: true,
+                        kind: Some(LinkKind::Direct),
+                        rtt: Some(Duration::from_millis(12)),
+                        traffic,
+                    }],
                 }),
             },
         ],
@@ -308,6 +316,19 @@ async fn status_in_a_group() {
                                 "relay_sent": 3,
                                 "relay_recv": 4,
                             },
+                            "conns": [{
+                                "protocol": "docs",
+                                "alpn": "/iroh-sync/1",
+                                "outgoing": true,
+                                "kind": "Direct",
+                                "rtt_ms": 12,
+                                "traffic": {
+                                    "direct_sent": 10,
+                                    "direct_recv": 20,
+                                    "relay_sent": 3,
+                                    "relay_recv": 4,
+                                },
+                            }],
                         },
                     },
                 ],

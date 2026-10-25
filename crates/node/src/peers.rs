@@ -13,7 +13,9 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, PathEvent, PathId, PathStats, VarInt, WeakConnectionHandle};
+use iroh::endpoint::{
+    Connection, PathEvent, PathId, PathStats, Side, VarInt, WeakConnectionHandle,
+};
 use iroh::{EndpointId, TransportAddr};
 use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -185,6 +187,41 @@ pub struct PeerSnapshot {
     pub rtt: Option<Duration>,
     /// Totals since this node started, over open and closed connections.
     pub traffic: Traffic,
+    /// The open connections, by protocol.
+    #[serde(default)]
+    pub conns: Vec<ConnSnapshot>,
+}
+
+/// One open connection to a peer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConnSnapshot {
+    /// The protocol's short name (see [`protocol_name`]).
+    pub protocol: String,
+    pub alpn: String,
+    /// Whether this node dialed it.
+    pub outgoing: bool,
+    /// Its selected path's kind.
+    pub kind: Option<LinkKind>,
+    pub rtt: Option<Duration>,
+    /// Since it opened.
+    pub traffic: Traffic,
+}
+
+/// The short name of the protocol on `alpn`, or the ALPN itself if unknown.
+pub fn protocol_name(alpn: &[u8]) -> String {
+    let known: [(&[u8], &str); 6] = [
+        (iroh_docs::ALPN, "docs"),
+        (iroh_gossip::ALPN, "gossip"),
+        (iroh_blobs::ALPN, "blobs"),
+        (crate::peer_wire::ALPN, "peer wire"),
+        (crate::gate::MEMBERS_ALPN, "members"),
+        (crate::gate::JOIN_ALPN, "join"),
+    ];
+    known
+        .iter()
+        .find(|(a, _)| *a == alpn)
+        .map(|(_, name)| name.to_string())
+        .unwrap_or_else(|| String::from_utf8_lossy(alpn).into_owned())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -206,6 +243,7 @@ struct PeerState {
 #[derive(Debug)]
 struct TrackedConn {
     alpn: Vec<u8>,
+    outgoing: bool,
     handle: WeakConnectionHandle,
     kinds: HashMap<PathId, LinkKind>,
     traffic: PathTotals<PathId>,
@@ -260,6 +298,7 @@ impl Peers {
                 stable_id,
                 TrackedConn {
                     alpn: alpn.clone(),
+                    outgoing: conn.side() == Side::Client,
                     handle,
                     kinds,
                     traffic: PathTotals::default(),
@@ -416,17 +455,28 @@ impl Peers {
                 let mut kind = None;
                 let mut path = None;
                 let mut rtt = None;
-                let mut connections = 0;
+                let mut conns = Vec::new();
                 for conn in peer.conns.values_mut() {
                     let Some(strong) = conn.handle.upgrade() else {
                         // Gone, close not handled yet: as last seen.
                         traffic.add(&conn.traffic.total());
                         continue;
                     };
-                    connections += 1;
+                    let mut snap = ConnSnapshot {
+                        protocol: protocol_name(&conn.alpn),
+                        alpn: String::from_utf8_lossy(&conn.alpn).into_owned(),
+                        outgoing: conn.outgoing,
+                        kind: None,
+                        rtt: None,
+                        traffic: Traffic::default(),
+                    };
                     for p in strong.paths().iter() {
                         let k = LinkKind::of(p.remote_addr());
                         conn.traffic.observe(p.id(), Traffic::of(k, &p.stats()));
+                        if p.is_selected() {
+                            snap.kind = Some(k);
+                            snap.rtt = Some(p.rtt());
+                        }
                         // Prefer a direct selected path if connections disagree.
                         if p.is_selected() && kind != Some(LinkKind::Direct) {
                             kind = Some(k);
@@ -434,15 +484,19 @@ impl Peers {
                             rtt = Some(p.rtt());
                         }
                     }
-                    traffic.add(&conn.traffic.total());
+                    snap.traffic = conn.traffic.total();
+                    traffic.add(&snap.traffic);
+                    conns.push(snap);
                 }
+                conns.sort_by(|a, b| (&a.protocol, b.outgoing).cmp(&(&b.protocol, a.outgoing)));
                 PeerSnapshot {
                     id: *id,
-                    connections,
+                    connections: conns.len(),
                     kind,
                     path,
                     rtt,
                     traffic,
+                    conns,
                 }
             })
             .collect();

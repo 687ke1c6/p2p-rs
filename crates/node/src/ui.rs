@@ -36,7 +36,7 @@ use crate::group::GroupError;
 use crate::join::Ticket;
 use crate::node::Node;
 use crate::peer_wire::{SwarmPeerState, SwarmSnapshot, Transfers, UploadSnapshot};
-use crate::peers::{LinkKind, PeerSnapshot, Traffic};
+use crate::peers::{ConnSnapshot, LinkKind, PeerSnapshot, Traffic};
 use crate::presence::LinkState;
 use crate::record::GroupId;
 use crate::status::{Link, MemberStatus, Status};
@@ -450,6 +450,24 @@ pub struct PeerInfo {
     pub rtt_ms: Option<u64>,
     /// Totals since this node started.
     pub traffic: Traffic,
+    /// The open connections, by protocol.
+    pub conns: Vec<ConnInfo>,
+}
+
+/// One open connection to a peer.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct ConnInfo {
+    /// The protocol's short name: docs, gossip, blobs or peer wire.
+    pub protocol: String,
+    pub alpn: String,
+    /// Whether this node dialed it.
+    pub outgoing: bool,
+    /// Its selected path's kind.
+    pub kind: Option<LinkKind>,
+    pub rtt_ms: Option<u64>,
+    /// Since it opened.
+    pub traffic: Traffic,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -536,6 +554,20 @@ impl From<&PeerSnapshot> for PeerInfo {
             path: peer.path.clone(),
             rtt_ms: peer.rtt.map(|rtt| rtt.as_millis() as u64),
             traffic: peer.traffic,
+            conns: peer.conns.iter().map(ConnInfo::from).collect(),
+        }
+    }
+}
+
+impl From<&ConnSnapshot> for ConnInfo {
+    fn from(conn: &ConnSnapshot) -> Self {
+        Self {
+            protocol: conn.protocol.clone(),
+            alpn: conn.alpn.clone(),
+            outgoing: conn.outgoing,
+            kind: conn.kind,
+            rtt_ms: conn.rtt.map(|rtt| rtt.as_millis() as u64),
+            traffic: conn.traffic,
         }
     }
 }

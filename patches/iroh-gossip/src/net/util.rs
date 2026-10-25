@@ -20,7 +20,7 @@ use n0_future::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 use tracing::{debug, trace, Instrument};
 
@@ -110,15 +110,38 @@ impl RecvLoop {
         }
     }
 
-    pub(crate) async fn run(&mut self) -> Result<(), ReadError> {
+    /// Reads messages until the connection is closed, or until `send_done`
+    /// fires and the remote, having opened streams, has finished them all.
+    ///
+    /// sync-node patch: in 0.101.0 this ran until the connection was closed,
+    /// and the connection was closed only once this returned. A connection
+    /// both sides had stopped using (the peer dropped, or another connection
+    /// to it taken for sending) stayed open for good, kept alive by iroh,
+    /// and a new one was dialed on top: one leaked per peer disconnect. A
+    /// side that stops using a connection finishes its streams. So once our
+    /// send loop has ended (`send_done`) and the remote has finished every
+    /// stream it opened, neither side uses it: this returns and the caller
+    /// closes it. A remote that has opened none yet may be about to use it
+    /// (both sides dialed at once, and each sends on the other's), so the
+    /// connection is kept until it does.
+    pub(crate) async fn run(&mut self, send_done: oneshot::Receiver<()>) -> Result<(), ReadError> {
         let mut read_futures = FuturesUnordered::new();
         let mut conn_is_closed = false;
+        let mut sending = true;
+        let mut remote_opened = false;
         let closed = self.conn.closed();
-        tokio::pin!(closed);
+        tokio::pin!(closed, send_done);
         while !conn_is_closed || !read_futures.is_empty() {
+            if !sending && remote_opened && read_futures.is_empty() {
+                debug!("neither side uses the connection");
+                break;
+            }
             tokio::select! {
                 _ = &mut closed, if !conn_is_closed => {
                     conn_is_closed = true;
+                }
+                _ = &mut send_done, if sending => {
+                    sending = false;
                 }
                 stream = self.conn.accept_uni(), if !conn_is_closed => {
                     let stream = match stream {
@@ -128,6 +151,7 @@ impl RecvLoop {
                             continue;
                         }
                     };
+                    remote_opened = true;
                     let state = RecvStreamState::new(stream, self.max_message_size).await?;
                     debug!(topic=%state.header.topic_id.fmt_short(), "stream opened");
                     read_futures.push(state.next());
@@ -231,9 +255,15 @@ impl SendLoop {
             tokio::select! {
                 biased;
                 _ = &mut closed => break,
-                Some(msg) = self.send_rx.recv() => self.write_message(&msg).await?,
+                // sync-node patch: ends when the actor drops the sender. In
+                // 0.101.0 a closed channel only disabled this branch, and
+                // `else` never ran while `closed` was pending, so a dropped
+                // connection kept its send loop (and streams) until closed.
+                msg = self.send_rx.recv() => match msg {
+                    Some(msg) => self.write_message(&msg).await?,
+                    None => break,
+                },
                 _ = self.finishing.join_next(), if !self.finishing.is_empty() => {}
-                else => break,
             }
         }
 

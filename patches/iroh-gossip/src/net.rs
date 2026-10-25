@@ -906,8 +906,15 @@ async fn connection_loop(
     let mut send_loop = SendLoop::new(conn.clone(), send_rx, max_message_size);
     let mut recv_loop = RecvLoop::new(from, conn, in_event_tx, max_message_size);
 
-    let send_fut = send_loop.run(queue).instrument(error_span!("send"));
-    let recv_fut = recv_loop.run().instrument(error_span!("recv"));
+    // sync-node patch: tells the recv loop that this side stopped sending.
+    let (send_done_tx, send_done_rx) = oneshot::channel();
+    let send_fut = async move {
+        let res = send_loop.run(queue).await;
+        send_done_tx.send(()).ok();
+        res
+    }
+    .instrument(error_span!("send"));
+    let recv_fut = recv_loop.run(send_done_rx).instrument(error_span!("recv"));
 
     let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
     send_res?;
