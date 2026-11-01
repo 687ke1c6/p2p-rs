@@ -16,12 +16,12 @@ stress:
 node *args:
     cargo run -p sync-node -- {{args}}
 
-# Release build of the node for the host (target/release/sync-node) and the web UI (ui/dist/)
+# Release build of the node for the host (target/release/sync-node), with the web UI embedded
 release: ui
     cargo build --release --locked -p sync-node
 
-# Cross-compile the node for armv7 (Debian bookworm armhf) into target/release/armv7,
-# build the web UI, and copy both to the Pi: ~/sync-node and ~/ui (its default UI dir)
+# Cross-compile the node for armv7 (Debian bookworm armhf), with the web UI embedded,
+# into target/release/armv7
 armv7: ui
     docker build -f Dockerfile.armv7 --output type=local,dest=target/release/armv7 .
 

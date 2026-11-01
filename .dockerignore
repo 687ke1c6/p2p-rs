@@ -1,3 +1,5 @@
 target/
 .git/
 .devcontainer/
+# Host packages (glibc binaries); Dockerfile.alpine installs its own.
+ui/node_modules/

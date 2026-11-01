@@ -142,11 +142,15 @@ fn id() -> EndpointId {
 }
 
 fn app(fake: Fake, ui_dir: &Path, config_dir: &Path) -> Router {
+    app_with(fake, Some(ui_dir.to_owned()), config_dir)
+}
+
+fn app_with(fake: Fake, ui_dir: Option<PathBuf>, config_dir: &Path) -> Router {
     let (router, _topics) = ui::router(
         Arc::new(fake),
         UiConfig {
             addr: ADDR.parse::<SocketAddr>().unwrap(),
-            ui_dir: ui_dir.to_owned(),
+            ui_dir,
             config_dir: config_dir.to_owned(),
         },
     );
@@ -456,6 +460,49 @@ async fn page_files_and_index_fallback() {
         assert_eq!(code, StatusCode::OK, "{path}");
         assert_eq!(body, want, "{path}");
     }
+}
+
+/// With no UI dir, the page embedded in the binary. A debug build reads it
+/// from `ui/dist/`, so the test compares with that.
+#[tokio::test]
+async fn embedded_page_and_index_fallback() {
+    let config = tempfile::tempdir().unwrap();
+    let embedded = || app_with(Fake::new(id()), None, config.path());
+    let dist = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/dist");
+    let Ok(index) = std::fs::read_to_string(dist.join("index.html")) else {
+        let (code, body) = send(embedded(), get("/")).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert_eq!(body, "UI not embedded in this build");
+        return;
+    };
+    for path in ["/", "/folders", "/folders/photos"] {
+        let (code, body) = send(embedded(), get(path)).await;
+        assert_eq!(code, StatusCode::OK, "{path}");
+        assert_eq!(body, index, "{path}");
+    }
+
+    let asset = std::fs::read_dir(dist.join("assets"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|name| name.ends_with(".js"))
+        .unwrap();
+    let response = embedded()
+        .oneshot(get(&format!("/assets/{asset}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/javascript");
+    let etag = response.headers()[header::ETAG].clone();
+
+    // The browser's copy is current: no body.
+    let request = Request::get(format!("/assets/{asset}"))
+        .header(header::HOST, ADDR)
+        .header(header::IF_NONE_MATCH, etag)
+        .body(Body::empty())
+        .unwrap();
+    let (code, body) = send(embedded(), request).await;
+    assert_eq!(code, StatusCode::NOT_MODIFIED);
+    assert_eq!(body, "");
 }
 
 /// A view of `photos` kept by `this` and `other`: one file in sync, one

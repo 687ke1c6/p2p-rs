@@ -141,7 +141,7 @@ One read the web UI subscribes to over its WebSocket, named as its read route (`
 _Avoid_: Topic (alone: that's the gossip presence topic), channel, feed, subscription
 
 **UI dir**:
-The directory of the built page that the server sends, set by `--ui-dir` / `SYNC_NODE_UI_DIR`; `ui/` next to the executable by default. Built from the `ui/` source directory into `ui/dist/`.
+A directory of the built page that the server sends in place of the page embedded in the binary, set by `--ui-dir` / `SYNC_NODE_UI_DIR`. No UI dir, the embedded page. `just ui` builds the page from the `ui/` source directory into `ui/dist/`, which the binary embeds.
 _Avoid_: Static dir, assets
 
 ## Processes

@@ -29,6 +29,8 @@ n0-future = "0.3"
 notify = "8"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 rand = "0.10"
+# The web UI page in the binary (`ui::EmbeddedPage`).
+rust-embed = { version = "8", features = ["mime-guess"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

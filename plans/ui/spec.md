@@ -12,8 +12,8 @@ How the web UI works, agreed with the developer on 2026-10-21 (grilling session)
 
 * The server is part of `sync-node run` (ADR 0004). No other command starts it.
 * **Off by default.** It starts only when a UI address is given: `--ui-addr <addr:port>` / `SYNC_NODE_UI_ADDR`. Use a loopback address (`127.0.0.1:<port>`). On the Pi, reach it with `ssh -L <port>:localhost:<port> g@raspberrypi`.
-* **UI dir:** `--ui-dir <path>` / `SYNC_NODE_UI_DIR`; by default `ui/` next to the executable (the directory of `std::env::current_exe()`). The page is not embedded in the binary.
-* If the UI dir is missing or has no `index.html`, the API still works and `/` answers with a short text: `UI not found at <path>`.
+* **The page is embedded in the binary** (`ui::EmbeddedPage`, rust-embed, from `ui/dist/`). A release build embeds the files; a debug build reads `ui/dist/` from disk on each request. Built without `ui/dist/`, the binary has no page: the API still works and `/` answers `UI not embedded in this build`. Embedded files have an `ETag` (their SHA-256); a matching `If-None-Match` gets 304. Changed 2026-11-01; before, the page came only from a UI dir.
+* **UI dir:** `--ui-dir <path>` / `SYNC_NODE_UI_DIR` serves the page from that dir, not the embedded one. If the dir has no `index.html`, the API still works and `/` answers with a short text: `UI not found at <path>`.
 * `run` with a UI address works when the node is in no group yet. Then the user creates or joins a group from the page (§5). `Node::create_group` and `Node::join` already start the monitor on a running node; the folder watchers start on the monitor's next `Folders::check`.
 * If the server can't bind its address, `run` fails at start with the error. It doesn't run on without the UI.
 * **Stopping:** at Ctrl-C, `run` first sends the router's stop signal. Every WebSocket loop (§4 UI topics) sends a close frame and ends, so it drops its subscriptions and its hold on the node, and the topic timers stop. Then the server stops with graceful shutdown, and `run` shuts the node down. An open page never makes `run` hang or skip `Node::shutdown`. The page shows that it can't reach the node and connects again every 2 s.
@@ -127,7 +127,7 @@ One page: a sticky header (app icon and `sync-node`) and a rail on the left to m
 * `just ui`: `bun install` and `vite build` into `ui/dist/`.
 * `just ui-dev`: the Vite dev server, with a proxy from `/api` to a running `sync-node run --ui-addr …` (the proxy rewrites `Host`, `changeOrigin`; for the WebSocket, `ws: true` and `Origin` set to the node's UI address). The usual workflow in the dev container.
 * `just ui-check`: `tsc --noEmit`, the linter, and the ts-rs freshness check. `just check` stays Rust-only and needs no bun.
-* `just armv7`: runs `just ui` first, builds the node in Docker, and copies it to `~/sync-node` and `ui/dist/` to `~/ui/` on the Pi (`rsync --delete`, so old asset files go). `~/ui` is the default UI dir there: `run --ui-addr …` needs no `--ui-dir`. `Dockerfile.armv7` doesn't change.
+* `just armv7` and `just release`: run `just ui` first, so the binary embeds the current page. `Dockerfile.armv7` copies `ui/dist/` into the build. Only the binary goes to the Pi.
 * New Rust crates: `axum` (with the `ws` feature, which brings `tokio-tungstenite`), `serde_json`, `tower`, `tower-http`, `ts-rs` (dev only), `arc-swap` (already in the tree through `iroh-dns`). They can affect the armv7 build: the developer checks it.
 
 #### 8. Tests

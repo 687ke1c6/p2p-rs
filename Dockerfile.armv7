@@ -30,6 +30,9 @@ RUN mkdir -p crates/node/src \
     && cargo build --release --locked -p sync-node --target $TARGET \
     && rm -r crates/*/src
 
+# The web UI, embedded in the binary (`ui::EmbeddedPage`). `just armv7`
+# builds it on the host first; bun isn't in this image.
+COPY ui/dist ui/dist
 COPY crates crates
 # COPY keeps the files' original mtimes, which can be older than the stub
 # build, and cargo would then reuse the stub binary. Touch to force a rebuild.

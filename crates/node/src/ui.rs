@@ -1,5 +1,5 @@
-//! The web UI's server: a JSON API under `/api` and the built page from the UI
-//! dir. Part of `sync-node run` (ADR 0004); see `plans/ui/spec.md`.
+//! The web UI's server: a JSON API under `/api` and the built page, embedded
+//! in the binary or from a UI dir. Part of `sync-node run` (ADR 0004); see `plans/ui/spec.md`.
 //!
 //! The handlers take a [`UiBackend`], not a [`Node`], so the tests drive the
 //! router with a fake through `oneshot`: no node, no port.
@@ -112,20 +112,20 @@ pub struct UiConfig {
     /// The UI address. A request whose `Host` isn't this address (or
     /// `localhost` with its port, for a loopback address) is refused.
     pub addr: SocketAddr,
-    /// The built page.
-    pub ui_dir: PathBuf,
+    /// The built page from this dir, or `None` for the page embedded in the
+    /// binary ([`EmbeddedPage`]).
+    pub ui_dir: Option<PathBuf>,
     /// The node's config dir, for invites and the queues.
     pub config_dir: PathBuf,
 }
 
-impl UiConfig {
-    /// The `ui/` directory next to the executable.
-    pub fn default_ui_dir() -> std::io::Result<PathBuf> {
-        let exe = std::env::current_exe()?;
-        let dir = exe.parent().unwrap_or(&exe);
-        Ok(dir.join("ui"))
-    }
-}
+/// The built page (`just ui`), embedded in a release build. A debug build
+/// reads `ui/dist/` from disk on each request, so a new page needs no
+/// rebuild. Built without `ui/dist/`, the binary has no page.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../../ui/dist"]
+#[allow_missing = true]
+pub struct EmbeddedPage;
 
 #[derive(Clone)]
 struct AppState {
@@ -301,10 +301,16 @@ async fn socket_loop(mut socket: WebSocket, topics: Topics) {
     }
 }
 
-/// A file from the UI dir; any other path gets `index.html`, since the page
+/// A file of the page; any other path gets `index.html`, since the page
 /// routes in the browser.
 async fn page(State(state): State<AppState>, request: Request) -> Response {
-    let dir = &state.config.ui_dir;
+    match &state.config.ui_dir {
+        Some(dir) => dir_page(dir, request).await,
+        None => embedded_page(&request),
+    }
+}
+
+async fn dir_page(dir: &std::path::Path, request: Request) -> Response {
     let index = dir.join("index.html");
     if !index.is_file() {
         return (
@@ -318,6 +324,34 @@ async fn page(State(state): State<AppState>, request: Request) -> Response {
         Ok(response) => response.into_response(),
         Err(err) => match err {},
     }
+}
+
+/// Answers as [`dir_page`] does, from [`EmbeddedPage`], with an `ETag` from
+/// the file's hash.
+fn embedded_page(request: &Request) -> Response {
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let path = request.uri().path().trim_start_matches('/');
+    let Some(file) = EmbeddedPage::get(path).or_else(|| EmbeddedPage::get("index.html")) else {
+        return (StatusCode::NOT_FOUND, "UI not embedded in this build").into_response();
+    };
+    let etag = format!(
+        "\"{}\"",
+        data_encoding::HEXLOWER.encode(&file.metadata.sha256_hash())
+    );
+    let fresh = request
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .is_some_and(|tag| tag.as_bytes() == etag.as_bytes());
+    if fresh {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
+    }
+    let headers = [
+        (header::CONTENT_TYPE, file.metadata.mimetype().to_string()),
+        (header::ETAG, etag),
+    ];
+    (headers, file.data).into_response()
 }
 
 /// A non-2xx answer: `{ "error": "<text>" }`.

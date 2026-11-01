@@ -50,7 +50,8 @@ enum Command {
         /// auth: use a loopback address. No address, no web UI.
         #[arg(long, env = "SYNC_NODE_UI_ADDR")]
         ui_addr: Option<SocketAddr>,
-        /// The built web UI. Defaults to `ui/` next to the executable.
+        /// Serve the built web UI from this dir, not the page embedded in the
+        /// binary.
         #[arg(long, env = "SYNC_NODE_UI_DIR")]
         ui_dir: Option<PathBuf>,
     },
@@ -241,12 +242,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
             let (stop_ui, ui_stopped) = tokio::sync::oneshot::channel::<()>();
             let server = match listener {
                 Some((addr, listener)) => {
-                    let ui_dir = match ui_dir {
-                        Some(dir) => dir,
-                        None => ui::UiConfig::default_ui_dir()
-                            .context("finding the UI dir next to the executable")?,
-                    };
-                    tracing::info!("web UI at http://{addr}/ from {}", ui_dir.display());
+                    match &ui_dir {
+                        Some(dir) => {
+                            tracing::info!("web UI at http://{addr}/ from {}", dir.display())
+                        }
+                        None => tracing::info!("web UI at http://{addr}/"),
+                    }
                     let (app, topics) = ui::router(
                         node.clone(),
                         ui::UiConfig {

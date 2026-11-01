@@ -29,7 +29,7 @@ Handoff for the next session. Read this first, then [plan.md](plan.md) and [spec
 * Off by default; on only with `--ui-addr` / `SYNC_NODE_UI_ADDR`. Loopback in use.
 * Auth parked. Meanwhile: `Host` check and `Content-Type: application/json` on writes.
 * SolidJS, Tailwind v4, TypeScript, Vite, bun (devcontainer feature).
-* Not embedded: `just ui` builds `ui/dist/`; the server reads the UI dir, `ui/` next to the executable by default.
+* Not embedded: `just ui` builds `ui/dist/`; the server reads the UI dir, `ui/` next to the executable by default. **Changed 2026-11-01:** embedded (see Step 8 below).
 * axum; the page polls; live values only, no history.
 * ts-rs generates the TS types; `just ui-check` checks them. `just check` stays Rust-only.
 * Member add and folder add go through the existing queues: 202 `{ queued: true }` after validation. Join and create wait (60 s limit).
@@ -55,6 +55,8 @@ Handoff for the next session. Read this first, then [plan.md](plan.md) and [spec
 
 * **Step 8 (2026-10-22):** the developer reported the copy of `ui/dist` and `run --ui-addr` working on the Pi. The `armv7` recipe copied `ui/dist` to `~/dist` (not the default UI dir `~/ui`) and didn't build the UI first: fixed (`armv7: ui`, `rsync -avP --delete ui/dist/ g@raspberrypi:~/ui/`), not run. Spec marked as built; GLOSSARY: Snubbed, Stuck added, `transfers` in UI topic. **Open:** the developer runs the fixed `just armv7` and removes the old `~/dist` on the Pi if it's there. Step 7's `just stress` item is still open.
 
+* **Page embedded (2026-11-01):** `ui::EmbeddedPage` (rust-embed 8, `mime-guess`, `allow_missing`) from `ui/dist/`; `UiConfig::ui_dir` is now `Option`, `None` serves the embedded page; `default_ui_dir` removed. `build.rs` reruns on a change in `ui/dist/`, so a release build made before `just ui` picks the page up. `Dockerfile.armv7` copies `ui/dist/`. ADR 0004, spec §2 and §6, GLOSSARY (UI dir) changed. New test `embedded_page_and_index_fallback` (36 in `tests/ui.rs`). Checked: a release binary copied to a dir with no `ui/` serves `/`, `/folders` and the JS asset (`text/javascript`). **Open:** the developer checks the armv7 build (new crate `rust-embed`; `Dockerfile.armv7` changed) and removes `~/ui` on the Pi.
+
 * **Snapshots always published (2026-10-22, after step 8):** the developer wants the download loop unchanged by an observer. Now `Leeching::view` is an `ArcSwap<DownloadView>` (with `have` from the new `Picker::have_count`; the reader no longer borrows the `have` watch, which blocked `send_modify`), and `Uploads` publishes its rows every second from the choker's task into an `ArcSwap` (`Uploads` has named fields `state`, `published` now). Spec §4 has the design and the rejected one (the reader asks the loop). New direct dependency `arc-swap` 1 (1.9.2, already in the tree through `iroh-dns`; no new crate in `Cargo.lock`). The peer-wire test waits for the seeder's published rows (`eventually`). `just check` and `just ui-check` pass; checked with two `run` nodes. Plan step 7 "Done when" changed: `just stress` before and after step 7, no page. **Open:** that comparison (the developer makes the before checkout with `git worktree add`); the armv7 build (new direct dependency).
 
 ## Decisions 2026-10-22
@@ -66,7 +68,7 @@ Handoff for the next session. Read this first, then [plan.md](plan.md) and [spec
 ## Notes for step 5 and later
 
 * `run` holds the node in an `Arc` for the server. At Ctrl-C the server stops with graceful shutdown, then `Arc::try_unwrap` gets the node back for `shutdown`. A long request (the 60 s join of step 6) delays the stop; an open WebSocket would hang `run` or make it skip `Node::shutdown`, so step 5 adds a stop signal that ends every socket loop first (spec §2, Stopping).
-* With `cargo run`, the default UI dir is `target/debug/ui`. Use `--ui-dir ui/dist` or `just ui-dev`.
+* With `cargo run`, the debug build reads the page from `ui/dist/` (run `just ui` first), or use `just ui-dev` for hot reload.
 * A new API struct: derive `TS` as in `ui.rs` and add its `export_all` call to `export_api_types` (dependencies come with it).
 * `ui/src/api/` is generated only; hand-written API code goes in `ui/src/lib/api.ts`.
 * Views read with `live(topic, kind)` from `lib/socket.ts` and show errors with `LiveError`. A new read: a `Topic` variant and an `Update` variant in `ui/topics.rs`, a `read_*` function shared with its `GET` route, and `just ui-types`.
