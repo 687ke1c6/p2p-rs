@@ -38,6 +38,9 @@ use crate::folder::{Folders, Serving};
 use crate::index::{safe_path, Apply, FileMeta};
 use crate::picker::{Complete, Holds, Picker};
 use crate::pieces::{read_piece, read_staged, span, Staged};
+use crate::transfer_log::{
+    Direction, Logged, Subject, TransferLog, TransferOutcome, TransferRecord,
+};
 
 /// Largest message (any but a `Piece`'s bytes) accepted.
 pub const MAX_HEADER: u32 = 8 << 10;
@@ -294,6 +297,8 @@ pub struct PeerWireProtocol {
     /// This node's running downloads, to serve as a leecher.
     swarms: Swarms,
     uploads: Uploads,
+    /// Where uploads are logged, with the downloads.
+    log: TransferLog,
     /// The choker's rounds, stopped with the last clone.
     _rounds: Arc<AbortOnDropHandle<()>>,
     /// `--direct-only`: requests that arrive over a relay are rejected
@@ -327,6 +332,7 @@ impl PeerWireProtocol {
         Transfers {
             swarms: self.swarms.snapshot(),
             uploads: self.uploads.snapshot(),
+            log: self.log.snapshot(),
         }
     }
 
@@ -334,6 +340,7 @@ impl PeerWireProtocol {
         let uploads = Uploads::default();
         Self {
             swarms: folders.swarms(),
+            log: folders.transfer_log(),
             _rounds: Arc::new(uploads.run()),
             uploads,
             folders,
@@ -370,13 +377,23 @@ impl PeerWireProtocol {
             }
         };
         let (mut send, recv) = wire.split();
-        if let Err(err) = self.serve(remote, &conn, &handshake, &mut send, recv).await {
+        let mut logged = None;
+        let served = self
+            .serve(remote, &conn, &handshake, &mut send, recv, &mut logged)
+            .await;
+        if let Err(err) = &served {
             tracing::debug!(
                 "{}: swarm for {}: {err:#}",
                 remote.fmt_short(),
                 handshake.path
             );
             send.reset();
+        }
+        if let Some(logged) = logged {
+            logged.end(match served {
+                Ok(()) => TransferOutcome::Done,
+                Err(err) => TransferOutcome::Failed(format!("{err:#}")),
+            });
         }
     }
 
@@ -387,6 +404,7 @@ impl PeerWireProtocol {
         handshake: &Handshake,
         send: &mut WireSend,
         recv: WireRecv,
+        logged: &mut Option<Logged>,
     ) -> anyhow::Result<()> {
         let (folder, leeching) = match self.join(remote, handshake) {
             Ok(joined) => joined,
@@ -419,6 +437,19 @@ impl PeerWireProtocol {
         let mut choked = true;
         let mut verified: Option<Verified> = None;
         let mut served = folder.served.clone();
+        // The version's shape, for its log entry, started on its first
+        // block sent: a stream that sends nothing isn't logged.
+        let meta = match &leeching {
+            Some(leeching) => leeching.meta.clone(),
+            None => match folder.entries.get(&handshake.path) {
+                Some(entry) => (*entry).clone(),
+                None => anyhow::bail!("{} is gone", handshake.path),
+            },
+        };
+        let pieces = meta.pieces.len() as u32;
+        // The pieces the other end says it has.
+        let mut theirs = vec![false; pieces as usize];
+        let mut their_count: Option<u32> = None;
         loop {
             let want = upload.interested && *unchoked.borrow_and_update();
             if want == choked {
@@ -436,7 +467,12 @@ impl PeerWireProtocol {
                     continue;
                 }
                 // The folder was disabled: no longer in the swarm.
-                Err(_) = served.changed() => break,
+                Err(_) = served.changed() => {
+                    if let Some(logged) = logged.take() {
+                        logged.end(TransferOutcome::Stopped);
+                    }
+                    break;
+                }
                 msg = incoming.recv() => match msg {
                     Some(msg) => msg?.0,
                     None => break,
@@ -470,6 +506,22 @@ impl PeerWireProtocol {
                         Ok(data) => {
                             send.send_piece(block, data).await?;
                             upload.sent(block.length);
+                            let logged = logged.get_or_insert_with(|| {
+                                let logged = self.log.start(Subject {
+                                    direction: Direction::Upload,
+                                    folder: handshake.folder,
+                                    path: &handshake.path,
+                                    content: handshake.content,
+                                    size: meta.size,
+                                    piece_length: meta.piece_length,
+                                    pieces,
+                                });
+                                if let Some(count) = their_count {
+                                    logged.remote_have(count);
+                                }
+                                logged
+                            });
+                            logged.sent(remote, block.length);
                         }
                         Err(why) => {
                             tracing::debug!(
@@ -481,17 +533,28 @@ impl PeerWireProtocol {
                         }
                     }
                 }
-                // The other end's own pieces and choking matter to its
-                // server, on the stream it opened, not here. Requests are
-                // answered in order, so a cancel always comes too late.
-                Message::Bitfield(_)
-                | Message::HaveAll
-                | Message::HaveNone
-                | Message::Have(_)
-                | Message::Choke
-                | Message::Unchoke
-                | Message::Cancel(_)
-                | Message::Reject(..) => {}
+                // The other end's pieces, for the log: its progress.
+                Message::Bitfield(_) | Message::HaveAll | Message::HaveNone | Message::Have(_) => {
+                    match (&msg, holds(&msg, pieces)) {
+                        (_, Some(Holds::All)) => theirs.fill(true),
+                        (_, Some(Holds::These(have))) => theirs = have,
+                        (Message::Have(piece), None) => {
+                            if let Some(slot) = theirs.get_mut(*piece as usize) {
+                                *slot = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    let count = theirs.iter().filter(|h| **h).count() as u32;
+                    their_count = Some(count);
+                    if let Some(logged) = logged {
+                        logged.remote_have(count);
+                    }
+                }
+                // Its choking matters to its server, on the stream it
+                // opened, not here. Requests are answered in order, so a
+                // cancel always comes too late.
+                Message::Choke | Message::Unchoke | Message::Cancel(_) | Message::Reject(..) => {}
                 Message::Refused(_) | Message::Piece(_) => {
                     anyhow::bail!("unexpected {msg:?}")
                 }
@@ -821,6 +884,8 @@ pub struct Transfers {
     pub swarms: Vec<SwarmSnapshot>,
     /// Each peer with swarm streams to this node's server, by ID.
     pub uploads: Vec<UploadSnapshot>,
+    /// The last downloads and uploads, running and ended, newest first.
+    pub log: Vec<TransferRecord>,
 }
 
 /// One running download.
@@ -842,6 +907,8 @@ pub struct SwarmSnapshot {
     /// it. With no peer in the swarm for [`GIVE_UP`], the download stops,
     /// for a later try.
     pub stuck: bool,
+    /// Its entry in [`Transfers::log`].
+    pub log_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -920,6 +987,8 @@ struct Leeching {
     /// The download's peers and picker, as last published: the download
     /// stores it, readers load it, and neither waits for the other.
     view: ArcSwap<DownloadView>,
+    /// Its entry in the transfer log.
+    log_id: u64,
 }
 
 /// What a download publishes for [`Swarms::snapshot`] every
@@ -981,6 +1050,7 @@ impl Swarms {
                     active: view.active,
                     peers: view.peers.clone(),
                     stuck: view.stuck,
+                    log_id: leeching.log_id,
                 }
             })
             .collect();
@@ -1081,6 +1151,8 @@ pub struct Client {
     fetched: Arc<Mutex<HashMap<EndpointId, u64>>>,
     /// The downloads running, for the server.
     swarms: Swarms,
+    /// Downloads and uploads, running and ended.
+    log: TransferLog,
 }
 
 /// One node a download asks.
@@ -1124,7 +1196,14 @@ impl Client {
             conns: Arc::default(),
             fetched: Arc::default(),
             swarms: Swarms::default(),
+            log: TransferLog::default(),
         }
+    }
+
+    /// The log of downloads and uploads, which the server adds its uploads
+    /// to.
+    pub(crate) fn log(&self) -> TransferLog {
+        self.log.clone()
     }
 
     /// The downloads running, which the server serves from as a leecher.
@@ -1164,21 +1243,52 @@ impl Client {
     ///
     /// Returns whether the file is complete (and synced to disk); if not,
     /// the staging file keeps the pieces that arrived, for a later try.
+    /// Each call is one entry in the transfer log.
     pub async fn download(
         &self,
         folder: NamespaceId,
         path: &str,
         meta: &FileMeta,
-        mut staged: Staged,
+        staged: Staged,
         peers: impl Fn() -> Vec<EndpointId>,
     ) -> anyhow::Result<bool> {
         let content = meta.content.context("fetching a tombstone")?;
+        let logged = self.log.start(Subject {
+            direction: Direction::Download,
+            folder,
+            path,
+            content,
+            size: meta.size,
+            piece_length: meta.piece_length,
+            pieces: meta.pieces.len() as u32,
+        });
         let handshake = Handshake {
             folder,
             path: path.to_string(),
             content,
         };
+        let result = self
+            .run_download(handshake, meta, staged, peers, &logged)
+            .await;
+        logged.end(match &result {
+            Ok(true) => TransferOutcome::Done,
+            Ok(false) => TransferOutcome::GaveUp,
+            Err(err) => TransferOutcome::Failed(format!("{err:#}")),
+        });
+        result
+    }
+
+    async fn run_download(
+        &self,
+        handshake: Handshake,
+        meta: &FileMeta,
+        mut staged: Staged,
+        peers: impl Fn() -> Vec<EndpointId>,
+        logged: &Logged,
+    ) -> anyhow::Result<bool> {
+        let path = handshake.path.as_str();
         let mut picker = Picker::new(meta.piece_length, meta.size, staged.missing.drain(..));
+        logged.held(&picker.have());
         // In the swarm as a leecher from the start: the server serves the
         // pieces verified so far, and those to come.
         let (have, _) = watch::channel(picker.have());
@@ -1192,6 +1302,7 @@ impl Client {
                 have: have.clone(),
                 lost,
                 view: ArcSwap::default(),
+                log_id: logged.id(),
             },
         );
         let (events, mut received) = mpsc::unbounded_channel::<(usize, u64, Event)>();
@@ -1263,7 +1374,7 @@ impl Client {
                             self.joined(i, joined, &mut remotes, &mut picker, &mut ids, &events, &mut tasks).await;
                         }
                         Event::Received(Ok(Some((msg, data)))) => {
-                            self.on_message(i, msg, &data, &mut remotes, &mut picker, &ids, meta, &staged, &have, path).await?;
+                            self.on_message(i, msg, &data, &mut remotes, &mut picker, &ids, meta, &staged, &have, path, logged).await?;
                         }
                         Event::Received(ended) => {
                             if let Err(err) = ended {
@@ -1415,6 +1526,7 @@ impl Client {
         staged: &Staged,
         have: &watch::Sender<Vec<bool>>,
         path: &str,
+        logged: &Logged,
     ) -> anyhow::Result<()> {
         let id = remotes[i].id;
         let State::In {
@@ -1461,8 +1573,10 @@ impl Client {
                     }
                 }
                 if let Some(complete) = got.complete {
-                    self.check(complete, remotes, picker, ids, meta, staged, have, path)
-                        .await?;
+                    self.check(
+                        complete, remotes, picker, ids, meta, staged, have, path, logged,
+                    )
+                    .await?;
                 }
             }
             Message::Reject(block, why) => {
@@ -1506,6 +1620,7 @@ impl Client {
         staged: &Staged,
         have: &watch::Sender<Vec<bool>>,
         path: &str,
+        logged: &Logged,
     ) -> anyhow::Result<()> {
         let Complete {
             piece,
@@ -1526,13 +1641,26 @@ impl Client {
         if written {
             picker.verified(piece);
             have.send_modify(|have| have[piece as usize] = true);
+            // Each server learns this node's progress, for its log. A send
+            // that fails is noticed by the stream's reader.
+            for remote in remotes.iter_mut() {
+                if let State::In { send, .. } = &mut remote.state {
+                    let _ = send.send(&Message::Have(piece)).await;
+                }
+            }
+            let senders: Vec<(EndpointId, u32)> = senders
+                .iter()
+                .map(|(peer, bytes)| (ids[*peer], *bytes))
+                .collect();
+            logged.verified(piece, &senders);
             let mut fetched = self.fetched.lock().unwrap();
-            for (peer, bytes) in senders {
-                *fetched.entry(ids[peer]).or_default() += u64::from(bytes);
+            for (id, bytes) in senders {
+                *fetched.entry(id).or_default() += u64::from(bytes);
             }
             return Ok(());
         }
         picker.failed(piece);
+        logged.bad_piece();
         for (peer, _) in senders {
             let bad = remotes
                 .iter_mut()

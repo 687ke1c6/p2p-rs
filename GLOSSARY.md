@@ -20,6 +20,10 @@ _Avoid_: User, participant
 A member's signed statement that a node is no longer in the group. It always wins: the removed ID can't come back. Members whose chain goes through the removed node are no longer members either, unless another member adds them again (ADR 0006).
 _Avoid_: Revocation, ban, kick
 
+**Presence**:
+A member's signed message, sent at intervals, saying it is online and how it reaches each member it is connected to. From these, every node sees who is online and how each pair is connected.
+_Avoid_: Heartbeat, ping
+
 **Group name**:
 The group's display name, set by any member, the same on every node. Cosmetic: the group ID identifies the group.
 
@@ -29,15 +33,16 @@ The group's display name, set by any member, the same on every node. Cosmetic: t
 A directory kept in sync across the nodes that keep it, known in the group by its name.
 _Avoid_: Share, repo, sync root
 
-**Document/doc**
-The iroh-doc document that is replicated across the group
+**Document**:
+The complete set of a folder's entries, from every node, replicated across the nodes that keep the folder.
+_Avoid_: Doc (alone: it also means the iroh-doc that carries it now, ADR 0003), index
 
 **Disabled folder**:
 A folder turned off on one node (`folder disable`): not watched or indexed, fetches nothing and serves nothing, while its doc still syncs and its entries stay. Enabled again, it catches up as a node coming back online does: its first scan writes what changed meanwhile, deletes included.
 _Avoid_: Paused (that's a folder whose root or marker is missing), muted, unmapped
 
 **Entry**:
-One members description of one path in a folder: its content, size, modification time and version, stored in the 'folder' iroh-doc document
+One node's description of one path in a folder: its content, size, modification time and version. Part of the folder's document. Only the node that wrote it changes it.
 _Avoid_: Record (that's membership), file info
 
 **Tombstone**:

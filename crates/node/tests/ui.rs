@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
@@ -26,6 +26,9 @@ use sync_node::peers::{ConnSnapshot, LinkKind, PeerSnapshot, Traffic};
 use sync_node::presence::LinkState;
 use sync_node::record::GroupId;
 use sync_node::status::{Link, MemberStatus, RemovedStatus};
+use sync_node::transfer_log::{
+    Direction, PeerShare, TransferOutcome, TransferRecord, SOURCE_MISSING,
+};
 use sync_node::ui::topics::{ClientMessage, Topics};
 use sync_node::ui::{self, BoxFuture, UiBackend, UiConfig};
 use sync_node::view::{Candidate, FolderView, NodeState, Outcome, PathView};
@@ -663,46 +666,61 @@ async fn folder_view_404s() {
 // ticks come when every task waits.
 
 /// This node downloads `big.bin` of `photos` from `other`, with `third`
-/// banned, and an older version from a folder it no longer keeps; it
-/// uploads to both.
+/// banned; it uploaded the same version to `third`; and a download from a
+/// folder it no longer keeps failed. It uploads to both now.
 fn transfers(other: EndpointId, third: EndpointId) -> Transfers {
-    let swarm = |folder: NamespaceId, path: &str, peers: Vec<SwarmPeer>| SwarmSnapshot {
+    let at = |ms: u64| UNIX_EPOCH + Duration::from_millis(ms);
+    let record = |id: u64, direction: Direction, folder: NamespaceId, path: &str| TransferRecord {
+        id,
+        direction,
         folder,
         path: path.to_string(),
         content: Hash::new(b"big"),
         size: 10 << 20,
         piece_length: 1 << 20,
         pieces: 10,
-        have: 4,
-        active: 2,
-        stuck: peers.is_empty(),
-        peers,
+        started: at(1_000),
+        ended: None,
+        outcome: None,
+        peers: vec![],
+        sources: vec![],
+        bad_pieces: 0,
+        remote_have: None,
+        rate: 0.0,
     };
+    let photos = NamespaceId::from(&[2u8; 32]);
+    let mut sources = vec![0; 4];
+    sources.resize(10, SOURCE_MISSING);
     Transfers {
-        swarms: vec![
-            swarm(
-                NamespaceId::from(&[2u8; 32]),
-                "big.bin",
-                vec![
-                    SwarmPeer {
-                        id: other,
-                        state: SwarmPeerState::In(InSwarm {
-                            unchoked: true,
-                            interested: true,
-                            rate: 1500.7,
-                            open: 12,
-                            snubbed: false,
-                            pieces: 10,
-                        }),
-                    },
-                    SwarmPeer {
-                        id: third,
-                        state: SwarmPeerState::Banned,
-                    },
-                ],
-            ),
-            swarm(NamespaceId::from(&[3u8; 32]), "old.bin", vec![]),
-        ],
+        swarms: vec![SwarmSnapshot {
+            folder: photos,
+            path: "big.bin".to_string(),
+            content: Hash::new(b"big"),
+            size: 10 << 20,
+            piece_length: 1 << 20,
+            pieces: 10,
+            have: 4,
+            active: 2,
+            stuck: false,
+            peers: vec![
+                SwarmPeer {
+                    id: other,
+                    state: SwarmPeerState::In(InSwarm {
+                        unchoked: true,
+                        interested: true,
+                        rate: 1500.7,
+                        open: 12,
+                        snubbed: false,
+                        pieces: 10,
+                    }),
+                },
+                SwarmPeer {
+                    id: third,
+                    state: SwarmPeerState::Banned,
+                },
+            ],
+            log_id: 2,
+        }],
         uploads: vec![
             UploadSnapshot {
                 id: other,
@@ -719,6 +737,40 @@ fn transfers(other: EndpointId, third: EndpointId) -> Transfers {
                 unchoked: true,
                 optimistic: true,
                 rate: 0.0,
+            },
+        ],
+        log: vec![
+            TransferRecord {
+                peers: vec![PeerShare {
+                    id: other,
+                    bytes: 4 << 20,
+                    pieces: 4,
+                }],
+                sources,
+                bad_pieces: 1,
+                ..record(2, Direction::Download, photos, "big.bin")
+            },
+            TransferRecord {
+                ended: Some(at(3_000)),
+                outcome: Some(TransferOutcome::Done),
+                peers: vec![PeerShare {
+                    id: third,
+                    bytes: 1024,
+                    pieces: 0,
+                }],
+                remote_have: Some(10),
+                ..record(1, Direction::Upload, photos, "big.bin")
+            },
+            TransferRecord {
+                ended: Some(at(2_000)),
+                outcome: Some(TransferOutcome::Failed("boom".to_string())),
+                sources: vec![SOURCE_MISSING; 10],
+                ..record(
+                    0,
+                    Direction::Download,
+                    NamespaceId::from(&[3u8; 32]),
+                    "old.bin",
+                )
             },
         ],
     }
@@ -742,8 +794,10 @@ async fn transfers_route() {
     assert_eq!(
         body,
         json!({
-            "swarms": [
+            "transfers": [
                 {
+                    "id": 2,
+                    "direction": "Download",
                     "folder_id": NamespaceId::from(&[2u8; 32]).to_string(),
                     "folder": "photos",
                     "path": "big.bin",
@@ -751,27 +805,62 @@ async fn transfers_route() {
                     "size": 10 << 20,
                     "piece_length": 1 << 20,
                     "pieces": 10,
+                    "started_ms": 1_000,
+                    "ended_ms": null,
+                    "state": "Running",
+                    "error": null,
+                    "bytes": 4 << 20,
+                    "rate": 1500,
+                    "peers": [{ "id": other, "label": other_short, "bytes": 4 << 20, "pieces": 4 }],
                     "have": 4,
-                    "active": 2,
-                    "peers": [
-                        {
-                            "id": other,
-                            "label": other_short,
-                            "state": "In",
-                            "in_swarm": {
-                                "unchoked": true,
-                                "interested": true,
-                                "rate": 1500,
-                                "open": 12,
-                                "snubbed": false,
-                                "pieces": 10,
+                    "bad_pieces": 1,
+                    "remote_have": null,
+                    "swarm": {
+                        "active": 2,
+                        "peers": [
+                            {
+                                "id": other,
+                                "label": other_short,
+                                "state": "In",
+                                "in_swarm": {
+                                    "unchoked": true,
+                                    "interested": true,
+                                    "rate": 1500,
+                                    "open": 12,
+                                    "snubbed": false,
+                                    "pieces": 10,
+                                },
                             },
-                        },
-                        { "id": third, "label": third_short, "state": "Banned", "in_swarm": null },
-                    ],
-                    "stuck": false,
+                            { "id": third, "label": third_short, "state": "Banned", "in_swarm": null },
+                        ],
+                        "stuck": false,
+                    },
                 },
                 {
+                    "id": 1,
+                    "direction": "Upload",
+                    "folder_id": NamespaceId::from(&[2u8; 32]).to_string(),
+                    "folder": "photos",
+                    "path": "big.bin",
+                    "content": content,
+                    "size": 10 << 20,
+                    "piece_length": 1 << 20,
+                    "pieces": 10,
+                    "started_ms": 1_000,
+                    "ended_ms": 3_000,
+                    "state": "Done",
+                    "error": null,
+                    "bytes": 1024,
+                    "rate": 0,
+                    "peers": [{ "id": third, "label": third_short, "bytes": 1024, "pieces": 0 }],
+                    "have": null,
+                    "bad_pieces": 0,
+                    "remote_have": 10,
+                    "swarm": null,
+                },
+                {
+                    "id": 0,
+                    "direction": "Download",
                     "folder_id": gone,
                     "folder": gone,
                     "path": "old.bin",
@@ -779,10 +868,17 @@ async fn transfers_route() {
                     "size": 10 << 20,
                     "piece_length": 1 << 20,
                     "pieces": 10,
-                    "have": 4,
-                    "active": 2,
+                    "started_ms": 1_000,
+                    "ended_ms": 2_000,
+                    "state": "Failed",
+                    "error": "boom",
+                    "bytes": 0,
+                    "rate": 0,
                     "peers": [],
-                    "stuck": true,
+                    "have": 0,
+                    "bad_pieces": 0,
+                    "remote_have": null,
+                    "swarm": null,
                 },
             ],
             "uploads": [
@@ -814,7 +910,7 @@ async fn transfers_with_none_running() {
     let dir = tempfile::tempdir().unwrap();
     let (code, body) = send_json(no_group(dir.path()), get("/api/transfers")).await;
     assert_eq!(code, StatusCode::OK);
-    assert_eq!(body, json!({ "swarms": [], "uploads": [] }));
+    assert_eq!(body, json!({ "transfers": [], "uploads": [] }));
 }
 
 const TICK: Duration = sync_node::ui::topics::TOPIC_INTERVAL;
@@ -961,12 +1057,12 @@ async fn transfers_topic() {
         parse(&sub.next().await.unwrap()),
         json!({
             "topic": "transfers",
-            "update": { "kind": "Transfers", "data": { "swarms": [], "uploads": [] } },
+            "update": { "kind": "Transfers", "data": { "transfers": [], "uploads": [] } },
         })
     );
     *fake.transfers.lock().unwrap() = transfers(other, third);
     let changed = parse(&sub.next().await.unwrap());
-    assert_eq!(changed["update"]["data"]["swarms"][0]["have"], 4);
+    assert_eq!(changed["update"]["data"]["transfers"][0]["have"], 4);
     assert_eq!(changed["update"]["data"]["uploads"][1]["optimistic"], true);
 }
 

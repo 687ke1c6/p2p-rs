@@ -1290,6 +1290,11 @@ impl Folders {
         self.0.client.swarms()
     }
 
+    /// The peer wire's log of downloads and uploads.
+    pub(crate) fn transfer_log(&self) -> crate::transfer_log::TransferLog {
+        self.0.client.log()
+    }
+
     /// Whether `id` is a member (see [`View::may_be_member`]).
     pub(crate) fn is_member(&self, id: EndpointId) -> bool {
         self.0.view.may_be_member(id)

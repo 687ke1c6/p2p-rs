@@ -14,3 +14,11 @@ export function bytes(n: number): string {
 export function secondsSince(unix: number): number {
   return Math.max(0, Math.round(Date.now() / 1000 - unix));
 }
+
+/** A span of seconds, coarse: `42 s`, `3 m 5 s`, `2 h 10 m`. */
+export function duration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} m ${s % 60} s`;
+  return `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} m`;
+}

@@ -40,6 +40,7 @@ use crate::peers::{ConnSnapshot, LinkKind, PeerSnapshot, Traffic};
 use crate::presence::LinkState;
 use crate::record::GroupId;
 use crate::status::{Link, MemberStatus, Status};
+use crate::transfer_log::{unix_ms, Direction, TransferOutcome, TransferRecord, SOURCE_MISSING};
 use crate::view::{NodeState, Outcome, PathView};
 use topics::{ClientMessage, Topics, TOPIC_INTERVAL};
 
@@ -756,20 +757,25 @@ impl PathInfo {
     }
 }
 
-/// `GET /api/transfers`: what this node downloads and uploads now.
+/// `GET /api/transfers`: what this node downloads and uploads, now and
+/// lately.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct TransfersAnswer {
-    /// The downloads running, by folder and path.
-    pub swarms: Vec<SwarmInfo>,
-    /// Each peer with swarm streams to this node, by ID.
+    /// The last downloads and uploads (up to 500 ended ones), running and
+    /// ended, newest first.
+    pub transfers: Vec<TransferInfo>,
+    /// Each peer with swarm streams to this node, by ID: the choker's view.
     pub uploads: Vec<UploadInfo>,
 }
 
-/// One running download: a swarm for one version of one file.
+/// One download attempt of a version of a file, or one upload of it to one
+/// peer.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-pub struct SwarmInfo {
+pub struct TransferInfo {
+    pub id: u64,
+    pub direction: TransferDirection,
     /// The folder's doc.
     pub folder_id: String,
     /// The folder's name, or its doc ID if this node no longer keeps it.
@@ -780,8 +786,65 @@ pub struct SwarmInfo {
     pub size: u64,
     pub piece_length: u32,
     pub pieces: u32,
-    /// Verified, in the staging file.
-    pub have: u32,
+    /// Unix milliseconds.
+    pub started_ms: u64,
+    pub ended_ms: Option<u64>,
+    pub state: TransferState,
+    /// Why it failed.
+    pub error: Option<String>,
+    /// Bytes moved: verified pieces (a download), blocks sent (an upload).
+    pub bytes: u64,
+    /// Bytes per second now, while it runs.
+    pub rate: u64,
+    /// A download: the peers that sent pieces. An upload: the one peer.
+    pub peers: Vec<TransferPeerInfo>,
+    /// A download: pieces this node has, from this or an earlier attempt.
+    pub have: Option<u32>,
+    /// A download: pieces that didn't match their hash.
+    pub bad_pieces: u32,
+    /// An upload: pieces the peer has, as it last said.
+    pub remote_have: Option<u32>,
+    /// A running download: its swarm.
+    pub swarm: Option<SwarmInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub enum TransferDirection {
+    Download,
+    Upload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub enum TransferState {
+    Running,
+    /// A download: complete. An upload: the peer's download ended.
+    Done,
+    /// A download: no peer for 30 s; tried again later.
+    GaveUp,
+    Failed,
+    /// Stopped by this node: a newer version, the folder disabled or
+    /// removed, or the node stopping.
+    Stopped,
+}
+
+/// What one peer sent (a download) or got (an upload).
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct TransferPeerInfo {
+    pub id: String,
+    /// Its name, or its short ID.
+    pub label: String,
+    pub bytes: u64,
+    /// A download: pieces it sent all of.
+    pub pieces: u32,
+}
+
+/// A running download's swarm.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct SwarmInfo {
     /// Started but not verified yet.
     pub active: u32,
     /// Every node the download asks, in the swarm or not.
@@ -852,16 +915,8 @@ pub struct UploadInfo {
 }
 
 impl SwarmInfo {
-    fn new(swarm: &SwarmSnapshot, folder: String, backend: &dyn UiBackend) -> Self {
+    fn new(swarm: &SwarmSnapshot, backend: &dyn UiBackend) -> Self {
         Self {
-            folder_id: swarm.folder.to_string(),
-            folder,
-            path: swarm.path.clone(),
-            content: swarm.content.to_string(),
-            size: swarm.size,
-            piece_length: swarm.piece_length,
-            pieces: swarm.pieces,
-            have: swarm.have,
             active: swarm.active,
             peers: swarm
                 .peers
@@ -892,6 +947,77 @@ impl SwarmInfo {
                 })
                 .collect(),
             stuck: swarm.stuck,
+        }
+    }
+}
+
+impl TransferInfo {
+    fn new(
+        record: &TransferRecord,
+        folder: String,
+        swarm: Option<&SwarmSnapshot>,
+        backend: &dyn UiBackend,
+    ) -> Self {
+        let (state, error) = match &record.outcome {
+            None => (TransferState::Running, None),
+            Some(TransferOutcome::Done) => (TransferState::Done, None),
+            Some(TransferOutcome::GaveUp) => (TransferState::GaveUp, None),
+            Some(TransferOutcome::Failed(why)) => (TransferState::Failed, Some(why.clone())),
+            Some(TransferOutcome::Stopped) => (TransferState::Stopped, None),
+        };
+        // Only a running download has a swarm.
+        let swarm = swarm.filter(|_| record.outcome.is_none());
+        let rate = match (record.direction, swarm) {
+            (Direction::Download, Some(swarm)) => swarm
+                .peers
+                .iter()
+                .map(|p| match &p.state {
+                    SwarmPeerState::In(s) => s.rate,
+                    _ => 0.0,
+                })
+                .sum(),
+            _ => record.rate,
+        };
+        let download = record.direction == Direction::Download;
+        Self {
+            id: record.id,
+            direction: match record.direction {
+                Direction::Download => TransferDirection::Download,
+                Direction::Upload => TransferDirection::Upload,
+            },
+            folder_id: record.folder.to_string(),
+            folder,
+            path: record.path.clone(),
+            content: record.content.to_string(),
+            size: record.size,
+            piece_length: record.piece_length,
+            pieces: record.pieces,
+            started_ms: unix_ms(record.started),
+            ended_ms: record.ended.map(unix_ms),
+            state,
+            error,
+            bytes: record.bytes(),
+            rate: rate as u64,
+            peers: record
+                .peers
+                .iter()
+                .map(|p| TransferPeerInfo {
+                    id: p.id.to_string(),
+                    label: backend.label(p.id),
+                    bytes: p.bytes,
+                    pieces: p.pieces,
+                })
+                .collect(),
+            have: download.then(|| {
+                record
+                    .sources
+                    .iter()
+                    .filter(|s| **s != SOURCE_MISSING)
+                    .count() as u32
+            }),
+            bad_pieces: record.bad_pieces,
+            remote_have: record.remote_have,
+            swarm: swarm.map(|s| SwarmInfo::new(s, backend)),
         }
     }
 }
@@ -949,16 +1075,19 @@ fn read_transfers(backend: &dyn UiBackend) -> TransfersAnswer {
         .into_iter()
         .map(|f| (f.config.id, f.config.name))
         .collect();
+    let swarms: HashMap<u64, &SwarmSnapshot> =
+        transfers.swarms.iter().map(|s| (s.log_id, s)).collect();
     TransfersAnswer {
-        swarms: transfers
-            .swarms
+        transfers: transfers
+            .log
             .iter()
-            .map(|swarm| {
+            .map(|record| {
                 let folder = names
-                    .get(&swarm.folder)
+                    .get(&record.folder)
                     .cloned()
-                    .unwrap_or_else(|| swarm.folder.to_string());
-                SwarmInfo::new(swarm, folder, backend)
+                    .unwrap_or_else(|| record.folder.to_string());
+                let swarm = swarms.get(&record.id).copied();
+                TransferInfo::new(record, folder, swarm, backend)
             })
             .collect(),
         uploads: transfers

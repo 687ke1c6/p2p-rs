@@ -20,6 +20,7 @@ pub mod pieces;
 pub mod presence;
 pub mod record;
 pub mod status;
+pub mod transfer_log;
 pub mod ui;
 pub mod view;
 

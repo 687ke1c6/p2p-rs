@@ -20,6 +20,7 @@ use sync_node::peer_wire::{
 };
 use sync_node::picker::Holds;
 use sync_node::pieces::{staging_path, MIN_PIECE_LENGTH};
+use sync_node::transfer_log::Direction;
 use sync_node::{Config, Network, Node};
 
 const INTERVAL: Duration = Duration::from_millis(200);
@@ -460,6 +461,29 @@ async fn a_leecher_serves_from_its_staging_file() {
             .any(|u| u.id == b.id() && u.unchoked && u.interested)
     })
     .await;
+    // Each side logs it: a's upload to b, which says what it has, and b's
+    // download, with each piece's source.
+    eventually("a to log its upload to b", || async {
+        a.transfers().log.iter().any(|t| {
+            t.direction == Direction::Upload
+                && t.path == "big.bin"
+                && t.outcome.is_none()
+                && t.peers
+                    .first()
+                    .is_some_and(|p| p.id == b.id() && p.bytes > 0)
+                && t.remote_have.is_some_and(|n| n > 0)
+        })
+    })
+    .await;
+    let log = b.transfers().log;
+    let download = log
+        .iter()
+        .find(|t| t.direction == Direction::Download && t.path == "big.bin")
+        .unwrap();
+    assert_eq!(download.outcome, None);
+    assert_eq!(download.peers[0].id, a.id());
+    assert!(download.peers[0].bytes > 0 && download.peers[0].pieces > 0);
+    assert!(download.sources.contains(&0));
     let a_id = a.id();
     a.shutdown().await.unwrap();
 
@@ -491,6 +515,13 @@ async fn a_leecher_serves_from_its_staging_file() {
     let mut wire = unchoked_by(&conn, &swarm).await;
     let got = ask_piece(&mut wire, &meta, good).await;
     assert_eq!(Hash::new(&got), meta.pieces[good as usize]);
+    // b logs it as an upload to c, as a leecher.
+    assert!(b.transfers().log.iter().any(|t| {
+        t.direction == Direction::Upload
+            && t.peers
+                .first()
+                .is_some_and(|p| p.id == c.id() && p.bytes == got.len() as u64)
+    }));
 
     // A piece that no longer matches in the staging file is rejected.
     let staging = staging_path(&rb, "big.bin", hash);

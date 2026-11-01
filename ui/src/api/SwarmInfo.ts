@@ -2,25 +2,9 @@
 import type { SwarmPeerInfo } from "./SwarmPeerInfo";
 
 /**
- * One running download: a swarm for one version of one file.
+ * A running download's swarm.
  */
 export type SwarmInfo = { 
-/**
- * The folder's doc.
- */
-folder_id: string, 
-/**
- * The folder's name, or its doc ID if this node no longer keeps it.
- */
-folder: string, path: string, 
-/**
- * The version's content hash.
- */
-content: string, size: number, piece_length: number, pieces: number, 
-/**
- * Verified, in the staging file.
- */
-have: number, 
 /**
  * Started but not verified yet.
  */

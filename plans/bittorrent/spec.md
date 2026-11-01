@@ -11,7 +11,7 @@ How file contents move between nodes, as built in BitTorrent plan steps 1–7 (2
 #### 2. Connections and streams
 
 * ALPN `/sync-node/peer-wire/0`. Gated (members only) and tracked like every other ALPN.
-* One connection per pair of nodes (the downloader's connection cache, dialled when not there; `CONNECT_TIMEOUT` 10 s). One bidirectional stream per swarm **per downloader**: when both nodes download a file, each opens its own stream to the other. On a stream, pieces and `Have`s go from the server to the downloader only.
+* One connection per pair of nodes (the downloader's connection cache, dialled when not there; `CONNECT_TIMEOUT` 10 s). One bidirectional stream per swarm **per downloader**: when both nodes download a file, each opens its own stream to the other. On a stream, pieces go from the server to the downloader only. `Have`s go both ways: the downloader's tell the server its progress (for the transfer log) and change nothing else.
 * Framing: a little-endian `u32` length, then a postcard body of at most 8 KiB (`MAX_HEADER`). A `Piece` message is followed by exactly its block's bytes (at most 128 KiB, `MAX_BLOCK_LENGTH`).
 * A message that doesn't parse, an oversized one, or one that breaks the protocol resets that stream (code 400, `BAD_REQUEST`), never the connection.
 

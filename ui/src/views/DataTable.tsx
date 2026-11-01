@@ -7,6 +7,7 @@ import {
   createPaginatedRowModel,
   createSortedRowModel,
   createTable,
+  type Cell,
   filterFn_includesString,
   globalFilteringFeature,
   metaHelper,
@@ -56,6 +57,33 @@ export type Features = typeof features;
 
 /** Denser rows than the table's own, for tables in cards. */
 export const dense = "[&_td]:py-1 [&_th]:h-8";
+
+/**
+ * A cell's context, with `getValue` reading its row as it is now. The table
+ * caches a row's values, and keeps the row while only its fields change (the
+ * data is a reconciled store), so its own `getValue` would keep the first.
+ */
+function liveContext<T extends RowData>(cell: Cell<Features, T, unknown>) {
+  const context = cell.getContext();
+  const value = () => cell.column.accessorFn?.(cell.row.original, cell.row.index);
+  return {
+    ...context,
+    getValue: value as typeof context.getValue,
+    renderValue: value as typeof context.renderValue,
+  };
+}
+
+/**
+ * A cell's content. Called in the JSX, which tracks it, rather than as a
+ * component (Solid runs those untracked): a cell that computes from its row
+ * in its body, such as `bytes(info.getValue())`, renders again when the row
+ * changes. One that only passes the row on as JSX props doesn't, so what it
+ * holds (an open popover) stays.
+ */
+function renderCell<T extends RowData>(cell: Cell<Features, T, unknown>): JSX.Element {
+  const template = cell.column.columnDef.cell;
+  return typeof template === "function" ? template(liveContext(cell)) : template;
+}
 
 /** The column helper for rows of `T`. */
 export const columnsOf = <T extends RowData>() => createColumnHelper<Features, T>();
@@ -174,7 +202,7 @@ export function DataTable<T extends RowData>(props: {
                 <For each={row.getAllCells()}>
                   {(cell) => (
                     <TableCell class={cell.column.columnDef.meta?.class}>
-                      <table.FlexRender cell={cell} />
+                      {renderCell(cell)}
                     </TableCell>
                   )}
                 </For>
