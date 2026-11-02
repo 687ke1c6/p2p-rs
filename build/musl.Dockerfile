@@ -6,7 +6,7 @@
 #       --build-arg TARGET=aarch64-unknown-linux-musl .
 #
 # cargo-zigbuild links with zig, which is also the C cross compiler for ring,
-# so one image builds every architecture. build/publish.sh has the targets.
+# so one image builds every architecture. build/dist.sh has the targets.
 # The build context is the repo root.
 # The final stage is `scratch` holding only the binary: it exists to be
 # exported with `docker build --output`, not run.

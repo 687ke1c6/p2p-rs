@@ -2,7 +2,7 @@ target/
 .git/
 .devcontainer/
 .claude/
-# Secrets for build/publish.sh; no image needs them.
+# Secrets for build/dist.sh; no image needs them.
 .env
 docs/
 plans/

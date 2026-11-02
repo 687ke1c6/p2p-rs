@@ -8,7 +8,7 @@
 #       --build-arg LINKER=aarch64-linux-gnu-gcc .
 #
 # With no PACKAGES and LINKER, the build machine's own gcc links: right for
-# its own architecture. build/publish.sh has the args for each target. The
+# its own architecture. build/dist.sh has the args for each target. The
 # build context is the repo root.
 # The final stage is `scratch` holding only the binary: it exists to be
 # exported with `docker build --output`, not run.

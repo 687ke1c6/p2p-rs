@@ -22,16 +22,15 @@ release: ui
 
 # Cross-compile the node for armv7 (Debian bookworm armhf), with the web UI embedded,
 # into target/docker/bookworm-armv7
-armv7: (dist "bookworm-armv7")
+armv7: (build "bookworm-armv7")
 
-# Build the node in Docker for each target (default: all) into target/docker/<target>/,
-# and pack each into target/dist/
-dist *targets:
-    build/publish.sh --no-publish {{targets}}
+# Build the node in Docker for each target (default: all) into target/docker/<target>/
+build *targets:
+    build/dist.sh build {{targets}}
 
-# As `dist`, then upload each pack to drop-docs (settings in .env)
+# Upload each target's build (default: all) to drop-docs (settings in .env); no build
 publish *targets:
-    build/publish.sh {{targets}}
+    build/dist.sh publish {{targets}}
 
 # Build the web UI into ui/dist/
 ui:

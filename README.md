@@ -17,10 +17,9 @@ Run `just` to list the recipes. The main ones:
 
 ## Build for other targets
 
-`just dist [target...]` builds the node in Docker, with the web UI embedded.
-Each binary goes to `target/docker/<target>/sync-node`, and each pack to
-`target/dist/sync-node-<target>-<commit>.tar.gz`. With no targets, it builds
-all of them.
+`just build [target...]` builds the node in Docker, with the web UI embedded.
+Each binary goes to `target/docker/<target>/sync-node`. With no targets, it
+builds all of them.
 
 | Target | For | Dockerfile |
 |---|---|---|
@@ -31,8 +30,9 @@ all of them.
 | `alpine-arm64` | Alpine on 64-bit ARM (static musl) | `build/musl.Dockerfile` |
 | `alpine-x86_64` | Alpine on x86_64 (static musl) | `build/musl.Dockerfile` |
 
-`just publish [target...]` does the same, then uploads each pack to drop-docs.
-Copy [.env.example](.env.example) to `.env` and fill in the settings first.
+`just publish [target...]` uploads those builds to drop-docs, with the version
+from `Cargo.toml`. It does not build. Copy [.env.example](.env.example) to
+`.env` and fill in the settings first.
 
 ## Docker image
 
