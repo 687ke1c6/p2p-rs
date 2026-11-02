@@ -1,6 +1,6 @@
 # sync-node on Alpine, with the web UI embedded.
 #
-#   docker build -f Dockerfile.alpine -t sync-node .
+#   docker build -t sync-node .
 #   docker run -d --name sync-node --network host \
 #       -v sync-node-config:/config -v /srv/sync:/sync \
 #       -e SYNC_NODE_UI_ADDR=127.0.0.1:7777 sync-node

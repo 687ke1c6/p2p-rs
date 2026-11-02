@@ -1,20 +1,33 @@
-# sync-node cross-compiled for 32-bit ARM (armv7, hard float), linked
-# against Debian bookworm's glibc, so it runs on bookworm armhf systems.
+# sync-node for one Rust target, linked against Debian bookworm's glibc, so it
+# runs on bookworm (and newer glibc) systems. The web UI is embedded: run
+# `just ui` first.
 #
-#   just armv7     # writes target/release/armv7/sync-node
+#   docker build -f build/bookworm.Dockerfile --output type=local,dest=<dir> \
+#       --build-arg TARGET=aarch64-unknown-linux-gnu \
+#       --build-arg "PACKAGES=gcc-aarch64-linux-gnu libc6-dev-arm64-cross" \
+#       --build-arg LINKER=aarch64-linux-gnu-gcc .
 #
+# With no PACKAGES and LINKER, the build machine's own gcc links: right for
+# its own architecture. build/publish.sh has the args for each target. The
+# build context is the repo root.
 # The final stage is `scratch` holding only the binary: it exists to be
 # exported with `docker build --output`, not run.
 
-# Cross-compile on the build machine's native platform; no ARM emulation.
+# Cross-compile on the build machine's native platform; no emulation.
 FROM --platform=$BUILDPLATFORM rust:1.99-bookworm AS builder
-ARG TARGET=armv7-unknown-linux-gnueabihf
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross \
-    && rm -rf /var/lib/apt/lists/* \
+ARG TARGET
+ARG PACKAGES=""
+ARG LINKER=""
+RUN if [ -n "$PACKAGES" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends $PACKAGES \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi \
     && rustup target add $TARGET
-ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
 WORKDIR /build
+RUN if [ -n "$LINKER" ]; then \
+        mkdir .cargo && printf '[target.%s]\nlinker = "%s"\n' "$TARGET" "$LINKER" > .cargo/config.toml; \
+    fi
 
 # Build dependencies against stub sources first, so editing our own code
 # doesn't rebuild every dependency. Every workspace member's manifest must be
@@ -30,8 +43,8 @@ RUN mkdir -p crates/node/src \
     && cargo build --release --locked -p sync-node --target $TARGET \
     && rm -r crates/*/src
 
-# The web UI, embedded in the binary (`ui::EmbeddedPage`). `just armv7`
-# builds it on the host first; bun isn't in this image.
+# The web UI, embedded in the binary (`ui::EmbeddedPage`). `just ui` builds
+# it on the host first; bun isn't in this image.
 COPY ui/dist ui/dist
 COPY crates crates
 # COPY keeps the files' original mtimes, which can be older than the stub

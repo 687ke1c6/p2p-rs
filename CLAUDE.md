@@ -15,8 +15,10 @@ for the developer to review and commit.
 
 ## armv7 builds
 
-Never run the armv7 Docker build (`just armv7`, or `docker build` with
-`Dockerfile.armv7`). It is slow and holds up the work. The developer runs it
+Never run the armv7 Docker build (`just armv7`, `just dist`/`just publish`
+with no targets or an armv7 target, or `docker build` with
+`build/bookworm.Dockerfile` for `armv7-unknown-linux-gnueabihf`). It is slow
+and holds up the work. The developer runs it
 locally, deploys to the Pi and reports back whether it succeeded. When a change
 could affect the armv7 build, say so and leave the check to the developer.
 

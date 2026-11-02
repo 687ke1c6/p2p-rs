@@ -21,9 +21,17 @@ release: ui
     cargo build --release --locked -p sync-node
 
 # Cross-compile the node for armv7 (Debian bookworm armhf), with the web UI embedded,
-# into target/release/armv7
-armv7: ui
-    docker build -f Dockerfile.armv7 --output type=local,dest=target/release/armv7 .
+# into target/docker/bookworm-armv7
+armv7: (dist "bookworm-armv7")
+
+# Build the node in Docker for each target (default: all) into target/docker/<target>/,
+# and pack each into target/dist/
+dist *targets:
+    build/publish.sh --no-publish {{targets}}
+
+# As `dist`, then upload each pack to drop-docs (settings in .env)
+publish *targets:
+    build/publish.sh {{targets}}
 
 # Build the web UI into ui/dist/
 ui:

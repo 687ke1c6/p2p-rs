@@ -1,5 +1,11 @@
 target/
 .git/
 .devcontainer/
-# Host packages (glibc binaries); Dockerfile.alpine installs its own.
+.claude/
+# Secrets for build/publish.sh; no image needs them.
+.env
+docs/
+plans/
+folder-test/
+# Host packages (glibc binaries); the root Dockerfile installs its own.
 ui/node_modules/
